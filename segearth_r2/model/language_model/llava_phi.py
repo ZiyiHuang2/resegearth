@@ -12,7 +12,7 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.utils.memory import retry_if_cuda_oom
-
+from ..mipha.model.multimodal_encoder.builder import build_vision_tower
 from ..mipha.model.language_model.mipha_phi import (MiphaPhiForCausalLM, MiphaPhiModel)
 
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
@@ -74,7 +74,7 @@ class SegEarthR2Model(MiphaPhiModel):
         super(SegEarthR2Model, self).__init__(config)
         self.cfg = mask_decoder_cfg
         self.projector_outdim = config.hidden_size
-
+        #配置vision tower mask
         if hasattr(config, "mm_vision_tower"):
             swin_type = getattr(config,'swin_type','base')
             if swin_type == 'base':

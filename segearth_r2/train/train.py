@@ -4,7 +4,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
-from transformers import SiglipImageProcessor
+from transformers import AutoImageProcessor, AutoProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
 import copy
@@ -136,7 +136,7 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
 
     return sorted(list(lora_module_names))
 
-
+#两种情况保存训练好的模型：1. deepspeed训练，直接调用trainer.save_model()；2. 非deepspeed训练，收集模型参数并保存
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -156,7 +156,7 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
         del state_dict
         trainer._save(output_dir, state_dict=cpu_state_dict)  # noqa
 
-
+#给新增标记一个合理的初始表示，避免随机初始化可能导致的训练不稳定
 def smart_tokenizer_and_embedding_resize(
         special_tokens_dict: Dict,
         tokenizer: transformers.PreTrainedTokenizer,
@@ -181,6 +181,9 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+def build_clip_image_processor(vision_tower_path: str):
+    return AutoImageProcessor.from_pretrained(vision_tower_path)
+
 def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_args):
     data_ratio = data_args.data_ratio
     data_ratio = data_ratio.split('||')
@@ -204,7 +207,7 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
-
+    #MASK_CONFIG读取
     mask_cfg = get_mask_config(config=model_args.mask_config)
     bnb_model_from_pretrained_args = {}
 
@@ -225,7 +228,7 @@ def train():
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
-
+    #根据配置启用梯度检查机制，以节省显存，同时保证模型训练的正确性
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
@@ -261,13 +264,32 @@ def train():
         )
 
         vision_tower = model.get_vision_tower()
+
+        print("vision tower type:", type(vision_tower))
+        print("vision hidden size:", vision_tower.hidden_size)
+
+        mm_projector = model.get_model().mm_projector
+        if hasattr(mm_projector, "in_features"):
+            print("projector in dim:", mm_projector.in_features)
+        elif hasattr(mm_projector, "__getitem__") and hasattr(mm_projector[0], "in_features"):
+            print("projector in dim:", mm_projector[0].in_features)
+        else:
+            print("cannot infer projector input dim directly:", type(mm_projector))
+
         vision_tower_mask = model.model.get_vision_tower_mask()
-        vision_tower.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
-        vision_tower_mask.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
+        vision_tower.to(
+            dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32),
+            device=training_args.device
+        )
+        vision_tower_mask.to(
+            dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32),
+            device=training_args.device
+        )
+
         data_args.is_multimodal = True
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
-        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints 
+        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
 
         if not model_args.train_clip_backbone:
             model.model.vision_tower.requires_grad_(False)
@@ -281,13 +303,14 @@ def train():
 
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
+    #需要训练的模块列表
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
     ]
 
     if model_args.train_swin_backbone:
         train_module_list.append('vision_tower_mask')
-        
+
     if training_args.lora_enable:
         lora_r = training_args.lora_r
         lora_alpha = training_args.lora_alpha
@@ -314,12 +337,16 @@ def train():
                 p.requires_grad = True
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
-    
-    clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
-    
-    data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
-    training_args.dataloader_drop_last = True
-    
+
+    clip_image_processor = build_clip_image_processor(model_args.vision_tower)
+
+    data_module = make_unify_datamodule(
+        clip_image_processor=clip_image_processor,
+        tokenizer=tokenizer,
+        data_args=data_args,
+        training_args=training_args
+    )
+
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,
                            args=training_args,
@@ -333,7 +360,7 @@ def train():
     model.config.use_cache = True
 
     safe_save_model_for_hf_trainer(trainer=trainer,
-                                       output_dir=training_args.output_dir)
+                                   output_dir=training_args.output_dir)
 
 if __name__ == "__main__":
     train()

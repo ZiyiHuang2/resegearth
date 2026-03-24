@@ -49,6 +49,7 @@ class DataArguments:
     output_dir: str = 'save_folder'
     eval_batch_size: int = 1
     dataloader_num_workers: int = 8
+    max_eval_samples: int = 0
 
 def init_distributed_mode(para):
     para.distributed = True
@@ -131,10 +132,13 @@ def evaluation():
 def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
 
     model.eval()
+    processed_samples = 0
 
     with torch.no_grad():
         for idx, inputs in tqdm(enumerate(eval_dataloader), total=len(eval_dataloader)):
-            
+
+            if data_args.max_eval_samples > 0 and processed_samples >= data_args.max_eval_samples:
+                break
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
             inputs['token_refer_id'] = [ids.to(device) for ids in inputs['token_refer_id']]
             outputs = model.eval_seg(
@@ -158,6 +162,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 if pred_mask.ndim > 2:
                     pred_mask = np.squeeze(pred_mask)
                 imsave(os.path.join(save_folder, mask_save_name), pred_mask.astype(np.uint8))
+                processed_samples += 1
 
 if __name__ == "__main__":
     evaluation()

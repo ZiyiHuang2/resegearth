@@ -36,6 +36,7 @@ def preprocess_mask(mask, image_size):
     for i in range(bs):
         single_mask = mask[i]
         hh, ww = single_mask.shape[:2]
+        # Resize
         if ww > hh:
             new_w = image_size
             new_h = int(hh * (image_size / ww))
