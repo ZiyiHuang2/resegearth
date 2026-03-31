@@ -1,0 +1,103 @@
+{
+  "os": "Linux-6.8.0-79-generic-x86_64-with-glibc2.35",
+  "python": "CPython 3.10.20",
+  "startedAt": "2026-03-31T09:29:05.931677Z",
+  "args": [
+    "--local_rank=0",
+    "--model_name_or_path",
+    "/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B",
+    "--vision_tower",
+    "/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip2-so400m-patch14-384",
+    "--vision_tower_mask",
+    "/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl",
+    "--base_data_path",
+    "/home/wangchengjun/huangziyi/data/RRSISD",
+    "--output_dir",
+    "/home/wangchengjun/huangziyi/reseg/forprompt/base_15000",
+    "--max_steps",
+    "15000",
+    "--per_device_train_batch_size",
+    "1",
+    "--save_strategy",
+    "steps",
+    "--save_steps",
+    "1000",
+    "--bf16",
+    "True",
+    "--save_total_limit",
+    "1",
+    "--learning_rate",
+    "1e-4",
+    "--weight_decay",
+    "0.0",
+    "--warmup_ratio",
+    "0.03",
+    "--lr_scheduler_type",
+    "cosine",
+    "--logging_steps",
+    "10",
+    "--tf32",
+    "False",
+    "--model_max_length",
+    "2048",
+    "--gradient_checkpointing",
+    "False",
+    "--dataloader_num_workers",
+    "4",
+    "--lora_r",
+    "4",
+    "--deepspeed",
+    "scripts/zero1.json",
+    "--mask_config",
+    "segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml",
+    "--data_ratio",
+    "1",
+    "--switch_bs",
+    "4"
+  ],
+  "program": "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main/segearth_r2/train/train.py",
+  "codePath": "segearth_r2/train/train.py",
+  "codePathLocal": "segearth_r2/train/train.py",
+  "email": "ihuangziyi@gmail.com",
+  "root": "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main",
+  "host": "h3c-H3C-UniServer-R4900-G5",
+  "executable": "/home/wangchengjun/miniconda3/envs/segearthr2/bin/python3.10",
+  "cpu_count": 56,
+  "cpu_count_logical": 112,
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "gpu_count": 3,
+  "disk": {
+    "/": {
+      "total": "942910771200",
+      "used": "309665538048"
+    }
+  },
+  "memory": {
+    "total": "270060216320"
+  },
+  "gpu_nvidia": [
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-1f96e6cf-2b48-2239-7ed6-a446917adf80"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-dac7eff1-64f7-cd01-cb07-38fa566e3093"
+    },
+    {
+      "name": "NVIDIA GeForce RTX 4090",
+      "memoryTotal": "25757220864",
+      "cudaCores": 16384,
+      "architecture": "Ada",
+      "uuid": "GPU-8d641088-7042-ac55-1840-5dec013926d8"
+    }
+  ],
+  "cudaVersion": "12.4",
+  "writerId": "166tcvd40sduzklaz2qn855s8tc7y39b"
+}

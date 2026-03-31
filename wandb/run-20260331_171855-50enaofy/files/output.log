@@ -1,0 +1,38 @@
+  0%|                                                                                             | 0/15000 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main/segearth_r2/train/train.py", line 345, in <module>
+    train()
+  File "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main/segearth_r2/train/train.py", line 336, in train
+    trainer.train()
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/transformers/trainer.py", line 1624, in train
+    return inner_training_loop(
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/transformers/trainer.py", line 1961, in _inner_training_loop
+    tr_loss_step = self.training_step(model, inputs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/transformers/trainer.py", line 2902, in training_step
+    loss = self.compute_loss(model, inputs)
+  File "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main/segearth_r2/train/llava_trainer.py", line 237, in compute_loss
+    outputs = model(**inputs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/deepspeed/utils/nvtx.py", line 15, in wrapped_fn
+    ret_val = func(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/deepspeed/runtime/engine.py", line 1769, in forward
+    loss = self.module(*inputs, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/peft/peft_model.py", line 918, in forward
+    return self.base_model(
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/segearthr2/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 94, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main/segearth_r2/model/language_model/llava_phi.py", line 659, in forward
+    attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+  File "/mnt/914a4333-5340-4edb-9244-141f95f7c28e/wangchengjun/huangziyi/reseg/resegearth-main/segearth_r2/model/language_model/llava_phi.py", line 659, in <listcomp>
+    attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+AttributeError: 'NoneType' object has no attribute 'sum'
