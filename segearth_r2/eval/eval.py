@@ -46,6 +46,11 @@ class DataArguments:
     eval_batch_size: int = 1
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
+    # BHFM评测配置（默认None表示沿用模型内配置）
+    bhfm_enable: Optional[bool] = field(default=None)
+    bhfm_stages: str = field(default="2")
+    bhfm_interval: int = field(default=3)
+    bhfm_full_open: bool = field(default=False)
 
     # 新增：数据集类型与 split
     dataset_name: str = "lasers"   # "lasers" or "rrsisd"
@@ -149,6 +154,20 @@ def evaluation():
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
     model.to(dtype=torch.float32, device=device)
+    model.eval_debug_rank0 = (data_args.local_rank == 0)
+
+    # 评测侧可选覆写BHFM开关/策略（尽量不破坏原路径）
+    vision_tower_mask = model.get_model().get_vision_tower_mask()
+    if data_args.bhfm_enable is not None:
+        vision_tower_mask.bhfm_enable = bool(data_args.bhfm_enable)
+    if hasattr(vision_tower_mask, "bhfm_stages"):
+        vision_tower_mask.bhfm_stages = tuple(
+            int(x.strip()) for x in data_args.bhfm_stages.split(",") if x.strip() != ""
+        )
+    if hasattr(vision_tower_mask, "bhfm_interval"):
+        vision_tower_mask.bhfm_interval = int(data_args.bhfm_interval)
+    if hasattr(vision_tower_mask, "bhfm_full_open"):
+        vision_tower_mask.bhfm_full_open = bool(data_args.bhfm_full_open)
 
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
@@ -167,6 +186,12 @@ def evaluation():
     for split, eval_dataset in eval_sets:
         if data_args.local_rank == 0:
             print(f"[Eval] split={split}, dataset_len={len(eval_dataset)}")
+            print(
+                f"[Eval][BHFM] enable={getattr(vision_tower_mask, 'bhfm_enable', False)}, "
+                f"stages={getattr(vision_tower_mask, 'bhfm_stages', ())}, "
+                f"interval={getattr(vision_tower_mask, 'bhfm_interval', -1)}, "
+                f"full_open={getattr(vision_tower_mask, 'bhfm_full_open', False)}"
+            )
 
         if not data_args.distributed:
             val_sampler = None
@@ -223,6 +248,14 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
             )
+
+            if data_args.local_rank == 0 and idx == 0:
+                vt = model.get_model().get_vision_tower_mask()
+                print(
+                    f"[Eval][BHFM] calls={getattr(vt, 'last_bhfm_calls', 0)}, "
+                    f"text_in_shape={getattr(vt, 'last_bhfm_text_in_shape', None)}, "
+                    f"text_out_shape={getattr(vt, 'last_bhfm_text_out_shape', None)}"
+                )
 
             for output in outputs:
                 pred_mask = output["pred"]

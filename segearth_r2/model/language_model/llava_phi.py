@@ -77,12 +77,25 @@ class SegEarthR2Model(MiphaPhiModel):
 
         if hasattr(config, "mm_vision_tower"):
             swin_type = getattr(config,'swin_type','base')
+            bhfm_kwargs = self._build_bhfm_kwargs_from_source(config)
             if swin_type == 'base':
-                self.vision_tower_mask = build_swin_b(None)
+                self.vision_tower_mask = build_swin_b(None, **bhfm_kwargs)
             else:
-                self.vision_tower_mask = build_swin_l(None)
+                self.vision_tower_mask = build_swin_l(None, **bhfm_kwargs)
 
             self.vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
+
+    @staticmethod
+    def _build_bhfm_kwargs_from_source(source) -> dict:
+        return dict(
+            bhfm_enable=getattr(source, "bhfm_enable", False),
+            bhfm_text_dim=getattr(source, "bhfm_text_dim", 256),
+            bhfm_num_heads=getattr(source, "bhfm_num_heads", 8),
+            bhfm_mlp_ratio=getattr(source, "bhfm_mlp_ratio", 4.0),
+            bhfm_stages=getattr(source, "bhfm_stages", (2,)),
+            bhfm_interval=getattr(source, "bhfm_interval", 3),
+            bhfm_full_open=getattr(source, "bhfm_full_open", False),
+        )
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
@@ -103,11 +116,19 @@ class SegEarthR2Model(MiphaPhiModel):
         self.config.mm_vision_tower = vision_tower
         swin_type = getattr(model_args,'swin_type','base')
         self.config.swin_type = swin_type
+        bhfm_kwargs = self._build_bhfm_kwargs_from_source(model_args)
+        self.config.bhfm_enable = bhfm_kwargs["bhfm_enable"]
+        self.config.bhfm_text_dim = bhfm_kwargs["bhfm_text_dim"]
+        self.config.bhfm_num_heads = bhfm_kwargs["bhfm_num_heads"]
+        self.config.bhfm_mlp_ratio = bhfm_kwargs["bhfm_mlp_ratio"]
+        self.config.bhfm_stages = tuple(bhfm_kwargs["bhfm_stages"])
+        self.config.bhfm_interval = int(bhfm_kwargs["bhfm_interval"])
+        self.config.bhfm_full_open = bhfm_kwargs["bhfm_full_open"]
         if swin_type == 'base':
-            vision_tower_mask = build_swin_b(vision_tower_mask)
+            vision_tower_mask = build_swin_b(vision_tower_mask, **bhfm_kwargs)
         else:
             print('current visual encoder is swin large')
-            vision_tower_mask = build_swin_l(vision_tower_mask)
+            vision_tower_mask = build_swin_l(vision_tower_mask, **bhfm_kwargs)
 
         if fsdp is not None and len(fsdp) > 0:
             self.vision_tower_mask = [vision_tower_mask]
@@ -126,6 +147,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
+        self._eval_seg_bhfm_calls = 0
 
         self.lm_head = nn.Linear(config.hidden_size, 51200, bias=False)
 
@@ -185,8 +207,43 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print(diff_predictor_msg)
             print(diff_pixel_msg)
 
-    def get_vision_tower_feature(self, images):
-        features = self.get_model().get_vision_tower_mask()(images)
+    def _prepare_bhfm_text_features(self, token_refer_id, batch_size, device, dtype):
+        if token_refer_id is None:
+            return None
+        text_embeds = []
+        for idx in range(batch_size):
+            cur_ids = token_refer_id[idx]
+            if cur_ids is None or (hasattr(cur_ids, "numel") and cur_ids.numel() == 0):
+                text_embeds.append(None)
+                continue
+            cur_embed = self.get_model().embed_tokens(cur_ids.to(device))
+            cur_embed = self.SEG_token_projector(cur_embed)
+            text_embeds.append(cur_embed)
+        if all(item is None for item in text_embeds):
+            return None
+        max_len = max(item.shape[0] if item is not None else 1 for item in text_embeds)
+        out = []
+        for item in text_embeds:
+            if item is None:
+                out.append(torch.zeros((max_len, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM), device=device, dtype=dtype))
+                continue
+            item = item.to(device=device, dtype=dtype)
+            if item.shape[0] < max_len:
+                pad = torch.zeros((max_len - item.shape[0], item.shape[1]), device=device, dtype=dtype)
+                item = torch.cat([item, pad], dim=0)
+            out.append(item)
+        return torch.stack(out, dim=0)
+
+    def get_vision_tower_feature(self, images, text_features=None, return_text=False):
+        vision_tower = self.get_model().get_vision_tower_mask()
+        updated_text = text_features
+        if return_text:
+            try:
+                features, updated_text = vision_tower(images, text_features=text_features, return_text=True)
+            except TypeError:
+                features = vision_tower(images)
+        else:
+            features = vision_tower(images)
         
         features_dict = {
             'res2': features[0], # bs, 128, 256, 256
@@ -194,6 +251,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             'res4': features[2], # bs, 512, 64, 64
             'res5': features[3], # bs, 1024, 32, 32
         }
+        if return_text:
+            return features_dict, updated_text
         return features_dict
     def mask_decoder_training_init(self, cfg):
         # Loss parameters:
@@ -636,7 +695,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
-                image_features = self.get_vision_tower_feature(images)
+                text_for_bhfm = self._prepare_bhfm_text_features(
+                    token_refer_id=token_refer_id,
+                    batch_size=input_ids.shape[0],
+                    device=images.device,
+                    dtype=images.dtype,
+                )
+                image_features, _ = self.get_vision_tower_feature(
+                    images,
+                    text_features=text_for_bhfm,
+                    return_text=True,
+                )
                 bs = input_ids.shape[0]
             
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
@@ -789,7 +858,27 @@ class SegEarthR2(MiphaPhiForCausalLM):
         output_hidden_states = True
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        image_features = self.get_vision_tower_feature(images)
+        text_for_bhfm = self._prepare_bhfm_text_features(
+            token_refer_id=token_refer_id,
+            batch_size=input_ids.shape[0],
+            device=images.device,
+            dtype=images.dtype,
+        )
+        image_features, updated_text_features = self.get_vision_tower_feature(
+            images,
+            text_features=text_for_bhfm,
+            return_text=True,
+        )
+        self._eval_seg_bhfm_calls += 1
+        if getattr(self, "eval_debug_rank0", False) and self._eval_seg_bhfm_calls <= 2:
+            vt = self.get_model().get_vision_tower_mask()
+            print(
+                f"[Model.eval_seg][BHFM] enabled={getattr(vt, 'bhfm_enable', False)}, "
+                f"call={self._eval_seg_bhfm_calls}, images={tuple(images.shape)}, "
+                f"text_in={None if text_for_bhfm is None else tuple(text_for_bhfm.shape)}, "
+                f"text_out={None if updated_text_features is None else tuple(updated_text_features.shape)}, "
+                f"bhfm_calls_in_swin={getattr(vt, 'last_bhfm_calls', 0)}"
+            )
 
         input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
@@ -809,6 +898,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state   
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        if updated_text_features is not None:
+            # 若 BHFM 返回文本特征，则用于增强分割 query（回退兼容：None 时保持原逻辑）。
+            seg_residual = updated_text_features.mean(dim=1, keepdim=True).to(dtype=SEG_embedding.dtype, device=SEG_embedding.device)
+            SEG_embedding = SEG_embedding + seg_residual
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)

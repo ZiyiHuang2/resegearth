@@ -12,6 +12,7 @@ import torch.utils.checkpoint as checkpoint
 import numpy as np
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import pickle
+from .bhfm import BHFMLayer
 
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
@@ -169,7 +170,8 @@ class SwinTransformerBlock(nn.Module):
 
     def __init__(self, dim, num_heads, window_size=7, shift_size=0,
                  mlp_ratio=4., qkv_bias=True, qk_scale=None, drop=0., attn_drop=0., drop_path=0.,
-                 act_layer=nn.GELU, norm_layer=nn.LayerNorm):
+                 act_layer=nn.GELU, norm_layer=nn.LayerNorm, enable_bhfm=False,
+                 bhfm_text_dim=256, bhfm_num_heads=8, bhfm_mlp_ratio=4.0):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -187,11 +189,20 @@ class SwinTransformerBlock(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
+        self.enable_bhfm = enable_bhfm
+        self.bhfm = BHFMLayer(
+            embed_dim=dim,
+            text_dim=bhfm_text_dim,
+            num_heads=bhfm_num_heads,
+            mlp_ratio=bhfm_mlp_ratio,
+        )
+        # 冻结分支从原 block 的 norm/mlp 初始化，避免冻结随机参数。
+        self.bhfm.init_frozen_from_block(self.norm2, self.mlp)
 
         self.H = None
         self.W = None
 
-    def forward(self, x, mask_matrix):
+    def forward(self, x, mask_matrix, text_features=None, use_bhfm=False):
         """ Forward function.
 
         Args:
@@ -246,11 +257,14 @@ class SwinTransformerBlock(nn.Module):
 
         x = x.view(B, H * W, C)
 
-        # FFN
+        # attention residual
         x = shortcut + self.drop_path(x)
+        if use_bhfm and text_features is not None:
+            x, text_features = self.bhfm(f_i=x, t_i=text_features, f_in=shortcut)
+        # FFN
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        return x
+        return x, text_features
 
 
 class PatchMerging(nn.Module):
@@ -328,12 +342,29 @@ class BasicLayer(nn.Module):
                  drop_path=0.,
                  norm_layer=nn.LayerNorm,
                  downsample=None,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+                 stage_index=0,
+                 bhfm_enable=False,
+                 bhfm_stages=(2,),
+                 bhfm_interval=3,
+                 bhfm_full_open=False,
+                 bhfm_text_dim=256,
+                 bhfm_num_heads=8,
+                 bhfm_mlp_ratio=4.0):
         super().__init__()
         self.window_size = window_size
         self.shift_size = window_size // 2
         self.depth = depth
         self.use_checkpoint = use_checkpoint
+        self.stage_index = stage_index
+        self.bhfm_enable = bool(bhfm_enable)
+        self.bhfm_interval = max(int(bhfm_interval), 1)
+        self.bhfm_stages = set(bhfm_stages) if bhfm_stages is not None else set()
+        self.bhfm_full_open = bool(bhfm_full_open)
+        self.bhfm_block_indices = []
+
+        def _enable_block(i):
+            return self._is_bhfm_block(i)
 
         # build blocks
         self.blocks = nn.ModuleList([
@@ -348,8 +379,22 @@ class BasicLayer(nn.Module):
                 drop=drop,
                 attn_drop=attn_drop,
                 drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                norm_layer=norm_layer)
+                norm_layer=norm_layer,
+                enable_bhfm=_enable_block(i),
+                bhfm_text_dim=bhfm_text_dim,
+                bhfm_num_heads=bhfm_num_heads,
+                bhfm_mlp_ratio=bhfm_mlp_ratio)
             for i in range(depth)])
+        self.bhfm_block_indices = [i for i in range(depth) if _enable_block(i)]
+
+    def _is_bhfm_block(self, block_index):
+        if not self.bhfm_enable:
+            return False
+        if self.bhfm_full_open:
+            return True
+        if self.stage_index not in self.bhfm_stages:
+            return False
+        return (block_index % self.bhfm_interval) == 0
 
         # patch merging layer
         if downsample is not None:
@@ -357,7 +402,7 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, H, W):
+    def forward(self, x, H, W, text_features=None, return_text=False):
         """ Forward function.
 
         Args:
@@ -386,17 +431,37 @@ class BasicLayer(nn.Module):
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
-        for blk in self.blocks:
+        bhfm_calls = 0
+        for blk_idx, blk in enumerate(self.blocks):
             blk.H, blk.W = H, W
+            use_bhfm = (text_features is not None) and self._is_bhfm_block(blk_idx)
             if self.use_checkpoint:
-                x = checkpoint.checkpoint(blk, x, attn_mask)
+                if text_features is None:
+                    x, _ = checkpoint.checkpoint(
+                        lambda _x, _m: blk(_x, _m, None, False),
+                        x,
+                        attn_mask,
+                    )
+                else:
+                    x, text_features = checkpoint.checkpoint(
+                        lambda _x, _m, _t: blk(_x, _m, _t, use_bhfm),
+                        x,
+                        attn_mask,
+                        text_features,
+                    )
             else:
-                x = blk(x, attn_mask)
+                x, text_features = blk(x, attn_mask, text_features, use_bhfm)
+            if use_bhfm:
+                bhfm_calls += 1
         if self.downsample is not None:
             x_down = self.downsample(x, H, W)
             Wh, Ww = (H + 1) // 2, (W + 1) // 2
+            if return_text:
+                return x, H, W, x_down, Wh, Ww, text_features, bhfm_calls
             return x, H, W, x_down, Wh, Ww
         else:
+            if return_text:
+                return x, H, W, x, H, W, text_features, bhfm_calls
             return x, H, W, x, H, W
 
 
@@ -491,7 +556,14 @@ class SwinTransformer(nn.Module):
                  patch_norm=True,
                  out_indices=(0, 1, 2, 3),
                  frozen_stages=-1,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+                 bhfm_enable=False,
+                 bhfm_text_dim=256,
+                 bhfm_num_heads=8,
+                 bhfm_mlp_ratio=4.0,
+                 bhfm_stages=(2,),
+                 bhfm_interval=3,
+                 bhfm_full_open=False):
         super().__init__()
 
         self.pretrain_img_size = pretrain_img_size
@@ -501,6 +573,13 @@ class SwinTransformer(nn.Module):
         self.patch_norm = patch_norm
         self.out_indices = out_indices
         self.frozen_stages = frozen_stages
+        self.bhfm_enable = bool(bhfm_enable)
+        self.bhfm_stages = tuple(bhfm_stages) if bhfm_stages is not None else (2,)
+        self.bhfm_interval = int(bhfm_interval)
+        self.bhfm_full_open = bool(bhfm_full_open)
+        self.last_bhfm_calls = 0
+        self.last_bhfm_text_in_shape = None
+        self.last_bhfm_text_out_shape = None
 
         # split image into non-overlapping patches
         self.patch_embed = PatchEmbed(
@@ -537,7 +616,15 @@ class SwinTransformer(nn.Module):
                 drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
                 norm_layer=norm_layer,
                 downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                use_checkpoint=use_checkpoint)
+                use_checkpoint=use_checkpoint,
+                stage_index=i_layer,
+                bhfm_enable=self.bhfm_enable,
+                bhfm_stages=self.bhfm_stages,
+                bhfm_interval=self.bhfm_interval,
+                bhfm_full_open=self.bhfm_full_open,
+                bhfm_text_dim=bhfm_text_dim,
+                bhfm_num_heads=bhfm_num_heads,
+                bhfm_mlp_ratio=bhfm_mlp_ratio)
             self.layers.append(layer)
 
         num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
@@ -605,8 +692,10 @@ class SwinTransformer(nn.Module):
         else:
             raise TypeError('pretrained must be a str or None')
 
-    def forward(self, x):
+    def forward(self, x, text_features=None, return_text=False):
         """Forward function."""
+        self.last_bhfm_calls = 0
+        self.last_bhfm_text_in_shape = tuple(text_features.shape) if text_features is not None else None
         x = self.patch_embed(x)
 
         Wh, Ww = x.size(2), x.size(3)
@@ -621,7 +710,13 @@ class SwinTransformer(nn.Module):
         outs = []
         for i in range(self.num_layers):
             layer = self.layers[i]
-            x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
+            if return_text:
+                x_out, H, W, x, Wh, Ww, text_features, bhfm_calls = layer(
+                    x, Wh, Ww, text_features=text_features, return_text=True
+                )
+                self.last_bhfm_calls += int(bhfm_calls)
+            else:
+                x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww, text_features=None, return_text=False)
 
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')
@@ -630,6 +725,9 @@ class SwinTransformer(nn.Module):
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 outs.append(out)
 
+        self.last_bhfm_text_out_shape = tuple(text_features.shape) if text_features is not None else None
+        if return_text:
+            return tuple(outs), text_features
         return tuple(outs)
 
     def train(self, mode=True):
@@ -637,7 +735,7 @@ class SwinTransformer(nn.Module):
         super(SwinTransformer, self).train(mode)
         self._freeze_stages()
 
-def build_swin_t(pretrain=None):
+def build_swin_t(pretrain=None, **kwargs):
     model = SwinTransformer(
         embed_dim=96,
         depths=[2, 2, 6, 2],
@@ -652,12 +750,13 @@ def build_swin_t(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        **kwargs)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_b(pretrain=None):
+def build_swin_b(pretrain=None, **kwargs):
     model = SwinTransformer(
         embed_dim=128,
         depths=[2, 2, 18, 2],
@@ -672,12 +771,13 @@ def build_swin_b(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        **kwargs)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_s(pretrain=None):
+def build_swin_s(pretrain=None, **kwargs):
     model = SwinTransformer(
         embed_dim=96,
         depths=[2, 2, 18, 2],
@@ -692,12 +792,13 @@ def build_swin_s(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        **kwargs)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_l(pretrain=None):
+def build_swin_l(pretrain=None, **kwargs):
     model = SwinTransformer(
         pretrain_img_size=384,
         embed_dim=192,
@@ -713,7 +814,8 @@ def build_swin_l(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        **kwargs)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model

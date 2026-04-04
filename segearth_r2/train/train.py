@@ -40,6 +40,14 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    # BHFM配置：默认关闭，保持原行为
+    bhfm_enable: bool = field(default=False)
+    bhfm_text_dim: int = field(default=256)
+    bhfm_num_heads: int = field(default=8)
+    bhfm_mlp_ratio: float = field(default=4.0)
+    bhfm_stages: str = field(default="2")
+    bhfm_interval: int = field(default=3)
+    bhfm_full_open: bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -137,6 +145,19 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
     return sorted(list(lora_module_names))
 
 
+def parse_bhfm_stages(stages):
+    if isinstance(stages, (list, tuple)):
+        return tuple(int(x) for x in stages)
+    if stages is None:
+        return (2,)
+    if isinstance(stages, str):
+        stages = stages.strip()
+        if stages == "":
+            return (2,)
+        return tuple(int(x.strip()) for x in stages.split(",") if x.strip() != "")
+    return (int(stages),)
+
+
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -208,6 +229,7 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    model_args.bhfm_stages = parse_bhfm_stages(model_args.bhfm_stages)
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
@@ -289,6 +311,8 @@ def train():
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        # BHFM相关模块允许训练（即使不训练整个swin）
+        "bhfm", "bhfm_layers", "bhfm_",
     ]
 
     if model_args.train_swin_backbone:
@@ -309,15 +333,24 @@ def train():
         )
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
+    # 无论LoRA开关，手动保证白名单模块可训练
+    for n, p in model.named_parameters():
+        if any([x in n for x in train_module_list]):
+            p.requires_grad = True
 
-        for n, p in model.named_parameters():
-            if any(
-                [
-                    x in n
-                    for x in train_module_list
-                ]):
-
-                p.requires_grad = True
+    # 训练参数可视化：确认BHFM未被冻结逻辑误伤
+    bhfm_total = 0
+    bhfm_trainable = 0
+    for n, p in model.named_parameters():
+        if "bhfm" in n:
+            bhfm_total += p.numel()
+            if p.requires_grad:
+                bhfm_trainable += p.numel()
+    print(
+        f"[Train][BHFM] enable={model_args.bhfm_enable}, stages={model_args.bhfm_stages}, "
+        f"interval={model_args.bhfm_interval}, full_open={model_args.bhfm_full_open}, "
+        f"trainable_params={bhfm_trainable}/{bhfm_total}"
+    )
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
     
