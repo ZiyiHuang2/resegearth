@@ -12,7 +12,7 @@ from deepspeed.profiling.flops_profiler import get_model_profile
 
 from segearth_r2.datasets.dataset import *
 from llava_trainer import LLaVATrainer
-from segearth_r2.model.language_model.llava_phi import SegEarthR2
+#from segearth_r2.model.language_model.llava_phi import SegEarthR2
 
 warnings.filterwarnings('ignore')
 local_rank = None
@@ -22,6 +22,7 @@ class ModelArguments:
     model_name_or_path: Optional[str] = field(default="pretrained_model/mllm/Mipha-3B")
    
     version: Optional[str] = field(default="phi-2")
+    llm_backbone: Optional[str] = field(default="phi")
 
     freeze_backbone: bool = field(default=False)
     train_clip_backbone: bool = field(default=False)
@@ -227,16 +228,30 @@ def train():
     global local_rank
 
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
+        (ModelArguments, DataArguments, TrainingArguments)
+    )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     model_args.bhfm_stages = parse_bhfm_stages(model_args.bhfm_stages)
     local_rank = training_args.local_rank
-    compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
+    compute_dtype = (
+        torch.float16 if training_args.fp16
+        else (torch.bfloat16 if training_args.bf16 else torch.float32)
+    )
+
+    if model_args.llm_backbone == "phi":
+        from segearth_r2.model.language_model.llava_phi import SegEarthR2 as SegEarthModel
+    elif model_args.llm_backbone == "qwen":
+        from segearth_r2.model.language_model.llava_qwen import SegEarthR2Qwen as SegEarthModel
+    else:
+        raise ValueError(
+            f"Unsupported llm_backbone: {model_args.llm_backbone}. "
+            f"Expected one of ['phi', 'qwen']."
+        )
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
     bnb_model_from_pretrained_args = {}
 
-    model = SegEarthR2.from_pretrained(
+    model = SegEarthModel.from_pretrained(
         model_args.model_name_or_path,
         mask_decoder_cfg=mask_cfg,
         add_cross_attn=True,
