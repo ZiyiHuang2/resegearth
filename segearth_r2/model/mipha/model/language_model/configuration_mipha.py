@@ -2,8 +2,15 @@ import os
 from typing import Union
 from transformers import PretrainedConfig, PhiConfig # , Dinov2Config, GemmaConfig, GPTNeoXConfig
 from transformers.utils import logging
-from transformers.utils.backbone_utils import get_aligned_output_features_output_indices
-
+#from transformers.utils.backbone_utils import get_aligned_output_features_output_indices
+# 修复 transformers 5.x 兼容性
+try:
+    # 新版 transformers 5.x 的路径
+    from transformers.backbone_utils import get_aligned_output_features_output_indices
+except ImportError:
+    # 如果还找不到，说明 API 已彻底移除，定义一个空函数保平安
+    def get_aligned_output_features_output_indices(out_features, out_indices, stage_names):
+        return out_features, out_indices
 logger = logging.get_logger(__name__)
 
 

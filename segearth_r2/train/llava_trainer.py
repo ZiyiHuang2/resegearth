@@ -8,7 +8,13 @@ import torch.distributed as dist
 from typing import Optional
 from torch import nn
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from transformers.utils import is_sagemaker_mp_enabled, is_apex_available, is_torch_tpu_available,is_accelerate_available
+from transformers.utils import is_sagemaker_mp_enabled, is_apex_available,is_accelerate_available
+try:
+    from transformers.utils import is_torch_tpu_available
+except ImportError:
+    # 如果不存在，创建一个始终返回False的占位函数
+    def is_torch_tpu_available():
+        return False
 if is_apex_available():
     from apex import amp
 if is_sagemaker_mp_enabled():

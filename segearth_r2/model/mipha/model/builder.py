@@ -42,6 +42,13 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             config=config,
             use_safetensors=True,
             **kwargs).to("cuda")
+    elif "qwen" in model_name.lower():
+        print("load Mipha-Qwen MSLM!!!")
+        model = MiphaQwenForCausalLM.from_pretrained(
+            model_path,
+            **kwargs,
+        ).to("cuda")
+        config = model.config
     else:
         raise ValueError(f"Unknown model name: {model_name}")
 
@@ -54,7 +61,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     else:
         return NotImplementedError
 
-    if 'phi' or "gemma" in model_name.lower():
+    if any(name in model_name.lower() for name in ("phi", "gemma", "qwen")):
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
         mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
 
