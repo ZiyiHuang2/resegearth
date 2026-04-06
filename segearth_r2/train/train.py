@@ -11,8 +11,8 @@ import copy
 from deepspeed.profiling.flops_profiler import get_model_profile
 
 from segearth_r2.datasets.dataset import *
-from llava_trainer import LLaVATrainer
-from segearth_r2.model.language_model.llava_phi import SegEarthR2
+from segearth_r2.train.llava_trainer import LLaVATrainer
+from segearth_r2.model.language_model.llava_qwen import SegEarthR2Qwen as SegEarthR2
 
 warnings.filterwarnings('ignore')
 local_rank = None
@@ -47,7 +47,7 @@ class DataArguments:
     is_multimodal: bool = False
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
-    base_data_path: str = '/data1/xzp/data'
+    base_data_path: str = '/home/wangchengjun/huangziyi/data/RRSISD'
     data_ratio: str = '1'  
     switch_bs: int = 4 # 16
     fix_dataset_len: int = 0
@@ -205,11 +205,19 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
 def train():
     global local_rank
 
+    import inspect
+    import pathlib
+
     parser = transformers.HfArgumentParser(
-        (ModelArguments, DataArguments, TrainingArguments))
+        (ModelArguments, DataArguments, TrainingArguments)
+    )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     local_rank = training_args.local_rank
-    compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
+
+    compute_dtype = (
+        torch.float16 if training_args.fp16 else
+        (torch.bfloat16 if training_args.bf16 else torch.float32)
+    )
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
     bnb_model_from_pretrained_args = {}
@@ -220,7 +228,7 @@ def train():
         add_cross_attn=True,
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
-                )
+    )
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
@@ -231,14 +239,12 @@ def train():
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
-
     if training_args.gradient_checkpointing:
         if hasattr(model, "enable_input_require_grads"):
             model.enable_input_require_grads()
         else:
             def make_inputs_require_grad(module, input, output):
                 output.requires_grad_(True)
-
             model.get_input_embeddings().register_forward_hook(make_inputs_require_grad)
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
@@ -255,6 +261,7 @@ def train():
             tokenizer=tokenizer,
             model=model,
         )
+
     if model_args.version in conversation_lib.conv_templates:
         conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
     else:
@@ -268,12 +275,13 @@ def train():
 
         vision_tower = model.get_vision_tower()
         vision_tower_mask = model.model.get_vision_tower_mask()
-        vision_tower.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
-        vision_tower_mask.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
-        data_args.is_multimodal = True
 
+        vision_tower.to(dtype=compute_dtype, device=training_args.device)
+        vision_tower_mask.to(dtype=compute_dtype, device=training_args.device)
+
+        data_args.is_multimodal = True
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
-        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints 
+        model.config.image_grid_pinpoints = data_args.image_grid_pinpoints
 
         if not model_args.train_clip_backbone:
             model.model.vision_tower.requires_grad_(False)
@@ -287,18 +295,19 @@ def train():
 
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
+
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
     ]
-
     if model_args.train_swin_backbone:
-        train_module_list.append('vision_tower_mask')
-        
+        train_module_list.append("vision_tower_mask")
+
     if training_args.lora_enable:
         lora_r = training_args.lora_r
         lora_alpha = training_args.lora_alpha
         lora_dropout = training_args.lora_dropout
         lora_target_modules = find_linear_layers(model, train_module_list=train_module_list)
+
         lora_config = LoraConfig(
             r=lora_r,
             lora_alpha=lora_alpha,
@@ -311,35 +320,52 @@ def train():
         model.print_trainable_parameters()
 
         for n, p in model.named_parameters():
-            if any(
-                [
-                    x in n
-                    for x in train_module_list
-                ]):
-
+            if any(x in n for x in train_module_list):
                 p.requires_grad = True
 
-    model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
-    
+    model.get_special_token(
+        SEG=tokenizer("[SEG]", return_tensors="pt", add_special_tokens=False)["input_ids"],
+        EOS=tokenizer.eos_token_id
+    )
+
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
-    
-    data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
+
+    data_module = make_unify_datamodule(
+        clip_image_processor=clip_image_processor,
+        tokenizer=tokenizer,
+        data_args=data_args,
+        training_args=training_args
+    )
     training_args.dataloader_drop_last = True
-    
-    trainer = LLaVATrainer(model=model,
-                           tokenizer=tokenizer,
-                           args=training_args,
-                           **data_module)
+
+    model.to(training_args.device)
+    # --------- 关键兼容点：不同 transformers 版本对 Trainer 是否支持 tokenizer= 不一致 ---------
+    trainer_kwargs = dict(
+        model=model,
+        args=training_args,
+        **data_module
+    )
+    if "tokenizer" in inspect.signature(LLaVATrainer.__init__).parameters:
+        trainer_kwargs["tokenizer"] = tokenizer
+
+    trainer = LLaVATrainer(**trainer_kwargs)
+    # 统一挂上 tokenizer，避免后续代码/保存流程用到 trainer.tokenizer
+    trainer.tokenizer = tokenizer
+    # ------------------------------------------------------------------------------
+
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
+
     trainer.save_state()
 
     model.config.use_cache = True
 
-    safe_save_model_for_hf_trainer(trainer=trainer,
-                                       output_dir=training_args.output_dir)
+    safe_save_model_for_hf_trainer(
+        trainer=trainer,
+        output_dir=training_args.output_dir
+    )
 
 if __name__ == "__main__":
     train()

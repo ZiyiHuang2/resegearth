@@ -48,7 +48,12 @@ from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampl
 
 from transformers.integrations.deepspeed import deepspeed_init, deepspeed_load_checkpoint, is_deepspeed_available
 from transformers.modelcard import TrainingSummary
-from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
+try:
+    from transformers.modeling_utils import PreTrainedModel, load_sharded_checkpoint, unwrap_model
+except ImportError:
+    # 旧 transformers 没有 load_sharded_checkpoint
+    from transformers.modeling_utils import PreTrainedModel, unwrap_model
+    load_sharded_checkpoint = None
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES, MODEL_MAPPING_NAMES
 from transformers.trainer_callback import (
     CallbackHandler,
@@ -59,35 +64,42 @@ from transformers.trainer_callback import (
     TrainerControl,
     TrainerState,
 )
-from transformers.utils import (
-    ADAPTER_CONFIG_NAME,
-    ADAPTER_SAFE_WEIGHTS_NAME,
-    ADAPTER_WEIGHTS_NAME,
-    CONFIG_NAME,
-    SAFE_WEIGHTS_INDEX_NAME,
-    SAFE_WEIGHTS_NAME,
-    WEIGHTS_INDEX_NAME,
-    WEIGHTS_NAME,
-    PushInProgress,
-    can_return_loss,
-    find_labels,
-    is_accelerate_available,
-    is_apex_available,
-    is_bitsandbytes_available,
-    is_datasets_available,
-    is_in_notebook,
-    is_ipex_available,
-    is_peft_available,
-    is_safetensors_available,
-    is_sagemaker_dp_enabled,
-    is_sagemaker_mp_enabled,
-    is_torch_compile_available,
-    is_torch_neuroncore_available,
-    is_torch_npu_available,
-    is_torch_tpu_available,
-    logging,
-    strtobool,
-)
+import transformers.utils as _tf_utils
+from transformers.utils import logging, strtobool
+
+def _false(*args, **kwargs):
+    return False
+
+# ====== 常量：旧版没有就给默认值，避免 import 崩 ======
+ADAPTER_CONFIG_NAME = getattr(_tf_utils, "ADAPTER_CONFIG_NAME", "adapter_config.json")
+ADAPTER_SAFE_WEIGHTS_NAME = getattr(_tf_utils, "ADAPTER_SAFE_WEIGHTS_NAME", "adapter_model.safetensors")
+ADAPTER_WEIGHTS_NAME = getattr(_tf_utils, "ADAPTER_WEIGHTS_NAME", "adapter_model.bin")
+CONFIG_NAME = getattr(_tf_utils, "CONFIG_NAME", "config.json")
+SAFE_WEIGHTS_INDEX_NAME = getattr(_tf_utils, "SAFE_WEIGHTS_INDEX_NAME", "model.safetensors.index.json")
+SAFE_WEIGHTS_NAME = getattr(_tf_utils, "SAFE_WEIGHTS_NAME", "model.safetensors")
+WEIGHTS_INDEX_NAME = getattr(_tf_utils, "WEIGHTS_INDEX_NAME", "pytorch_model.bin.index.json")
+WEIGHTS_NAME = getattr(_tf_utils, "WEIGHTS_NAME", "pytorch_model.bin")
+
+# ====== 类/函数：旧版没有就降级 ======
+PushInProgress = getattr(_tf_utils, "PushInProgress", object)
+can_return_loss = getattr(_tf_utils, "can_return_loss", lambda *a, **k: False)
+find_labels = getattr(_tf_utils, "find_labels", lambda *a, **k: [])
+
+# ====== is_xxx_available：旧版没有就返回 False ======
+is_accelerate_available = getattr(_tf_utils, "is_accelerate_available", _false)
+is_apex_available = getattr(_tf_utils, "is_apex_available", _false)
+is_bitsandbytes_available = getattr(_tf_utils, "is_bitsandbytes_available", _false)
+is_datasets_available = getattr(_tf_utils, "is_datasets_available", _false)
+is_in_notebook = getattr(_tf_utils, "is_in_notebook", _false)
+is_ipex_available = getattr(_tf_utils, "is_ipex_available", _false)
+is_peft_available = getattr(_tf_utils, "is_peft_available", _false)
+is_safetensors_available = getattr(_tf_utils, "is_safetensors_available", _false)
+is_sagemaker_dp_enabled = getattr(_tf_utils, "is_sagemaker_dp_enabled", _false)
+is_sagemaker_mp_enabled = getattr(_tf_utils, "is_sagemaker_mp_enabled", _false)
+is_torch_compile_available = getattr(_tf_utils, "is_torch_compile_available", _false)
+is_torch_neuroncore_available = getattr(_tf_utils, "is_torch_neuroncore_available", _false)
+is_torch_npu_available = getattr(_tf_utils, "is_torch_npu_available", _false)
+is_torch_tpu_available = getattr(_tf_utils, "is_torch_tpu_available", _false)
 
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
@@ -207,7 +219,7 @@ class LLaVATrainer(Trainer):
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         else:
-            super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            super(LLaVATrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
@@ -242,7 +254,7 @@ class LLaVATrainer(Trainer):
         
         outputs = model(**inputs)
 
-        if self.args.past_index >= 0:
+        if getattr(self.args, "past_index", -1) >= 0:
             self._past = outputs[self.args.past_index]
 
         if labels is not None:

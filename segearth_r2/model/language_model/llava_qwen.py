@@ -9,8 +9,18 @@ import numpy as np
 import pickle
 import fvcore.nn.weight_init as weight_init
 
+from segearth_r2.model.mipha.model.language_model.configuration_mipha import MiphaVisionConfig, ProjectorConfig
+from segearth_r2.model.mipha.model.multimodal_projector.builder import build_vision_projector
+from segearth_r2.model.mipha.model.multimodal_encoder.clip_encoder import CLIPVisionTower
+from segearth_r2.model.mipha.model.multimodal_encoder.siglip_encoder import SiglipVisionTower
+from segearth_r2.model.mipha.model.multimodal_encoder.dinov2_encoder import Dinov2VisionTower
+
+
 from torch.nn import CrossEntropyLoss
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import Qwen2_5_VLForConditionalGeneration
+# 兼容老一点的 VL 名字（你环境里也有 True）
+from transformers import Qwen2VLForConditionalGeneration
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.modeling.postprocessing import sem_seg_postprocess
@@ -106,11 +116,21 @@ class AttentionLoss(nn.Module):
 
 
 class SegEarthR2ModelQwen(MiphaQwenModel):
-    def __init__(self, config: QwenVLConfig, mask_decoder_cfg=None):
-        super(SegEarthR2ModelQwen, self).__init__(config)
+    def __init__(self, config: QwenVLConfig, mask_decoder_cfg=None, qwen_model=None):
+        super(SegEarthR2ModelQwen, self).__init__(config, qwen_model=qwen_model)
+        # 让 MiphaMetaForCausalLM / prepare_inputs_labels_for_multimodal 能用 get_model().embed_tokens(...)
+        qwen_core = getattr(self, "qwen_model", None)
+
+        if qwen_core is not None and hasattr(qwen_core, "embed_tokens"):
+            self.embed_tokens = qwen_core.embed_tokens
+        elif qwen_core is not None and hasattr(qwen_core, "model") and hasattr(qwen_core.model, "embed_tokens"):
+            self.embed_tokens = qwen_core.model.embed_tokens
+        else:
+            raise AttributeError("Cannot find embed_tokens in qwen_model (expected qwen_model.embed_tokens or qwen_model.model.embed_tokens)")
         self.cfg = mask_decoder_cfg
         self.projector_outdim = _get_hidden_size(config)
 
+        # mask tower（swin）初始化（保持你原逻辑）
         if hasattr(config, "mm_vision_tower"):
             swin_type = getattr(config, "swin_type", "base")
             if swin_type == "base":
@@ -133,6 +153,7 @@ class SegEarthR2ModelQwen(MiphaQwenModel):
         return vision_tower
 
     def initialize_vision_modules(self, model_args, fsdp=None):
+        # ---- 1) 取训练参数里的路径 ----
         vision_tower = (
             model_args.vision_tower
             if hasattr(model_args, "vision_tower")
@@ -148,6 +169,7 @@ class SegEarthR2ModelQwen(MiphaQwenModel):
         swin_type = getattr(model_args, "swin_type", "base")
         self.config.swin_type = swin_type
 
+        # ---- 2) 初始化 swin mask tower（保持你原逻辑）----
         if swin_type == "base":
             vision_tower_mask = build_swin_b(vision_tower_mask)
         else:
@@ -160,20 +182,59 @@ class SegEarthR2ModelQwen(MiphaQwenModel):
             self.vision_tower_mask = vision_tower_mask
 
         self.config.use_mm_proj = True
-        vision_tower_mask.hidden_size = 256
-        vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
+        self.vision_tower_mask.hidden_size = 256
+        self.vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
 
+        # ---- 3) 关键新增：如果 MiphaMetaModel 没建出 vision_tower/mm_projector，就在这里补齐 ----
+        if getattr(self, "vision_tower", None) is None or getattr(self, "mm_projector", None) is None:
+            vt_path = vision_tower
+
+            # 这里依赖：MiphaVisionConfig / ProjectorConfig / (CLIPVisionTower, SiglipVisionTower, Dinov2VisionTower) / build_vision_projector
+            # 请把这些 import 放到 llava_qwen.py 文件顶部（顶格），不要写在类内部。
+            vt_cfg = MiphaVisionConfig(
+                vision_model_name_or_path=vt_path,
+                mm_vision_select_layer=getattr(model_args, "mm_vision_select_layer", -2),
+                mm_vision_select_feature=getattr(model_args, "mm_vision_select_feature", "patch"),
+            )
+
+            if "clip" in vt_path:
+                self.vision_tower = CLIPVisionTower(vt_cfg)
+            elif "siglip" in vt_path:
+                self.vision_tower = SiglipVisionTower(vt_cfg)
+            elif "dinov2" in vt_path:
+                self.vision_tower = Dinov2VisionTower(vt_cfg)
+            else:
+                raise ValueError(f"Unsupported vision_tower path: {vt_path}")
+
+            # projector 的输入维度 = 视觉塔输出 hidden_size；输出维度 = 语言模型 hidden_size
+            mm_hidden = getattr(self.vision_tower, "hidden_size", None)
+            if mm_hidden is None and hasattr(self.vision_tower, "config"):
+                mm_hidden = getattr(self.vision_tower.config, "hidden_size", None)
+            if mm_hidden is None:
+                raise ValueError("Cannot infer vision tower hidden size for projector")
+
+            lm_hidden = _get_hidden_size(self.config)
+            proj_cfg = ProjectorConfig(
+                mm_projector_type=getattr(model_args, "mm_projector_type", "linear"),
+                mm_hidden_size=mm_hidden,
+                hidden_size=lm_hidden,
+            )
+            self.mm_projector = build_vision_projector(proj_cfg)
 
 class SegEarthR2Qwen(MiphaQwenForCausalLM):
-    def __init__(self, config, model_args=None, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None):
-        super(SegEarthR2Qwen, self).__init__(config)
+    def __init__(self, config, model_args=None, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None,
+             qwen_model=None, lm_head=None):
+        super(SegEarthR2Qwen, self).__init__(config, qwen_model=qwen_model, lm_head=lm_head)
 
-        self.model = SegEarthR2ModelQwen(config, mask_decoder_cfg)
+        self.model = SegEarthR2ModelQwen(config, mask_decoder_cfg, qwen_model=qwen_model)
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
 
-        self.lm_head = nn.Linear(_get_hidden_size(config), _get_vocab_size(config), bias=False)
+        if lm_head is None:
+            self.lm_head = nn.Linear(_get_hidden_size(config), _get_vocab_size(config), bias=False)
+        else:
+            self.lm_head = lm_head
 
         is_train_mask_decode = getattr(config, "mask_decode_train", False)
         self.is_train_mask_decode = is_train_mask_decode
@@ -187,29 +248,85 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
         cache_dir = kwargs.pop("cache_dir", None)
         mask_decoder_cfg = kwargs.pop("mask_decoder_cfg", None)
         add_cross_attn = kwargs.pop("add_cross_attn", True)
         cross_attn_index = kwargs.pop("cross_attn_index", None)
-
-        base_lm = AutoModelForCausalLM.from_pretrained(
+        trust_remote_code = kwargs.pop("trust_remote_code", True)
+        # 先读 config 判断是否 VL
+        config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path,
             cache_dir=cache_dir,
-            *model_args,
-            **kwargs,
+            trust_remote_code=trust_remote_code,
         )
-        config = base_lm.config
+        is_vl = config.__class__.__name__ in ("Qwen2_5_VLConfig", "Qwen2VLConfig")
+
+        # 1) 先加载 base 模型
+        if is_vl:
+            base_lm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                *model_args,
+                **kwargs,
+            )
+        else:
+            base_lm = AutoModelForCausalLM.from_pretrained(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                trust_remote_code=trust_remote_code,
+                *model_args,
+                **kwargs,
+            )
+            config = base_lm.config  # 非 VL 情况用 base_lm.config
+
+        # 2) 构建你们的 wrapper
+# VL：取 language_model 当作 qwen_model（文本主干）
+        if is_vl:
+            qwen_model = base_lm.model.language_model
+            lm_head = base_lm.lm_head
+        else:
+            qwen_model = base_lm.model
+            lm_head = base_lm.lm_head
 
         model = cls(
             config=config,
             mask_decoder_cfg=mask_decoder_cfg,
             add_cross_attn=add_cross_attn,
             cross_attn_index=cross_attn_index,
+            qwen_model=qwen_model,
+            lm_head=lm_head,
         )
-        if hasattr(base_lm, "model"):
-            model.model.qwen_model.load_state_dict(base_lm.model.state_dict(), strict=False)
-        if hasattr(base_lm, "lm_head"):
-            model.lm_head.load_state_dict(base_lm.lm_head.state_dict(), strict=False)
+
+    # 3) 灌权重（关键：VL 的文本主干在 base_lm.model.language_model）
+    # 你的输出证明了：base_lm.model.children() = ['visual', 'language_model']，并且有 base_lm.lm_head :contentReference[oaicite:1]{index=1}
+        if is_vl:
+            # 只灌语言模型 + lm_head。visual 我们不需要（你训练里用的是 siglip2）
+            src_lm = base_lm.model.language_model
+            if hasattr(model.model, "qwen_model"):
+                model.model.qwen_model.load_state_dict(src_lm.state_dict(), strict=False)
+            elif hasattr(model.model, "language_model"):
+                model.model.language_model.load_state_dict(src_lm.state_dict(), strict=False)
+            else:
+            # 兜底：直接往 model.model 灌（可能会有一堆 unexpected keys，但 strict=False 不会炸）
+                model.model.load_state_dict(src_lm.state_dict(), strict=False)
+
+            if hasattr(base_lm, "lm_head") and hasattr(model, "lm_head"):
+                model.lm_head.load_state_dict(base_lm.lm_head.state_dict(), strict=False)
+
+        # 可选：释放 base_lm 的视觉部分省显存/内存
+            try:
+                del base_lm.model.visual
+            except Exception:
+                pass
+
+        else:
+        # 非 VL（纯文本）保持你原来的灌法即可
+            if hasattr(base_lm, "model") and hasattr(model.model, "qwen_model"):
+                model.model.qwen_model.load_state_dict(base_lm.model.state_dict(), strict=False)
+            if hasattr(base_lm, "lm_head") and hasattr(model, "lm_head"):
+                model.lm_head.load_state_dict(base_lm.lm_head.state_dict(), strict=False)
 
         return model
 
@@ -364,7 +481,42 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
 
     def get_model(self):
         return self.model
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+    # 让 Trainer / PEFT 能调用到
+        if gradient_checkpointing_kwargs is None:
+            gradient_checkpointing_kwargs = {}
 
+    # 标记 config（有些代码会读这个）
+        if hasattr(self, "config"):
+            setattr(self.config, "gradient_checkpointing", True)
+
+    # 尝试把底层语言模型真正打开 checkpointing
+    # 你的底层主干通常在 self.model.qwen_model（MiphaQwenModel 内）
+        qwen_core = None
+        if hasattr(self, "model") and hasattr(self.model, "qwen_model"):
+            qwen_core = self.model.qwen_model
+        elif hasattr(self, "model"):
+            qwen_core = self.model
+
+        if qwen_core is not None and hasattr(qwen_core, "gradient_checkpointing_enable"):
+            try:
+                qwen_core.gradient_checkpointing_enable(**gradient_checkpointing_kwargs)
+            except TypeError:
+            # 有些实现不收 kwargs
+                qwen_core.gradient_checkpointing_enable()
+
+    def gradient_checkpointing_disable(self):
+        if hasattr(self, "config"):
+            setattr(self.config, "gradient_checkpointing", False)
+
+        qwen_core = None
+        if hasattr(self, "model") and hasattr(self.model, "qwen_model"):
+            qwen_core = self.model.qwen_model
+        elif hasattr(self, "model"):
+            qwen_core = self.model
+
+        if qwen_core is not None and hasattr(qwen_core, "gradient_checkpointing_disable"):
+            qwen_core.gradient_checkpointing_disable()
     def output_shape(self):
         out_features = self.mask_decoder_cfg.MODEL.SWIN.OUT_FEATURES
         out_feature_strides = {

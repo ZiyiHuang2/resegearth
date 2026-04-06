@@ -25,29 +25,71 @@ from .language_model.configuration_mipha import MiphaVisionConfig, ProjectorConf
 from ..constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, \
     DEFAULT_IM_END_TOKEN
 
+def _to_dict(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if hasattr(x, "to_dict"):
+        return x.to_dict()
+    # 兜底：对象属性转 dict
+    return dict(getattr(x, "__dict__", {}))
+
 
 class MiphaMetaModel:
     def __init__(self, config):
-        super(MiphaMetaModel, self).__init__(config)
-        if "clip" in config.vision_config["vision_tower"]["vision_model_name_or_path"]:
+        # nn.Module.__init__ 不能传 config
+        super(MiphaMetaModel, self).__init__()
+        self.config = config
+
+        # ---- 兼容：vision_config 可能是 dict，也可能是类似 Qwen2_5_VLVisionConfig 的对象 ----
+        vision_cfg = _to_dict(getattr(config, "vision_config", None))
+
+# Qwen2.5-VL 这类 config.vision_config 不是 mipha 的 dict 结构
+        if not isinstance(vision_cfg, dict) or ("vision_tower" not in vision_cfg) or ("mm_projector" not in vision_cfg):
+    # 先占位，稍后由 initialize_vision_modules() 用 model_args.vision_tower 来真正构建
+            self.vision_tower = None
+            self.mm_projector = None
+            return
+
+        vision_tower_cfg = _to_dict(vision_cfg.get("vision_tower"))
+        mm_projector_cfg = _to_dict(vision_cfg.get("mm_projector"))
+
+        if vision_tower_cfg is None or mm_projector_cfg is None:
+            self.vision_tower = None
+            self.mm_projector = None
+            return
+
+        # 兼容：有些 config 里可能没有 vision_model_name_or_path，就用 mm_vision_tower 兜底
+        vision_path = vision_tower_cfg.get("vision_model_name_or_path", None)
+        if vision_path is None:
+            vision_path = getattr(config, "mm_vision_tower", None)
+
+        if vision_path is None:
+            raise ValueError(
+                "Cannot find vision model path from config.vision_config['vision_tower']['vision_model_name_or_path'] "
+                "or config.mm_vision_tower"
+            )
+
+        if "clip" in vision_path:
             self.vision_tower = CLIPVisionTower(
-                MiphaVisionConfig(**config.vision_config["vision_tower"])
+                MiphaVisionConfig(**vision_tower_cfg)
             )
-        elif "siglip" in config.vision_config["vision_tower"]["vision_model_name_or_path"]:
+        elif "siglip" in vision_path:
             self.vision_tower = SiglipVisionTower(
-                MiphaVisionConfig(**config.vision_config["vision_tower"])
+                MiphaVisionConfig(**vision_tower_cfg)
             )
-        elif "dinov2" in config.vision_config["vision_tower"]["vision_model_name_or_path"]:
+        elif "dinov2" in vision_path:
             self.vision_tower = Dinov2VisionTower(
-                MiphaVisionConfig(**config.vision_config["vision_tower"])
+                MiphaVisionConfig(**vision_tower_cfg)
             )
         else:
             raise ValueError(
-                "Vision model name or path should contain either 'clip' or 'siglip'"
+                "Vision model name or path should contain either 'clip' or 'siglip' or 'dinov2'"
             )
 
         self.mm_projector = build_vision_projector(
-            ProjectorConfig(**config.vision_config["mm_projector"])
+            ProjectorConfig(**mm_projector_cfg)
         )
 
     def get_vision_tower(self):
