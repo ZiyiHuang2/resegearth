@@ -106,8 +106,9 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     vision_tower.to(device=device)
 
+    # Keep merge-time trainable list aligned with training-time whitelist.
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
     ]
 
     if model_args.lora_enable:

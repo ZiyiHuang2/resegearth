@@ -182,6 +182,75 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 class LLaVATrainer(Trainer):
 
+    def _init_delta_grad_monitor(self, model):
+        if not getattr(self.args, 'enable_delta_grad_monitor', False):
+            return
+
+        if hasattr(self, '_delta_grad_hooks'):
+            return
+
+        self._delta_grad_hooks = []
+        self._delta_grad_latest = {}
+        self._delta_grad_prev = {}
+
+        # Track delta gradient statistics for exactly two modules:
+        # - itaa
+        # - SEG_token_projector
+        def module_key(name: str):
+            if 'itaa' in name:
+                return 'itaa'
+            if 'SEG_token_projector' in name:
+                return 'SEG_token_projector'
+            return None
+
+        def make_hook(key):
+            def hook_fn(grad):
+                if grad is None:
+                    return
+                stat = self._delta_grad_latest.setdefault(key, {'sum': 0.0, 'count': 0})
+                stat['sum'] += grad.detach().norm().item()
+                stat['count'] += 1
+            return hook_fn
+
+        for name, param in model.named_parameters():
+            key = module_key(name)
+            if key is not None and param.requires_grad:
+                self._delta_grad_hooks.append(param.register_hook(make_hook(key)))
+
+    def _log_delta_grad_monitor(self, global_step):
+        if not getattr(self.args, 'enable_delta_grad_monitor', False):
+            return
+
+        if not hasattr(self, '_delta_grad_latest') or not self._delta_grad_latest:
+            return
+
+        custom_interval = int(getattr(self.args, 'delta_grad_monitor_interval', 0))
+        if custom_interval > 0:
+            interval = custom_interval
+        else:
+            interval = max(1, int(getattr(self.args, 'logging_steps', 50)))
+        if global_step <= 0 or global_step % interval != 0:
+            return
+
+        current = {}
+        for key, value in self._delta_grad_latest.items():
+            if value['count'] > 0:
+                current[key] = value['sum'] / value['count']
+
+        if not current:
+            return
+
+        log_dict = {}
+        for key, grad_norm in current.items():
+            # grad_norm/* is absolute mean grad norm;
+            # grad_norm_delta/* is change vs previous logged step.
+            log_dict[f'grad_norm/{key}'] = grad_norm
+            prev = self._delta_grad_prev.get(key, grad_norm)
+            log_dict[f'grad_norm_delta/{key}'] = grad_norm - prev
+
+        self.log(log_dict)
+        self._delta_grad_prev = current
+
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -191,7 +260,7 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ['mm_projector']
+            keys_to_match = ['mm_projector', 'itaa']
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(['embed_tokens', 'embed_in'])
 
@@ -227,6 +296,12 @@ class LLaVATrainer(Trainer):
 
                 Subclass and override for custom behavior.
                 """
+        self._init_delta_grad_monitor(model)
+        # Log previous backward pass gradient delta, then clear buffer for current pass.
+        self._log_delta_grad_monitor(self.state.global_step)
+        if hasattr(self, '_delta_grad_latest'):
+            self._delta_grad_latest = {}
+
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:

@@ -20,8 +20,10 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
+from ..fusion.itaa import ImageTextAlignmentAdapter
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
+
 
 from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
@@ -150,6 +152,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.itaa = ImageTextAlignmentAdapter(
+            image_dim=self.mask_decoder_cfg.MODEL.SEM_SEG_HEAD.MASK_DIM,
+            llm_dim=self.config.hidden_size,
+            hidden_dim=self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+        )
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -661,6 +668,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
+        
+        itaa_loss = torch.tensor(0.0, device=mask_features.device)
+        if hasattr(self, 'itaa') and self.itaa is not None:
+            gt_mask = None
+            if seg_info is not None and len(seg_info) > 0 and 'mask' in seg_info[0]:
+                gt_mask = torch.stack([item['mask'] for item in seg_info], dim=0).to(mask_features.device)
+            SEG_embedding, itaa_loss = self.itaa(
+                mask_features,
+                SEG_embedding,
+                gt_mask=gt_mask,
+                mask_num=mask_num,
+            )
         mask_num = torch.tensor(mask_num, device=mask_features.device)
         mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
         multi_scale_features = [
@@ -753,7 +772,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
             loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
-        loss = llm_loss + mask_loss + 0.01 * loss_attention
+        loss = llm_loss + mask_loss + 0.01 * loss_attention + 0.1 * itaa_loss
 
         return CausalOutputWithMask(
             loss=loss,
@@ -812,6 +831,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
+        
+        if hasattr(self, 'itaa') and self.itaa is not None:
+            gt_mask = None
+            if seg_info is not None and len(seg_info) > 0 and 'mask' in seg_info[0]:
+                gt_mask = torch.stack([item['mask'] for item in seg_info], dim=0).to(mask_features.device)
+            SEG_embedding, _ = self.itaa(
+                mask_features,
+                SEG_embedding,
+                gt_mask=gt_mask,
+                mask_num=mask_num,
+            )
     
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]

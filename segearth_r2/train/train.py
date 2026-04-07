@@ -19,7 +19,7 @@ local_rank = None
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="pretrained_model/mllm/Mipha-3B")
+    model_name_or_path: Optional[str] = field(default="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B")
    
     version: Optional[str] = field(default="phi-2")
 
@@ -27,8 +27,8 @@ class ModelArguments:
     train_clip_backbone: bool = field(default=False)
     train_swin_backbone: bool = field(default=False)
 
-    vision_tower: str = "pretrained_model/CLIP/siglip-so400m-patch14-384"
-    vision_tower_mask: str = "pretrained_model/mask2former/maskformer2_swin_base_IN21k_384_bs16_50ep.pkl"
+    vision_tower: str = "/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip2-so400m-patch14-384"
+    vision_tower_mask: str = "/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/maskformer2_swin_base_IN21k_384_bs16_50ep.pkl"
     with_norm: bool = field(default=True)
     with_layernorm: bool = field(default=False)
     skip_init_vision: bool = field(default=False)
@@ -37,7 +37,7 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default="swin_conv")
     model_version: Optional[str] = field(default="v1")
     load_mask2former: bool = field(default=True)
-    mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
+    mask_config: Optional[str] = field(default="/home/wangchengjun/huangziyi/reseg/segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
@@ -47,7 +47,7 @@ class DataArguments:
     is_multimodal: bool = False
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
-    base_data_path: str = '/data1/xzp/data'
+    base_data_path: str = '/home/wangchengjun/huangziyi/data'
     data_ratio: str = '1'  
     switch_bs: int = 4 # 16
     fix_dataset_len: int = 0
@@ -95,6 +95,12 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
+    # Enable lightweight delta gradient logging for two modules:
+    # 1) ITAA, 2) SEG_token_projector.
+    # This monitor is NOT limited to ITAA only.
+    enable_delta_grad_monitor: bool = field(default=False)
+    # 0 means follow logging_steps; >0 uses a custom logging interval.
+    delta_grad_monitor_interval: int = field(default=0)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -287,8 +293,9 @@ def train():
 
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
+    # Delta trainables whitelist: modules in this list are explicitly unfrozen after LoRA wrapping.
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
     ]
 
     if model_args.train_swin_backbone:
