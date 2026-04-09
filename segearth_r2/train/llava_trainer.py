@@ -219,7 +219,11 @@ class LLaVATrainer(Trainer):
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         else:
-            super(LLaVATrainer, self)._save_checkpoint(model, trial)
+            parent_sig = inspect.signature(super(LLaVATrainer, self)._save_checkpoint)
+            if "metrics" in parent_sig.parameters:
+                super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+            else:
+                super(LLaVATrainer, self)._save_checkpoint(model, trial)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
@@ -254,8 +258,9 @@ class LLaVATrainer(Trainer):
         
         outputs = model(**inputs)
 
-        if getattr(self.args, "past_index", -1) >= 0:
-            self._past = outputs[self.args.past_index]
+        past_index = getattr(self.args, "past_index", -1)
+        if past_index >= 0:
+            self._past = outputs[past_index]
 
         if labels is not None:
             if unwrap_model(model)._get_name() in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():

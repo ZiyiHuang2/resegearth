@@ -16,10 +16,10 @@ from peft import LoraConfig, get_peft_model
 
 from transformers import AutoTokenizer, BitsAndBytesConfig
 import torch
-from segearth_r2.model import *
+import os
 
 from segearth_r2.datasets.dataset import get_mask_config
-from segearth_r2.model.language_model.llava_phi import SegEarthR2
+from segearth_r2.model.language_model.llava_qwen import SegEarthR2Qwen as SegEarthR2
 
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
@@ -41,14 +41,38 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    base_model_path = getattr(model_args, "base_model_path", None) or model_path
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model_path, use_fast=True)
+    model = SegEarthR2.from_pretrained(base_model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    
+    if not getattr(model, "is_train_mask_decode", False):
+        mask2former_ckpt = getattr(model_args, "vision_tower_mask", None)
+        model.initial_mask_module(mask2former_ckpt, model_args)
+
+    model.get_model().initialize_vision_modules(model_args)
     
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor
 
+    if "[SEG]" not in tokenizer.get_vocab():
+        tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
+
+    # Optional: load merged/custom local state dict from model_path when base_model_path is provided.
+    if model_path != base_model_path:
+        state_dict = None
+        safe_path = os.path.join(model_path, "model.safetensors")
+        bin_path = os.path.join(model_path, "pytorch_model.bin")
+        if os.path.isfile(safe_path):
+            from safetensors.torch import load_file as load_safetensors
+            state_dict = load_safetensors(safe_path, device="cpu")
+        elif os.path.isfile(bin_path):
+            state_dict = torch.load(bin_path, map_location="cpu")
+
+        if state_dict is not None:
+            model.load_state_dict(state_dict, strict=False)
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

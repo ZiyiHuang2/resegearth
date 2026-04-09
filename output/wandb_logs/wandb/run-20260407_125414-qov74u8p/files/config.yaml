@@ -1,0 +1,53 @@
+_wandb:
+    value:
+        cli_version: 0.25.1
+        e:
+            adunddu8eijcsg2t271l7ta2lp9pfzl2:
+                codePath: eval_val_metrics.py
+                codePathLocal: eval_val_metrics.py
+                cpu_count: 56
+                cpu_count_logical: 112
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "7140691197952"
+                        used: "502418141184"
+                email: ihuangziyi@gmail.com
+                executable: /home/wangchengjun/miniconda3/envs/segearthr2_qwen_clean/bin/python
+                gpu: NVIDIA GeForce RTX 4090
+                gpu_count: 3
+                gpu_nvidia:
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-1f96e6cf-2b48-2239-7ed6-a446917adf80
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-dac7eff1-64f7-cd01-cb07-38fa566e3093
+                    - architecture: Ada
+                      cudaCores: 16384
+                      memoryTotal: "25757220864"
+                      name: NVIDIA GeForce RTX 4090
+                      uuid: GPU-8d641088-7042-ac55-1840-5dec013926d8
+                host: h3c-H3C-UniServer-R4900-G5
+                memory:
+                    total: "265495138304"
+                os: Linux-6.17.0-5-generic-x86_64-with-glibc2.42
+                program: /home/wangchengjun/huangziyi/reseg/eval_val_metrics.py
+                python: CPython 3.10.20
+                root: /home/wangchengjun/huangziyi/reseg/resegearth_qwen/output/wandb_logs
+                startedAt: "2026-04-07T04:54:14.453715Z"
+                writerId: adunddu8eijcsg2t271l7ta2lp9pfzl2
+        m: []
+        python_version: 3.10.20
+        t:
+            "3":
+                - 2
+                - 13
+            "4": 3.10.20
+            "5": 0.25.1
+            "12": 0.25.1
+            "13": linux-x86_64

@@ -264,13 +264,22 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
 
         # 1) 先加载 base 模型
         if is_vl:
-            base_lm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                pretrained_model_name_or_path,
-                cache_dir=cache_dir,
-                trust_remote_code=trust_remote_code,
-                *model_args,
-                **kwargs,
-            )
+            try:
+                base_lm = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir,
+                    trust_remote_code=trust_remote_code,
+                    *model_args,
+                    **kwargs,
+                )
+            except Exception:
+                base_lm = Qwen2VLForConditionalGeneration.from_pretrained(
+                    pretrained_model_name_or_path,
+                    cache_dir=cache_dir,
+                    trust_remote_code=trust_remote_code,
+                    *model_args,
+                    **kwargs,
+                )
         else:
             base_lm = AutoModelForCausalLM.from_pretrained(
                 pretrained_model_name_or_path,

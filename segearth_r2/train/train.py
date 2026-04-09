@@ -9,11 +9,11 @@ from peft import LoraConfig, get_peft_model
 import warnings
 import copy
 from deepspeed.profiling.flops_profiler import get_model_profile
-
+import json
 from segearth_r2.datasets.dataset import *
 from segearth_r2.train.llava_trainer import LLaVATrainer
 from segearth_r2.model.language_model.llava_qwen import SegEarthR2Qwen as SegEarthR2
-
+from segearth_r2.utils.constants import IGNORE_INDEX
 warnings.filterwarnings('ignore')
 local_rank = None
 
@@ -34,7 +34,7 @@ class ModelArguments:
     skip_init_vision: bool = field(default=False)
     swin_type: Optional[str] = field(default="base")
     projector_outdim: Optional[int] = field(default=2048)
-    mm_projector_type: Optional[str] = field(default="swin_conv")
+    mm_projector_type: Optional[str] = field(default="linear")
     model_version: Optional[str] = field(default="v1")
     load_mask2former: bool = field(default=True)
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
@@ -52,6 +52,7 @@ class DataArguments:
     switch_bs: int = 4 # 16
     fix_dataset_len: int = 0
     segmentation: bool = True
+    mask_style: str = "legacy"
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -202,6 +203,87 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     data_collator = DataCollatorForCOCODatasetV2(tokenizer=tokenizer, clip_image_processor=clip_image_processor)
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
+def _non_ignore_spans(labels, ignore_index=IGNORE_INDEX):
+    spans = []
+    start = None
+    for idx, value in enumerate(labels):
+        if value != ignore_index and start is None:
+            start = idx
+        elif value == ignore_index and start is not None:
+            spans.append((start, idx - 1))
+            start = None
+    if start is not None:
+        spans.append((start, len(labels) - 1))
+    return spans
+
+
+def _format_prompt_for_dump(prompt_text, keep_chars=500):
+    if len(prompt_text) <= keep_chars * 2:
+        return prompt_text
+    return prompt_text[:keep_chars] + "\n...[TRUNCATED]...\n" + prompt_text[-keep_chars:]
+
+
+def dump_prompt_diagnostics_step0(
+    train_dataset,
+    tokenizer,
+    output_dir,
+    version_name,
+    mask_style,
+    max_samples=10,
+):
+    diagnostics_dir = os.path.join(output_dir, "diagnostics")
+    os.makedirs(diagnostics_dir, exist_ok=True)
+    dump_path = os.path.join(diagnostics_dir, "prompt_dump_step0.jsonl")
+    sample_cnt = min(max_samples, len(train_dataset))
+    seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
+
+    with open(dump_path, "w", encoding="utf-8") as fw:
+        for idx in range(sample_cnt):
+            sample = train_dataset[idx]
+            input_ids = sample["input_ids"]
+            labels = sample["labels"]
+            if torch.is_tensor(input_ids):
+                input_ids = input_ids.tolist()
+            if torch.is_tensor(labels):
+                labels = labels.tolist()
+
+            prompt_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+            spans = _non_ignore_spans(labels)
+            ignore_cnt = sum(1 for x in labels if x == IGNORE_INDEX)
+            total_cnt = len(labels)
+            ignore_ratio = (ignore_cnt / total_cnt) if total_cnt > 0 else 1.0
+            valid_ratio = 1.0 - ignore_ratio if total_cnt > 0 else 0.0
+            valid_label_token_count = total_cnt - ignore_cnt
+
+            sample_id = idx
+            if "annotations" in sample and len(sample["annotations"]) > 0:
+                sample_id = sample["annotations"][0].get("data_id", idx)
+
+            key_tokens = {
+                "has_image_token_id": IMAGE_TOKEN_INDEX in input_ids,
+                "has_refer_token_id": REFER_TOKEN_INDEX in input_ids,
+                "has_seg_token_id": (seg_token_id in input_ids) if seg_token_id is not None and seg_token_id >= 0 else False,
+                "has_image_text": "<image>" in prompt_text,
+                "has_refer_text": "<refer>" in prompt_text,
+                "has_seg_text": ("[SEG]" in prompt_text) or ("<seg>" in prompt_text.lower()),
+            }
+
+            record = {
+                "sample_id": sample_id,
+                "index": idx,
+                "version": version_name,
+                "mask_style": mask_style,
+                "prompt_text": _format_prompt_for_dump(prompt_text, keep_chars=500),
+                "tokenized_input_ids_len": total_cnt,
+                "label_valid_spans_non_neg100": spans,
+                "valid_label_token_count": valid_label_token_count,
+                "valid_label_token_ratio": round(valid_ratio, 6),
+                "key_token_presence": key_tokens,
+            }
+            fw.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    print(f"[rank0] prompt diagnostics dumped to: {dump_path}")
+
 def train():
     global local_rank
 
@@ -336,6 +418,15 @@ def train():
         data_args=data_args,
         training_args=training_args
     )
+    if training_args.local_rank in [-1, 0]:
+        dump_prompt_diagnostics_step0(
+            train_dataset=data_module["train_dataset"],
+            tokenizer=tokenizer,
+            output_dir=training_args.output_dir,
+            version_name=model_args.version,
+            mask_style=data_args.mask_style,
+            max_samples=10,
+        )
     training_args.dataloader_drop_last = True
 
     model.to(training_args.device)

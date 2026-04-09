@@ -35,6 +35,7 @@ class DataArguments:
     lazy_preprocess: bool = False
     base_data_path: Optional[str] = field(default="your_data_path")
     model_path: Optional[str] = field(default="your_model_path")
+    base_model_path: Optional[str] = field(default=None)
     mask_config: Optional[str] = field(
         default="../segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
     )
@@ -46,6 +47,7 @@ class DataArguments:
     eval_batch_size: int = 1
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
+    eval_dtype: str = "float16"   # float16 / bfloat16 / float32
 
     # 新增：数据集类型与 split
     dataset_name: str = "lasers"   # "lasers" or "rrsisd"
@@ -148,7 +150,13 @@ def evaluation():
     )
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
-    model.to(dtype=torch.float32, device=device)
+    if data_args.eval_dtype == "bfloat16":
+        target_dtype = torch.bfloat16
+    elif data_args.eval_dtype == "float32":
+        target_dtype = torch.float32
+    else:
+        target_dtype = torch.float16
+    model.to(dtype=target_dtype, device=device)
 
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
@@ -201,6 +209,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
         distributed.barrier()
 
     with torch.no_grad():
+        model_dtype = next(model.parameters()).dtype
         for idx, inputs in tqdm(
             enumerate(eval_dataloader),
             total=len(eval_dataloader),
@@ -215,8 +224,8 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
             outputs = model.eval_seg(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-                images=inputs["images"].float(),
-                images_clip=inputs["images_clip"].float(),
+                images=inputs["images"].to(dtype=model_dtype),
+                images_clip=inputs["images_clip"].to(dtype=model_dtype),
                 seg_info=inputs["seg_info"],
                 token_refer_id=inputs["token_refer_id"],
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],

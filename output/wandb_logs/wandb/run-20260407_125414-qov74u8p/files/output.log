@@ -1,0 +1,31 @@
+Evaluating: 100%|███████████████████████| 3481/3481 [00:57<00:00, 60.76sample/s]
+[WARN] 空GT mask，跳过: 00413.jpg id=413
+
+========== VAL METRICS ==========
+Dataset           : rrsisd
+Split             : test
+Samples           : 3480
+Skipped (empty GT): 1
+
+------ 论文主指标（Mask-level）------
+mIoU              : 0.5025 (50.25%)   ← 每样本单独算再平均
+gIoU              : 0.5025 (50.25%)   ← 同 mIoU，论文叫法
+oIoU              : 0.6568 (65.68%)   ← overall IoU = Σinter/Σunion（rs2-sam2 口径）
+cIoU              : 0.6568 (65.68%)   ← 同 oIoU，论文叫法
+mDice             : 0.5737 (57.37%)
+mRecall           : 0.6121 (61.21%)
+mPrecision        : 0.5791 (57.91%)
+Pr@0.5            : 0.5575 (55.75%)
+Pr@0.6            : 0.4991 (49.91%)
+Pr@0.7            : 0.4250 (42.50%)
+Pr@0.8            : 0.3241 (32.41%)
+Pr@0.9            : 0.1836 (18.36%)
+
+------ Box-level（非论文主指标，仅参考）------
+mean_box_IoU      : 0.4799
+mean_box_GIoU     : 0.3172  (Generalized IoU)
+mean_box_CIoU     : 0.3245  (Complete IoU)
+
+Saved metrics to: /home/wangchengjun/huangziyi/reseg/output/qwen/qwen_fair_7500steps_2gpu/rrsisd_test_metrics.json
+Saved vis meta to: /home/wangchengjun/huangziyi/reseg/output/qwen/qwen_fair_7500steps_2gpu/test_vs_siglip2/vis_meta.jsonl
+[34m[1mwandb[0m: Adding directory to artifact (/home/wangchengjun/huangziyi/reseg/output/qwen/qwen_fair_7500steps_2gpu/test_vs_siglip2)... Done. 0.2s

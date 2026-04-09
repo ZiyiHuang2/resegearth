@@ -112,7 +112,70 @@ class RS_Base_Dataset(Dataset):
         else:
             return input_ids
         
-    def preprocess_llama2(self, sources, tokenizer):
+    def _tokenize_source_as_conversation(self, source, tokenizer):
+        conv = conversation_lib.default_conversation.copy()
+        roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+        if roles[source[0]["from"]] != conv.roles[0]:
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2]
+            conv.append_message(role, sentence["value"])
+        prompt = conv.get_prompt()
+        input_ids = self.tokenizer_special_tokens(prompt, tokenizer, return_tensors='pt')
+        return prompt, input_ids
+
+    def _mask_with_chatml_style(self, sources, tokenizer):
+        input_ids_list = []
+        labels_list = []
+        for source in sources:
+            prompt, input_ids = self._tokenize_source_as_conversation(source, tokenizer)
+            labels = torch.full_like(input_ids, IGNORE_INDEX)
+            assistant_value = source[-1]["value"] if len(source) > 0 else ""
+            assistant_ids = self.tokenizer_special_tokens(assistant_value, tokenizer, return_tensors='pt')
+            if assistant_ids.numel() > 0 and input_ids.numel() >= assistant_ids.numel():
+                start_idx = -1
+                max_start = input_ids.numel() - assistant_ids.numel()
+                for st in range(max_start, -1, -1):
+                    if torch.equal(input_ids[st:st + assistant_ids.numel()], assistant_ids):
+                        start_idx = st
+                        break
+                if start_idx >= 0:
+                    labels[start_idx:start_idx + assistant_ids.numel()] = input_ids[start_idx:start_idx + assistant_ids.numel()]
+                else:
+                    prompt_snippet = prompt[:200].replace("\n", "\\n")
+                    raise ValueError(
+                        f"[mask_style=chatml] assistant span not found. "
+                        f"version={conversation_lib.default_conversation.version}, "
+                        f"assistant_len={assistant_ids.numel()}, prompt_snippet={prompt_snippet}"
+                    )
+            else:
+                prompt_snippet = prompt[:200].replace("\n", "\\n")
+                raise ValueError(
+                    f"[mask_style=chatml] invalid assistant tokens for masking. "
+                    f"version={conversation_lib.default_conversation.version}, "
+                    f"assistant_len={assistant_ids.numel()}, input_len={input_ids.numel()}, "
+                    f"prompt_snippet={prompt_snippet}"
+                )
+            input_ids_list.append(input_ids)
+            labels_list.append(labels)
+
+        return dict(
+            input_ids=torch.stack(input_ids_list, dim=0),
+            labels=torch.stack(labels_list, dim=0),
+        )
+
+    def preprocess_llama2(self, sources, tokenizer, mask_style="legacy"):
+        if mask_style == "chatml":
+            return self._mask_with_chatml_style(sources, tokenizer)
+        if mask_style != "legacy":
+            raise ValueError(
+                f"Unsupported mask_style={mask_style}. "
+                "Expected one of: legacy, chatml."
+            )
         conv = conversation_lib.default_conversation.copy()
         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
 
@@ -142,6 +205,12 @@ class RS_Base_Dataset(Dataset):
         idx = 0
         for conversation, target in zip(conversations, targets):
             total_len = int(target.ne(tokenizer.pad_token_id).sum())
+            if not conv.sep2:
+                prompt_snippet = conversation[:200].replace("\n", "\\n")
+                raise ValueError(
+                    f"[mask_style=legacy] unsupported separator: sep2 is empty. "
+                    f"version={conv.version}, prompt_snippet={prompt_snippet}"
+                )
 
             rounds = conversation.split(conv.sep2)
             if conv.version == 'v0':
@@ -174,6 +243,13 @@ class RS_Base_Dataset(Dataset):
                 target[cur_len:] = IGNORE_INDEX
                 cur_len -= end_token_cnt
             else:
+                if (conv.sep + conv.roles[1] + ": ") not in conversation:
+                    prompt_snippet = conversation[:200].replace("\n", "\\n")
+                    raise ValueError(
+                        f"[mask_style=legacy] unsupported template/separator for masking. "
+                        f"version={conv.version}, expected_sep={conv.sep + conv.roles[1] + ': '}, "
+                        f"prompt_snippet={prompt_snippet}"
+                    )
                 cur_len = 1
                 target[:cur_len] = IGNORE_INDEX
                 for i, rou in enumerate(rounds):
@@ -222,6 +298,7 @@ class RRSISDDataset(RS_Base_Dataset):
 
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
+        self.mask_style = getattr(data_args, "mask_style", "legacy")
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
 
         # 官方目录结构
@@ -318,7 +395,7 @@ class RRSISDDataset(RS_Base_Dataset):
             {'from': 'gpt', 'value': '\n' + answer}
         ]]
 
-        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        text_dict = self.preprocess_llama2(sources, self.tokenizer, mask_style=self.mask_style)
         input_ids = text_dict['input_ids'][0]
 
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
@@ -355,7 +432,7 @@ class LaSeRSDataset(RS_Base_Dataset):
         
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
-
+        self.mask_style = getattr(data_args, "mask_style", "legacy")
         if "train" in split:
             self.LaSeRS_image_path = os.path.join(base_data_path, "train/images")
             self.LaSeRS_json_path = os.path.join(base_data_path, "train/annotations", split)
@@ -432,7 +509,7 @@ class LaSeRSDataset(RS_Base_Dataset):
         sources = [[{'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
                     {'from': 'gpt', 'value': '\n' + answer}]]
 
-        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        text_dict = self.preprocess_llama2(sources, self.tokenizer, mask_style=self.mask_style)
         input_ids = text_dict['input_ids'][0]
         
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
