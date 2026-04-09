@@ -101,6 +101,12 @@ class TrainingArguments(transformers.TrainingArguments):
     enable_delta_grad_monitor: bool = field(default=False)
     # 0 means follow logging_steps; >0 uses a custom logging interval.
     delta_grad_monitor_interval: int = field(default=0)
+    loss_llm_weight: float = field(default=1.0)
+    loss_mask_weight: float = field(default=1.0)
+    loss_attention_weight: float = field(default=0.01)
+    loss_itaa_weight: float = field(default=0.1)
+    enable_attention_loss: bool = field(default=True)
+    enable_itaa_loss: bool = field(default=True)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -233,7 +239,13 @@ def train():
         model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.config.use_cache = False
-
+    model.config.loss_llm_weight = training_args.loss_llm_weight
+    model.config.loss_mask_weight = training_args.loss_mask_weight
+    model.config.loss_attention_weight = training_args.loss_attention_weight
+    model.config.loss_itaa_weight = training_args.loss_itaa_weight
+    model.config.enable_attention_loss = training_args.enable_attention_loss
+    model.config.enable_itaa_loss = training_args.enable_itaa_loss
+    
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 

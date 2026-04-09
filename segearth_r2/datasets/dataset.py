@@ -334,7 +334,17 @@ class RRSISDDataset(RS_Base_Dataset):
         data_dict['token_refer_id'] = token_refer_id
         data_dict['refer_embedding_indices'] = refer_embedding_indices
         data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
+        assert mask_num == len(data_dict['annotations']), \
+            f"mask_num({mask_num}) != annotations({len(data_dict['annotations'])})"
+        assert int(SEG_token_embedding_indices.sum().item()) == mask_num, \
+            f"SEG tokens({int(SEG_token_embedding_indices.sum().item())}) != mask_num({mask_num})"
+
         data_dict['mask_num'] = mask_num
+        data_dict['query_to_image_index'] = torch.zeros(mask_num, dtype=torch.long)
+        if masks is not None:
+            data_dict['gt_masks_per_query'] = torch.as_tensor(np.expand_dims(masks, axis=1), dtype=torch.uint8)
+        else:
+            data_dict['gt_masks_per_query'] = None
 
         return data_dict
     
@@ -556,7 +566,29 @@ class DataCollatorForCOCODatasetV2(object):
         
         if 'mask_num' in instances[0]:
             batch['mask_num'] = [instance['mask_num'] for instance in instances]
-        
+
+        if 'query_to_image_index' in instances[0] and 'mask_num' in batch:
+            query_to_image_index = []
+            for image_idx, mask_cnt in enumerate(batch['mask_num']):
+                query_to_image_index.append(
+                    torch.full((int(mask_cnt),), image_idx, dtype=torch.long)
+                )
+            batch['query_to_image_index'] = (
+                torch.cat(query_to_image_index, dim=0)
+                if len(query_to_image_index) > 0 else torch.zeros((0,), dtype=torch.long)
+            )
+
+        if 'gt_masks_per_query' in instances[0]:
+            gt_masks_per_query = []
+            for instance in instances:
+                query_masks = instance.get('gt_masks_per_query', None)
+                if query_masks is None:
+                    continue
+                gt_masks_per_query.append(query_masks)
+            if len(gt_masks_per_query) > 0:
+                batch['gt_masks_per_query'] = torch.cat(gt_masks_per_query, dim=0)
+            else:
+                batch['gt_masks_per_query'] = None        
         return batch
 
 class UnifyDatasetSingleDatasetForBatch(Dataset):
