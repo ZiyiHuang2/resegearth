@@ -14,6 +14,7 @@ from segearth_r2.datasets.dataset import *
 from segearth_r2.train.llava_trainer import LLaVATrainer
 from segearth_r2.model.language_model.llava_qwen import SegEarthR2Qwen as SegEarthR2
 from segearth_r2.utils.constants import IGNORE_INDEX
+from segearth_r2.utils import conversation as conversation_lib
 warnings.filterwarnings('ignore')
 local_rank = None
 
@@ -223,12 +224,46 @@ def _format_prompt_for_dump(prompt_text, keep_chars=500):
     return prompt_text[:keep_chars] + "\n...[TRUNCATED]...\n" + prompt_text[-keep_chars:]
 
 
+def _safe_decode_with_placeholders(tokenizer, input_ids):
+    parts = []
+    valid_ids = []
+    vocab_size = getattr(tokenizer, "vocab_size", None)
+
+    def flush_valid():
+        nonlocal valid_ids
+        if not valid_ids:
+            return
+        try:
+            parts.append(tokenizer.decode(valid_ids, skip_special_tokens=False))
+        except Exception:
+            parts.append(str(valid_ids))
+        valid_ids = []
+
+    for tid in input_ids:
+        tid_int = int(tid)
+        if tid_int == IMAGE_TOKEN_INDEX:
+            flush_valid()
+            parts.append("<image>")
+        elif tid_int == REFER_TOKEN_INDEX:
+            flush_valid()
+            parts.append("<refer>")
+        elif vocab_size is not None and (tid_int < 0 or tid_int >= vocab_size):
+            flush_valid()
+            parts.append(f"<tok:{tid_int}>")
+        else:
+            valid_ids.append(tid_int)
+
+    flush_valid()
+    return "".join(parts)
+
+
 def dump_prompt_diagnostics_step0(
     train_dataset,
     tokenizer,
     output_dir,
     version_name,
     mask_style,
+    mm_projector_trainable,
     max_samples=10,
 ):
     diagnostics_dir = os.path.join(output_dir, "diagnostics")
@@ -247,7 +282,7 @@ def dump_prompt_diagnostics_step0(
             if torch.is_tensor(labels):
                 labels = labels.tolist()
 
-            prompt_text = tokenizer.decode(input_ids, skip_special_tokens=False)
+            prompt_text = _safe_decode_with_placeholders(tokenizer, input_ids)
             spans = _non_ignore_spans(labels)
             ignore_cnt = sum(1 for x in labels if x == IGNORE_INDEX)
             total_cnt = len(labels)
@@ -273,6 +308,7 @@ def dump_prompt_diagnostics_step0(
                 "index": idx,
                 "version": version_name,
                 "mask_style": mask_style,
+                "mm_projector_trainable": bool(mm_projector_trainable),
                 "prompt_text": _format_prompt_for_dump(prompt_text, keep_chars=500),
                 "tokenized_input_ids_len": total_cnt,
                 "label_valid_spans_non_neg100": spans,
@@ -284,6 +320,23 @@ def dump_prompt_diagnostics_step0(
 
     print(f"[rank0] prompt diagnostics dumped to: {dump_path}")
 
+
+def is_mm_projector_trainable(model):
+    mm_projector = model.get_model().mm_projector
+    return any(p.requires_grad for p in mm_projector.parameters())
+
+def ensure_datasets_dataset_attr(local_rank=None):
+    try:
+        import datasets as hf_datasets
+    except Exception:
+        return
+
+    if not hasattr(hf_datasets, "Dataset"):
+        class _CompatDataset:
+            pass
+        hf_datasets.Dataset = _CompatDataset
+        if local_rank in [None, -1, 0]:
+            print("[compat] injected datasets.Dataset placeholder to avoid Trainer AttributeError")
 def train():
     global local_rank
 
@@ -347,7 +400,11 @@ def train():
     if model_args.version in conversation_lib.conv_templates:
         conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
     else:
-        conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
+        conversation_lib.default_conversation = (
+            conversation_lib.conv_templates.get("vicuna_v1")
+            or conversation_lib.conv_templates.get("llava_v1")
+            or conversation_lib.conv_templates["default"]
+        )
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
@@ -358,8 +415,9 @@ def train():
         vision_tower = model.get_vision_tower()
         vision_tower_mask = model.model.get_vision_tower_mask()
 
-        vision_tower.to(dtype=compute_dtype, device=training_args.device)
-        vision_tower_mask.to(dtype=compute_dtype, device=training_args.device)
+        current_device = torch.device(f"cuda:{training_args.local_rank}") if torch.cuda.is_available() and training_args.local_rank != -1 else training_args.device
+        vision_tower.to(dtype=compute_dtype, device=current_device)
+        vision_tower_mask.to(dtype=compute_dtype, device=current_device)
 
         data_args.is_multimodal = True
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
@@ -374,6 +432,9 @@ def train():
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
+        else:
+            for p in model.get_model().mm_projector.parameters():
+                p.requires_grad = True
 
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
@@ -381,6 +442,8 @@ def train():
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
     ]
+    if not training_args.freeze_mm_mlp_adapter:
+        train_module_list.append("mm_projector")
     if model_args.train_swin_backbone:
         train_module_list.append("vision_tower_mask")
 
@@ -418,18 +481,30 @@ def train():
         data_args=data_args,
         training_args=training_args
     )
+    mm_projector_trainable = is_mm_projector_trainable(model)
     if training_args.local_rank in [-1, 0]:
+        print(f"[rank0] freeze_mm_mlp_adapter={training_args.freeze_mm_mlp_adapter}")
+        print(f"[rank0] mm_projector_trainable={mm_projector_trainable}")
         dump_prompt_diagnostics_step0(
             train_dataset=data_module["train_dataset"],
             tokenizer=tokenizer,
             output_dir=training_args.output_dir,
             version_name=model_args.version,
             mask_style=data_args.mask_style,
+            mm_projector_trainable=mm_projector_trainable,
             max_samples=10,
         )
     training_args.dataloader_drop_last = True
 
-    model.to(training_args.device)
+    current_device = torch.device(f"cuda:{training_args.local_rank}") if torch.cuda.is_available() and training_args.local_rank != -1 else training_args.device
+    model.to(current_device)
+    if torch.cuda.is_available():
+        try:
+            import gc as _gc
+            _gc.collect()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
     # --------- 关键兼容点：不同 transformers 版本对 Trainer 是否支持 tokenizer= 不一致 ---------
     trainer_kwargs = dict(
         model=model,
@@ -443,6 +518,7 @@ def train():
     # 统一挂上 tokenizer，避免后续代码/保存流程用到 trainer.tokenizer
     trainer.tokenizer = tokenizer
     # ------------------------------------------------------------------------------
+    ensure_datasets_dataset_attr(training_args.local_rank)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

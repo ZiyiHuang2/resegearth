@@ -56,19 +56,25 @@ class DataArguments:
 
 
 def init_distributed_mode(args):
-    args.distributed = True
-    if torch.cuda.device_count() <= 1:
+    rank_env = os.environ.get("RANK")
+    world_size_env = os.environ.get("WORLD_SIZE")
+    local_rank_env = os.environ.get("LOCAL_RANK")
+    launched_with_torchrun = all(v is not None for v in [rank_env, world_size_env, local_rank_env])
+
+    args.distributed = launched_with_torchrun
+    if not launched_with_torchrun:
         args.distributed = False
         args.local_rank = 0
         args.world_size = 1
         return
 
-    distributed.init_process_group(backend="nccl")
-    local_rank = distributed.get_rank()
+    distributed.init_process_group(backend="nccl", init_method="env://")
+    rank = distributed.get_rank()
     world_size = distributed.get_world_size()
+    local_rank = int(local_rank_env)
     torch.cuda.set_device(local_rank)
 
-    print(f"I am rank {local_rank} in this world of size {world_size}!")
+    print(f"I am rank {rank} (local_rank={local_rank}) in this world of size {world_size}!")
     args.local_rank = local_rank
     args.world_size = world_size
 
@@ -150,13 +156,19 @@ def evaluation():
     )
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
-    if data_args.eval_dtype == "bfloat16":
-        target_dtype = torch.bfloat16
-    elif data_args.eval_dtype == "float32":
-        target_dtype = torch.float32
-    else:
-        target_dtype = torch.float16
-    model.to(dtype=target_dtype, device=device)
+    dtype_map = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    eval_dtype = dtype_map.get(data_args.eval_dtype.lower())
+    if eval_dtype is None:
+        raise ValueError(f"Unsupported eval_dtype: {data_args.eval_dtype}. Use float16 / bfloat16 / float32")
+
+    model.to(dtype=eval_dtype, device=device)
 
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]

@@ -398,6 +398,8 @@ conv_templates = {
     "v0_mmtag": conv_llava_v0_mmtag,
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
+    "qwen2_5_vl": conv_llava_v1,
+    "qwen2_5_vl_mmtag": conv_llava_v1_mmtag,
     "llava_llama_2": conv_llava_llama_2,
 
     "mpt": conv_mpt,

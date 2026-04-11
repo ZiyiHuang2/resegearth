@@ -13,7 +13,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig, BitsAndBytesConfig
+from transformers import AutoTokenizer, BitsAndBytesConfig
 
 from segearth_r2.datasets.dataset import get_mask_config
 from segearth_r2.model.language_model.llava_qwen import SegEarthR2Qwen as SegEarthR2
@@ -42,6 +42,7 @@ def parse_args(args):
     parser.add_argument("--lora_dropout", default=0.05, type=float)
     parser.add_argument("--lora_weight_path", default="", type=str)
     parser.add_argument("--lora_bias", default="none", type=str)
+    parser.add_argument("--version", default="qwen2_5_vl", type=str)
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     parser.add_argument( "--base_model_path", default=None,help="Base model path/repo used to build model+tokenizer before loading DeepSpeed zero checkpoint weights.")
     parser.add_argument("--mm_projector_type", default="linear", type=str)

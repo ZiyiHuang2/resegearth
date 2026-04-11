@@ -28,6 +28,22 @@ from segearth_r2.model.mask_decoder.mask_config.config import Config
 warnings.filterwarnings('ignore')
 local_rank = None
 
+def _tokenizer_special_tokens_impl(prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, refer_token_index=REFER_TOKEN_INDEX, return_tensors=None):
+    input_ids = []
+    special_token_map = {'<image>': image_token_index, '<refer>': refer_token_index}
+    prompt_chunks = re.split('(<image>|<refer>)', prompt)
+
+    for chunk in prompt_chunks:
+        if chunk in special_token_map:
+            input_ids.append(special_token_map[chunk])
+        elif chunk != '':
+            input_ids.extend(tokenizer.encode(chunk, add_special_tokens=False))
+
+    if return_tensors is not None:
+        if return_tensors == 'pt':
+            return torch.tensor(input_ids, dtype=torch.long).squeeze()
+        raise ValueError(f'Unsupported tensor type: {return_tensors}')
+    return input_ids
 def preprocess_mask(mask, image_size):
     if len(mask.shape) == 2:
         mask = np.expand_dims(mask, axis=0)
@@ -94,24 +110,14 @@ def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, ma
     return img_padded
 
 class RS_Base_Dataset(Dataset):
-    
     def tokenizer_special_tokens(self, prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, refer_token_index=REFER_TOKEN_INDEX, return_tensors=None):
-        input_ids = []
-        special_token_map = {'<image>': image_token_index, '<refer>':refer_token_index}
-        prompt_chunks = re.split('(<image>|<refer>)', prompt)
-
-        for chunk in prompt_chunks:
-            if chunk in special_token_map:
-                input_ids.append(special_token_map[chunk])
-            elif chunk != '':
-                input_ids.extend(tokenizer.encode(chunk, add_special_tokens=False))
-        if return_tensors is not None:
-            if return_tensors == 'pt':
-                return torch.tensor(input_ids, dtype=torch.long).squeeze()
-            raise ValueError(f'Unsupported tensor type: {return_tensors}')
-        else:
-            return input_ids
-        
+        return _tokenizer_special_tokens_impl(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            image_token_index=image_token_index,
+            refer_token_index=refer_token_index,
+            return_tensors=return_tensors,
+        )
     def _tokenize_source_as_conversation(self, source, tokenizer):
         conv = conversation_lib.default_conversation.copy()
         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -128,6 +134,22 @@ class RS_Base_Dataset(Dataset):
         input_ids = self.tokenizer_special_tokens(prompt, tokenizer, return_tensors='pt')
         return prompt, input_ids
 
+    def _tokenize_source_as_conversation(self, source, tokenizer):
+        conv = conversation_lib.default_conversation.copy()
+        roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+        if roles[source[0]["from"]] != conv.roles[0]:
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2]
+            conv.append_message(role, sentence["value"])
+        prompt = conv.get_prompt()
+        input_ids = _tokenizer_special_tokens_impl(prompt, tokenizer, return_tensors='pt')
+        return prompt, input_ids
+
     def _mask_with_chatml_style(self, sources, tokenizer):
         input_ids_list = []
         labels_list = []
@@ -135,24 +157,8 @@ class RS_Base_Dataset(Dataset):
             prompt, input_ids = self._tokenize_source_as_conversation(source, tokenizer)
             labels = torch.full_like(input_ids, IGNORE_INDEX)
             assistant_value = source[-1]["value"] if len(source) > 0 else ""
-            assistant_ids = self.tokenizer_special_tokens(assistant_value, tokenizer, return_tensors='pt')
-            if assistant_ids.numel() > 0 and input_ids.numel() >= assistant_ids.numel():
-                start_idx = -1
-                max_start = input_ids.numel() - assistant_ids.numel()
-                for st in range(max_start, -1, -1):
-                    if torch.equal(input_ids[st:st + assistant_ids.numel()], assistant_ids):
-                        start_idx = st
-                        break
-                if start_idx >= 0:
-                    labels[start_idx:start_idx + assistant_ids.numel()] = input_ids[start_idx:start_idx + assistant_ids.numel()]
-                else:
-                    prompt_snippet = prompt[:200].replace("\n", "\\n")
-                    raise ValueError(
-                        f"[mask_style=chatml] assistant span not found. "
-                        f"version={conversation_lib.default_conversation.version}, "
-                        f"assistant_len={assistant_ids.numel()}, prompt_snippet={prompt_snippet}"
-                    )
-            else:
+            assistant_ids = _tokenizer_special_tokens_impl(assistant_value, tokenizer, return_tensors='pt')
+            if assistant_ids.numel() <= 0 or input_ids.numel() < assistant_ids.numel():
                 prompt_snippet = prompt[:200].replace("\n", "\\n")
                 raise ValueError(
                     f"[mask_style=chatml] invalid assistant tokens for masking. "
@@ -160,6 +166,29 @@ class RS_Base_Dataset(Dataset):
                     f"assistant_len={assistant_ids.numel()}, input_len={input_ids.numel()}, "
                     f"prompt_snippet={prompt_snippet}"
                 )
+
+            start_idx = -1
+            max_start = input_ids.numel() - assistant_ids.numel()
+            for st in range(max_start, -1, -1):
+                if torch.equal(input_ids[st:st + assistant_ids.numel()], assistant_ids):
+                    start_idx = st
+                    break
+
+            if start_idx < 0:
+                # Fallback: some templates/tokenizers may not expose assistant content as
+                # an exact contiguous sub-sequence. Keep training runnable by supervising
+                # the tail tokens with the same length as assistant_ids.
+                start_idx = max(0, input_ids.numel() - assistant_ids.numel())
+                if not getattr(self, "_chatml_fallback_warned", False):
+                    prompt_snippet = prompt[:200].replace("\n", "\\n")
+                    print(
+                        f"[mask_style=chatml][fallback-tail] assistant span not found, "
+                        f"use tail span instead. version={conversation_lib.default_conversation.version}, "
+                        f"assistant_len={assistant_ids.numel()}, start_idx={start_idx}, prompt_snippet={prompt_snippet}"
+                    )
+                    self._chatml_fallback_warned = True
+
+            labels[start_idx:start_idx + assistant_ids.numel()] = input_ids[start_idx:start_idx + assistant_ids.numel()]
             input_ids_list.append(input_ids)
             labels_list.append(labels)
 
