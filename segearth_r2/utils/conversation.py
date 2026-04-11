@@ -10,6 +10,7 @@ class SeparatorStyle(Enum):
     MPT = auto()
     PLAIN = auto()
     LLAMA_2 = auto()
+    CHATML = auto()
 
 
 @dataclasses.dataclass
@@ -98,6 +99,17 @@ class Conversation:
                     ret += message + seps[i % 2]
                 else:
                     ret += ""
+        elif self.sep_style == SeparatorStyle.CHATML:
+            ret = ""
+            if self.system:
+                ret += f"<|im_start|>system\n{self.system}\n<|im_end|>\n"
+            for role, message in messages:
+                if message:
+                    if type(message) is tuple:
+                        message, _, _ = message
+                    ret += f"<|im_start|>{role}\n{message}\n<|im_end|>\n"
+                else:
+                    ret += f"<|im_start|>{role}\n"
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
@@ -358,6 +370,30 @@ conv_llava_v1_mmtag = Conversation(
     version="v1_mmtag",
 )
 
+conv_qwen2_5_vl = Conversation(
+    system="You are a helpful language and vision assistant. "
+           "You are able to understand the visual content that the user provides, "
+           "and assist the user with a variety of tasks using natural language.",
+    roles=("user", "assistant"),
+    version="qwen2_5_vl",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.CHATML,
+    sep="",
+)
+
+conv_qwen2_5_vl_mmtag = Conversation(
+    system="You are a helpful language and vision assistant. "
+           "You are able to understand the visual content that the user provides, "
+           "and assist the user with a variety of tasks using natural language.",
+    roles=("user", "assistant"),
+    version="qwen2_5_vl_mmtag",
+    messages=(),
+    offset=0,
+    sep_style=SeparatorStyle.CHATML,
+    sep="",
+)
+
 conv_llava_opt = Conversation(
     system="You are a helpful language and vision assistant. "
            "You are able to understand the visual content that the user provides, "
@@ -398,8 +434,8 @@ conv_templates = {
     "v0_mmtag": conv_llava_v0_mmtag,
     "llava_v1": conv_llava_v1,
     "v1_mmtag": conv_llava_v1_mmtag,
-    "qwen2_5_vl": conv_llava_v1,
-    "qwen2_5_vl_mmtag": conv_llava_v1_mmtag,
+    "qwen2_5_vl": conv_qwen2_5_vl,
+    "qwen2_5_vl_mmtag": conv_qwen2_5_vl_mmtag,
     "llava_llama_2": conv_llava_llama_2,
 
     "mpt": conv_mpt,

@@ -110,30 +110,6 @@ def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, ma
     return img_padded
 
 class RS_Base_Dataset(Dataset):
-    def tokenizer_special_tokens(self, prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, refer_token_index=REFER_TOKEN_INDEX, return_tensors=None):
-        return _tokenizer_special_tokens_impl(
-            prompt=prompt,
-            tokenizer=tokenizer,
-            image_token_index=image_token_index,
-            refer_token_index=refer_token_index,
-            return_tensors=return_tensors,
-        )
-    def _tokenize_source_as_conversation(self, source, tokenizer):
-        conv = conversation_lib.default_conversation.copy()
-        roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
-
-        if roles[source[0]["from"]] != conv.roles[0]:
-            source = source[1:]
-
-        conv.messages = []
-        for j, sentence in enumerate(source):
-            role = roles[sentence["from"]]
-            assert role == conv.roles[j % 2]
-            conv.append_message(role, sentence["value"])
-        prompt = conv.get_prompt()
-        input_ids = self.tokenizer_special_tokens(prompt, tokenizer, return_tensors='pt')
-        return prompt, input_ids
-
     def _tokenize_source_as_conversation(self, source, tokenizer):
         conv = conversation_lib.default_conversation.copy()
         roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
@@ -151,44 +127,68 @@ class RS_Base_Dataset(Dataset):
         return prompt, input_ids
 
     def _mask_with_chatml_style(self, sources, tokenizer):
+        def _find_subseq(haystack, needle, start=0):
+            if needle.numel() == 0 or haystack.numel() < needle.numel():
+                return -1
+            max_start = haystack.numel() - needle.numel()
+            for st in range(start, max_start + 1):
+                if torch.equal(haystack[st:st + needle.numel()], needle):
+                    return st
+            return -1
+
         input_ids_list = []
         labels_list = []
+        assistant_prefix_ids = _tokenizer_special_tokens_impl("<|im_start|>assistant\n", tokenizer, return_tensors='pt')
+        im_end_ids = _tokenizer_special_tokens_impl("<|im_end|>", tokenizer, return_tensors='pt')
         for source in sources:
             prompt, input_ids = self._tokenize_source_as_conversation(source, tokenizer)
             labels = torch.full_like(input_ids, IGNORE_INDEX)
-            assistant_value = source[-1]["value"] if len(source) > 0 else ""
-            assistant_ids = _tokenizer_special_tokens_impl(assistant_value, tokenizer, return_tensors='pt')
-            if assistant_ids.numel() <= 0 or input_ids.numel() < assistant_ids.numel():
-                prompt_snippet = prompt[:200].replace("\n", "\\n")
-                raise ValueError(
-                    f"[mask_style=chatml] invalid assistant tokens for masking. "
-                    f"version={conversation_lib.default_conversation.version}, "
-                    f"assistant_len={assistant_ids.numel()}, input_len={input_ids.numel()}, "
-                    f"prompt_snippet={prompt_snippet}"
-                )
-
-            start_idx = -1
-            max_start = input_ids.numel() - assistant_ids.numel()
-            for st in range(max_start, -1, -1):
-                if torch.equal(input_ids[st:st + assistant_ids.numel()], assistant_ids):
-                    start_idx = st
+            chatml_masked = False
+            cursor = 0
+            while True:
+                assist_pos = _find_subseq(input_ids, assistant_prefix_ids, start=cursor)
+                if assist_pos < 0:
                     break
+                content_start = assist_pos + assistant_prefix_ids.numel()
+                content_end_marker = _find_subseq(input_ids, im_end_ids, start=content_start)
+                if content_end_marker < 0:
+                    break
+                if content_end_marker > content_start:
+                    labels[content_start:content_end_marker] = input_ids[content_start:content_end_marker]
+                    chatml_masked = True
+                cursor = content_end_marker + im_end_ids.numel()
 
-            if start_idx < 0:
-                # Fallback: some templates/tokenizers may not expose assistant content as
-                # an exact contiguous sub-sequence. Keep training runnable by supervising
-                # the tail tokens with the same length as assistant_ids.
-                start_idx = max(0, input_ids.numel() - assistant_ids.numel())
-                if not getattr(self, "_chatml_fallback_warned", False):
+            if not chatml_masked:
+                assistant_value = source[-1]["value"] if len(source) > 0 else ""
+                assistant_ids = _tokenizer_special_tokens_impl(assistant_value, tokenizer, return_tensors='pt')
+                if assistant_ids.numel() <= 0 or input_ids.numel() < assistant_ids.numel():
                     prompt_snippet = prompt[:200].replace("\n", "\\n")
-                    print(
-                        f"[mask_style=chatml][fallback-tail] assistant span not found, "
-                        f"use tail span instead. version={conversation_lib.default_conversation.version}, "
-                        f"assistant_len={assistant_ids.numel()}, start_idx={start_idx}, prompt_snippet={prompt_snippet}"
+                    raise ValueError(
+                        f"[mask_style=chatml] invalid assistant tokens for masking. "
+                        f"version={conversation_lib.default_conversation.version}, "
+                        f"assistant_len={assistant_ids.numel()}, input_len={input_ids.numel()}, "
+                        f"prompt_snippet={prompt_snippet}"
                     )
-                    self._chatml_fallback_warned = True
 
-            labels[start_idx:start_idx + assistant_ids.numel()] = input_ids[start_idx:start_idx + assistant_ids.numel()]
+                start_idx = -1
+                max_start = input_ids.numel() - assistant_ids.numel()
+                for st in range(max_start, -1, -1):
+                    if torch.equal(input_ids[st:st + assistant_ids.numel()], assistant_ids):
+                        start_idx = st
+                        break
+
+                if start_idx < 0:
+                    start_idx = max(0, input_ids.numel() - assistant_ids.numel())
+                    if not getattr(self, "_chatml_fallback_warned", False):
+                        prompt_snippet = prompt[:200].replace("\n", "\\n")
+                        print(
+                            f"[mask_style=chatml][fallback-tail] assistant span not found, "
+                            f"use tail span instead. version={conversation_lib.default_conversation.version}, "
+                            f"assistant_len={assistant_ids.numel()}, start_idx={start_idx}, prompt_snippet={prompt_snippet}"
+                        )
+                        self._chatml_fallback_warned = True
+
+                labels[start_idx:start_idx + assistant_ids.numel()] = input_ids[start_idx:start_idx + assistant_ids.numel()]
             input_ids_list.append(input_ids)
             labels_list.append(labels)
 
