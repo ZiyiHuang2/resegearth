@@ -14,6 +14,7 @@ import xml.etree.ElementTree as ET
 from pycocotools import mask as M
 from typing import Dict, Sequence, Optional
 import torch
+import re
 import transformers
 from torch.utils.data import Dataset
 import numpy as np
@@ -92,6 +93,17 @@ def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, ma
     ) # (1024, 1024, 3)
     
     return img_padded
+
+def extract_seg_phrases(answer: str):
+    """
+    从 answer 中抽取 <p> ... </p> 内的短语。
+    例如:
+    <p>airplane engine</p> [SEG]
+    <p>wing</p> [SEG]
+    """
+    phrases = re.findall(r"<p>\s*(.*?)\s*</p>", answer, flags=re.IGNORECASE | re.DOTALL)
+    phrases = [re.sub(r"\s+", " ", p).strip() for p in phrases]
+    return phrases
 
 class RS_Base_Dataset(Dataset):
     
@@ -249,7 +261,9 @@ class RRSISDDataset(RS_Base_Dataset):
 
     def __getitem__(self, idx):
         ref = self.reason_file[idx]
-
+        ann = self.ann_dict[ref["ann_id"]]
+        cat_id = ann.get("category_id", ann.get("categories_id", None))
+        cat_name = self.category_dict.get(cat_id, "target")
         image_path = os.path.join(self.image_dir, ref["file_name"])
         data_id = ref["ref_id"]
 
@@ -293,12 +307,21 @@ class RRSISDDataset(RS_Base_Dataset):
         image_RGB = preprocess_image(image_path)
         image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
         data_dict['image'] = (image_tensor - self.pixel_mean) / self.pixel_std
-
+        data_dict['seg_phrase_input_ids'] = seg_phrase_input_ids
         data_dict['annotations'] = []
 
         # 这套数据已确认 image=ann=ref 一一对应，这里就是单目标
         mask_num = 1
+        seg_phrases = extract_seg_phrases(answer)
 
+        # 最小稳妥策略：phrase 数量和 mask_num 不一致时，这个样本不做 contrastive supervision
+        if len(seg_phrases) != mask_num:
+            seg_phrase_input_ids = []
+        else:
+            seg_phrase_input_ids = [
+                torch.tensor(self.tokenizer.encode(p, add_special_tokens=False), dtype=torch.long)
+                for p in seg_phrases
+            ]
         data_dict['annotations'].append({
             'data_id': data_id,
             'mask_id': 0,
@@ -307,6 +330,8 @@ class RRSISDDataset(RS_Base_Dataset):
             'height': image_height,
             'width': image_width,
             'image_id': os.path.basename(image_path).split(".")[0],
+            'category_id': int(cat_id) if cat_id is not None else 0,
+            'category_name': cat_name,
         })
 
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
@@ -408,11 +433,20 @@ class LaSeRSDataset(RS_Base_Dataset):
         image_RGB = preprocess_image(image_path)
         image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
         data_dict['image'] = (image_tensor - self.pixel_mean) / self.pixel_std
-        
+        data_dict['seg_phrase_input_ids'] = seg_phrase_input_ids
         data_dict['annotations'] = []
         
         mask_num = answer.count("[SEG]")
+        seg_phrases = extract_seg_phrases(answer)
 
+        # 最小稳妥策略：phrase 数量和 mask_num 不一致时，这个样本不做 contrastive supervision
+        if len(seg_phrases) != mask_num:
+            seg_phrase_input_ids = []
+        else:
+            seg_phrase_input_ids = [
+                torch.tensor(self.tokenizer.encode(p, add_special_tokens=False), dtype=torch.long)
+                for p in seg_phrases
+            ]
         for i in range(mask_num):
             data_dict['annotations'].append({
                 'data_id': data_id,
@@ -422,6 +456,8 @@ class LaSeRSDataset(RS_Base_Dataset):
                 'height': image_height,
                 'width': image_width,
                 'image_id': os.path.basename(image_path).split(".")[0],
+                'category_id': int(data_info.get('category_id', 0)),
+                'category_name': data_info.get('category_name', data_info.get('category', 'unknown')),
             })
             
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
@@ -556,7 +592,12 @@ class DataCollatorForCOCODatasetV2(object):
         
         if 'mask_num' in instances[0]:
             batch['mask_num'] = [instance['mask_num'] for instance in instances]
-        
+        if 'seg_phrase_input_ids' in instances[0]:
+            flat_seg_phrase_input_ids = []
+            for instance in instances:
+                for x in instance['seg_phrase_input_ids']:
+                    flat_seg_phrase_input_ids.append(x)
+            batch['seg_phrase_input_ids'] = flat_seg_phrase_input_ids        
         return batch
 
 class UnifyDatasetSingleDatasetForBatch(Dataset):

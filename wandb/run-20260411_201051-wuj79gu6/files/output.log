@@ -1,0 +1,32 @@
+  0%|                                                                                               | 0/20 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/home/wangchengjun/huangziyi/reseg/segearth+ov/segearth_r2/train/train.py", line 364, in <module>
+    train()
+  File "/home/wangchengjun/huangziyi/reseg/segearth+ov/segearth_r2/train/train.py", line 355, in train
+    trainer.train()
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/trainer.py", line 1624, in train
+    return inner_training_loop(
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/trainer.py", line 1928, in _inner_training_loop
+    for step, inputs in enumerate(epoch_iterator):
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/accelerate/data_loader.py", line 452, in __iter__
+    current_batch = next(dataloader_iter)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 630, in __next__
+    data = self._next_data()
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1345, in _next_data
+    return self._process_data(data)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1371, in _process_data
+    data.reraise()
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/_utils.py", line 694, in reraise
+    raise exception
+KeyError: Caught KeyError in DataLoader worker process 0.
+Original Traceback (most recent call last):
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py", line 308, in _worker_loop
+    data = fetcher.fetch(index)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 51, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 51, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/wangchengjun/huangziyi/reseg/segearth+ov/segearth_r2/datasets/dataset.py", line 618, in __getitem__
+    output_data = self.datasets[self.cur_dataset_index][data_idx]
+  File "/home/wangchengjun/huangziyi/reseg/segearth+ov/segearth_r2/datasets/dataset.py", line 429, in __getitem__
+    'category_id': int(data_info['category_id'])
+KeyError: 'category_id'

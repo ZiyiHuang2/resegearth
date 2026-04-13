@@ -12,6 +12,7 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.utils.memory import retry_if_cuda_oom
+from ..open_vocab.seg_text_contrast import SegTextContrastHead
 
 from ..mipha.model.language_model.mipha_phi import (MiphaPhiForCausalLM, MiphaPhiModel)
 
@@ -150,7 +151,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-            
+        self.seg_text_contrast_head = SegTextContrastHead(
+            dim=self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+            proj_dim=self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+            tau=0.07,
+        )
+        self.contrast_loss_weight = 0.1    
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
             def get_w(weights, keyword):
@@ -602,6 +608,55 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
            
+    def encode_seg_phrase_inputs(self, seg_phrase_input_ids, device):
+        """
+        seg_phrase_input_ids: List[Tensor], each tensor shape [Li]
+        return:
+            text_embeds: [N, D] or None
+        """
+        if seg_phrase_input_ids is None or len(seg_phrase_input_ids) == 0:
+            return None
+
+    # 去掉空 phrase
+        valid_inputs = [x for x in seg_phrase_input_ids if x is not None and x.numel() > 0]
+        if len(valid_inputs) == 0:
+            return None
+
+        max_len = max(x.numel() for x in valid_inputs)
+
+        padded = []
+        attn = []
+        for x in valid_inputs:
+            x = x.to(device)
+            pad_len = max_len - x.numel()
+            if pad_len > 0:
+                x_pad = torch.cat(
+                    [x, torch.zeros(pad_len, dtype=x.dtype, device=device)],
+                    dim=0
+                )
+                m = torch.cat(
+                    [
+                        torch.ones(x.numel(), dtype=torch.float32, device=device),
+                        torch.zeros(pad_len, dtype=torch.float32, device=device),
+                    ],
+                    dim=0
+                )
+            else:
+                x_pad = x
+                m = torch.ones(x.numel(), dtype=torch.float32, device=device)
+
+            padded.append(x_pad)
+            attn.append(m)
+
+        padded = torch.stack(padded, dim=0)   # [N, L]
+        attn = torch.stack(attn, dim=0)       # [N, L]
+
+       # 直接复用当前模型 token embedding，再映射到 SEG 空间
+        text_token_embeds = self.get_model().embed_tokens(padded)              # [N, L, hidden_size]
+        text_token_embeds = self.SEG_token_projector(text_token_embeds)        # [N, L, seg_dim]
+
+        text_embeds = (text_token_embeds * attn.unsqueeze(-1)).sum(dim=1) / attn.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return text_embeds       
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -617,6 +672,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict: Optional[bool] = None,
             seg_info=None,
             token_refer_id=None,
+            seg_phrase_input_ids=None,
             SEG_token_embedding_indices=None,
             global_step=None,
             mask_num=None,
@@ -658,7 +714,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        
+        loss_contrast = torch.tensor(0.0, device=SEG_embedding.device)
+
+        if self.training and seg_phrase_input_ids is not None and len(seg_phrase_input_ids) > 0:
+            text_embeds = self.encode_seg_phrase_inputs(seg_phrase_input_ids, SEG_embedding.device)
+
+            if text_embeds is not None:
+                seg_query_embeds = SEG_embedding.squeeze(1)  # [N, D]
+
+        # 只有 query 数量和 phrase 数量对齐时才算 contrastive
+                if seg_query_embeds.shape[0] == text_embeds.shape[0]:
+                    loss_contrast = self.seg_text_contrast_head(seg_query_embeds, text_embeds)
+
+        if global_step is not None and global_step < 5:
+            print(
+                f"[debug] contrast loss: {float(loss_contrast.detach().cpu()):.4f} | "
+                f"num_seg: {SEG_embedding.shape[0]} | "
+                f"num_phrase: {0 if seg_phrase_input_ids is None else len(seg_phrase_input_ids)}"
+            )
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
         mask_num = torch.tensor(mask_num, device=mask_features.device)
@@ -700,17 +773,34 @@ class SegEarthR2(MiphaPhiForCausalLM):
             elif 'mask' in seg_info[0]:
                 targets = []
                 for gt_mask in seg_info:
-                    targets.append(
-                        {
-                            'labels': torch.tensor([0]).to(mask_outputs['pred_masks'].device),
-                            'masks': gt_mask['mask'].to(mask_outputs['pred_masks'].device),
-                            'valid': None,
-                            'inst_id': None
-                        }
+                    cur_label = gt_mask.get('category_id', 0)
+                if isinstance(cur_label, torch.Tensor):
+                    cur_label_tensor = cur_label.to(mask_outputs['pred_masks'].device).view(-1).long()
+                else:
+                    cur_label_tensor = torch.tensor(
+                        [int(cur_label)],
+                        dtype=torch.int64,
+                        device=mask_outputs['pred_masks'].device
                     )
+
+                targets.append(
+                    {
+                        'labels': cur_label_tensor,
+                        'masks': gt_mask['mask'].to(mask_outputs['pred_masks'].device),
+                        'valid': None,
+                        'inst_id': None
+                    }
+            )
             else:
                 targets = None
+            if global_step is not None and global_step < 5:
+                print("[debug] seg_info keys:", list(seg_info[0].keys()))
+                print("[debug] target labels:", [t["labels"].detach().cpu().tolist() for t in targets[:8]])
+            if global_step is not None and global_step < 5:
+                print("[debug] mask_outputs keys:", list(mask_outputs.keys()))
             mask_losses = self.criterion(mask_outputs, targets)
+            if global_step is not None and global_step < 5:
+                print("[debug] mask loss keys:", list(mask_losses.keys()))
             weight_dict = self.weight_dict
 
             loss_mask = 0.0
@@ -753,7 +843,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
             loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
-        loss = llm_loss + mask_loss + 0.01 * loss_attention
+        loss = llm_loss + mask_loss + 0.01 * loss_attention + self.contrast_loss_weight * loss_contrast
 
         return CausalOutputWithMask(
             loss=loss,
