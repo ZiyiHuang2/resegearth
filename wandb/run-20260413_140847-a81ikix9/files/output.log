@@ -1,0 +1,77 @@
+ 15%|█████████████                                                                          | 3/20 [00:05<00:25,  1.50s/it]
+[debug] outputs.attentions is None: False
+[debug] num attentions: 32
+[debug] contrast loss: 0.0000 | num_seg: 1 | num_phrase: 1 | contrast_active: True | contrast_matched: True
+[debug] seg_info keys: ['data_id', 'mask_id', 'mask', 'image_path', 'height', 'width', 'image_id']
+[debug] target labels: [[0]]
+[debug] mask_outputs keys: ['pred_SEG_logits', 'pred_masks', 'aux_outputs']
+[debug] mask loss keys: ['loss_SEG_class', 'loss_mask', 'loss_dice', 'loss_SEG_class_0', 'loss_mask_0', 'loss_dice_0', 'loss_SEG_class_1', 'loss_mask_1', 'loss_dice_1', 'loss_SEG_class_2', 'loss_mask_2', 'loss_dice_2', 'loss_SEG_class_3', 'loss_mask_3', 'loss_dice_3', 'loss_SEG_class_4', 'loss_mask_4', 'loss_dice_4', 'loss_SEG_class_5', 'loss_mask_5', 'loss_dice_5', 'loss_SEG_class_6', 'loss_mask_6', 'loss_dice_6', 'loss_SEG_class_7', 'loss_mask_7', 'loss_dice_7', 'loss_SEG_class_8', 'loss_mask_8', 'loss_dice_8']
+{'loss_mask': 5.261789798736572, 'loss_dice': 49.789146423339844, 'loss_llm': 5.3125, 'loss_attention': 0.0, 'epoch': 0}
+{'loss': 60.3634, 'grad_norm': 214.61222809352134, 'learning_rate': 0.0001, 'epoch': 0.0}
+[debug] outputs.attentions is None: False
+[debug] num attentions: 32
+[debug] contrast loss: 0.6953 | num_seg: 2 | num_phrase: 2 | contrast_active: True | contrast_matched: True
+[debug] seg_info keys: ['data_id', 'mask_id', 'mask', 'image_path', 'height', 'width', 'image_id']
+[debug] target labels: [[0], [0]]
+[debug] mask_outputs keys: ['pred_SEG_logits', 'pred_masks', 'aux_outputs']
+[debug] mask loss keys: ['loss_SEG_class', 'loss_mask', 'loss_dice', 'loss_SEG_class_0', 'loss_mask_0', 'loss_dice_0', 'loss_SEG_class_1', 'loss_mask_1', 'loss_dice_1', 'loss_SEG_class_2', 'loss_mask_2', 'loss_dice_2', 'loss_SEG_class_3', 'loss_mask_3', 'loss_dice_3', 'loss_SEG_class_4', 'loss_mask_4', 'loss_dice_4', 'loss_SEG_class_5', 'loss_mask_5', 'loss_dice_5', 'loss_SEG_class_6', 'loss_mask_6', 'loss_dice_6', 'loss_SEG_class_7', 'loss_mask_7', 'loss_dice_7', 'loss_SEG_class_8', 'loss_mask_8', 'loss_dice_8']
+{'loss_mask': 11.802299499511719, 'loss_dice': 48.76976776123047, 'loss_llm': 3.34375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 63.9852, 'grad_norm': 500.6596824947873, 'learning_rate': 9.931806517013612e-05, 'epoch': 0.0}
+[debug] outputs.attentions is None: False
+[debug] num attentions: 32
+[debug] contrast loss: 0.0000 | num_seg: 1 | num_phrase: 1 | contrast_active: True | contrast_matched: True
+[debug] seg_info keys: ['data_id', 'mask_id', 'mask', 'image_path', 'height', 'width', 'image_id']
+[debug] target labels: [[0]]
+[debug] mask_outputs keys: ['pred_SEG_logits', 'pred_masks', 'aux_outputs']
+[debug] mask loss keys: ['loss_SEG_class', 'loss_mask', 'loss_dice', 'loss_SEG_class_0', 'loss_mask_0', 'loss_dice_0', 'loss_SEG_class_1', 'loss_mask_1', 'loss_dice_1', 'loss_SEG_class_2', 'loss_mask_2', 'loss_dice_2', 'loss_SEG_class_3', 'loss_mask_3', 'loss_dice_3', 'loss_SEG_class_4', 'loss_mask_4', 'loss_dice_4', 'loss_SEG_class_5', 'loss_mask_5', 'loss_dice_5', 'loss_SEG_class_6', 'loss_mask_6', 'loss_dice_6', 'loss_SEG_class_7', 'loss_mask_7', 'loss_dice_7', 'loss_SEG_class_8', 'loss_mask_8', 'loss_dice_8']
+{'loss_mask': 28.12862777709961, 'loss_dice': 49.7403450012207, 'loss_llm': 4.28125, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 82.1502, 'grad_norm': 502.2731666975402, 'learning_rate': 9.729086208503174e-05, 'epoch': 0.0}
+[debug] outputs.attentions is None: False
+[debug] num attentions: 32
+[debug] contrast loss: 0.0000 | num_seg: 1 | num_phrase: 1 | contrast_active: True | contrast_matched: True
+[debug] seg_info keys: ['data_id', 'mask_id', 'mask', 'image_path', 'height', 'width', 'image_id']
+[debug] target labels: [[0]]
+[debug] mask_outputs keys: ['pred_SEG_logits', 'pred_masks', 'aux_outputs']
+[debug] mask loss keys: ['loss_SEG_class', 'loss_mask', 'loss_dice', 'loss_SEG_class_0', 'loss_mask_0', 'loss_dice_0', 'loss_SEG_class_1', 'loss_mask_1', 'loss_dice_1', 'loss_SEG_class_2', 'loss_mask_2', 'loss_dice_2', 'loss_SEG_class_3', 'loss_mask_3', 'loss_dice_3', 'loss_SEG_class_4', 'loss_mask_4', 'loss_dice_4', 'loss_SEG_class_5', 'loss_mask_5', 'loss_dice_5', 'loss_SEG_class_6', 'loss_mask_6', 'loss_dice_6', 'loss_SEG_class_7', 'loss_mask_7', 'loss_dice_7', 'loss_SEG_class_8', 'loss_mask_8', 'loss_dice_8']
+{'loss_mask': 48.645355224609375, 'loss_dice': 49.9296875, 'loss_llm': 3.140625, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 101.7157, 'grad_norm': 711.5896095791011, 'learning_rate': 9.397368756032445e-05, 'epoch': 0.0}
+[debug] outputs.attentions is None: False
+[debug] num attentions: 32
+[debug] contrast loss: 0.0000 | num_seg: 1 | num_phrase: 1 | contrast_active: True | contrast_matched: True
+[debug] seg_info keys: ['data_id', 'mask_id', 'mask', 'image_path', 'height', 'width', 'image_id']
+[debug] target labels: [[0]]
+[debug] mask_outputs keys: ['pred_SEG_logits', 'pred_masks', 'aux_outputs']
+[debug] mask loss keys: ['loss_SEG_class', 'loss_mask', 'loss_dice', 'loss_SEG_class_0', 'loss_mask_0', 'loss_dice_0', 'loss_SEG_class_1', 'loss_mask_1', 'loss_dice_1', 'loss_SEG_class_2', 'loss_mask_2', 'loss_dice_2', 'loss_SEG_class_3', 'loss_mask_3', 'loss_dice_3', 'loss_SEG_class_4', 'loss_mask_4', 'loss_dice_4', 'loss_SEG_class_5', 'loss_mask_5', 'loss_dice_5', 'loss_SEG_class_6', 'loss_mask_6', 'loss_dice_6', 'loss_SEG_class_7', 'loss_mask_7', 'loss_dice_7', 'loss_SEG_class_8', 'loss_mask_8', 'loss_dice_8']
+{'loss_mask': 19.384572982788086, 'loss_dice': 49.87486267089844, 'loss_llm': 3.75, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 73.0094, 'grad_norm': 206.36367162323003, 'learning_rate': 8.945702546981969e-05, 'epoch': 0.0}
+{'loss_mask': 5.972240924835205, 'loss_dice': 49.463932037353516, 'loss_llm': 4.71875, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 60.1549, 'grad_norm': 149.72320082483668, 'learning_rate': 8.386407858128706e-05, 'epoch': 0.0}
+{'loss_mask': 27.949996948242188, 'loss_dice': 48.63410568237305, 'loss_llm': 4.28125, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 80.8654, 'grad_norm': 977.5522384539099, 'learning_rate': 7.734740790612136e-05, 'epoch': 0.0}
+{'loss_mask': 11.514771461486816, 'loss_dice': 49.085994720458984, 'loss_llm': 2.734375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 63.4064, 'grad_norm': 308.41579976063514, 'learning_rate': 7.008477123264848e-05, 'epoch': 0.0}
+{'loss_mask': 25.233448028564453, 'loss_dice': 49.684783935546875, 'loss_llm': 4.78125, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 79.6995, 'grad_norm': 1049.4364373021835, 'learning_rate': 6.227427435703997e-05, 'epoch': 0.0}
+{'loss_mask': 7.359524726867676, 'loss_dice': 49.692665100097656, 'loss_llm': 4.34375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 61.3959, 'grad_norm': 114.63296710731669, 'learning_rate': 5.4128967273616625e-05, 'epoch': 0.0}
+{'loss_mask': 5.843682289123535, 'loss_dice': 49.14781188964844, 'loss_llm': 4.09375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 59.0852, 'grad_norm': 107.30424113144328, 'learning_rate': 4.5871032726383386e-05, 'epoch': 0.0}
+{'loss_mask': 34.0691032409668, 'loss_dice': 49.64905548095703, 'loss_llm': 4.84375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 88.5619, 'grad_norm': 393.9305169662102, 'learning_rate': 3.772572564296005e-05, 'epoch': 0.0}
+{'loss_mask': 1.732251763343811, 'loss_dice': 46.7509651184082, 'loss_llm': 3.09375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 51.659, 'grad_norm': 130.81704113510125, 'learning_rate': 2.991522876735154e-05, 'epoch': 0.0}
+{'loss_mask': 7.762203216552734, 'loss_dice': 48.66897964477539, 'loss_llm': 3.25, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 59.6812, 'grad_norm': 151.41494629630873, 'learning_rate': 2.2652592093878666e-05, 'epoch': 0.0}
+{'loss_mask': 40.10045623779297, 'loss_dice': 49.60436248779297, 'loss_llm': 3.0, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 92.7048, 'grad_norm': 538.0968207270532, 'learning_rate': 1.6135921418712956e-05, 'epoch': 0.0}
+{'loss_mask': 3.1932315826416016, 'loss_dice': 49.35774612426758, 'loss_llm': 3.203125, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 55.7541, 'grad_norm': 45.53252727992184, 'learning_rate': 1.0542974530180327e-05, 'epoch': 0.0}
+{'loss_mask': 13.612506866455078, 'loss_dice': 49.19634246826172, 'loss_llm': 4.125, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 66.9339, 'grad_norm': 262.78078918380334, 'learning_rate': 6.026312439675552e-06, 'epoch': 0.0}
+{'loss_mask': 8.347976684570312, 'loss_dice': 49.483428955078125, 'loss_llm': 3.109375, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 60.9408, 'grad_norm': 112.16062267810845, 'learning_rate': 2.7091379149682685e-06, 'epoch': 0.0}
+{'loss_mask': 7.585326194763184, 'loss_dice': 49.23214340209961, 'loss_llm': 3.78125, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 60.5987, 'grad_norm': 133.7260602114917, 'learning_rate': 6.819348298638839e-07, 'epoch': 0.0}
+{'loss_mask': 4.578414440155029, 'loss_dice': 47.70492172241211, 'loss_llm': 3.671875, 'loss_attention': 0.0, 'epoch': 0.0}
+{'loss': 55.9552, 'grad_norm': 110.88402182635116, 'learning_rate': 0.0, 'epoch': 0.0}
+{'train_runtime': 16.2102, 'train_samples_per_second': 1.234, 'train_steps_per_second': 1.234, 'train_loss': 68.93104305267335, 'epoch': 0.0}

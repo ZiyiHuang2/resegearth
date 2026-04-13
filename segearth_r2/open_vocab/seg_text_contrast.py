@@ -26,8 +26,15 @@ class SegTextContrastHead(nn.Module):
         q = F.normalize(self.q_proj(seg_query_embeds), dim=-1)
         t = F.normalize(self.t_proj(text_embeds), dim=-1)
 
+        n = q.shape[0]
+
+        # 单对样本时，InfoNCE 退化，改用正样本对齐
+        if n == 1:
+            pos_sim = F.cosine_similarity(q, t, dim=-1)   # [1]
+            return (1.0 - pos_sim).mean()
+
         logits = torch.matmul(q, t.t()) / self.tau  # [N, N]
-        labels = torch.arange(logits.size(0), device=logits.device)
+        labels = torch.arange(n, device=logits.device)
 
         loss_q2t = F.cross_entropy(logits, labels)
         loss_t2q = F.cross_entropy(logits.t(), labels)

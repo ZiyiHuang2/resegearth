@@ -6,20 +6,20 @@ from dataclasses import dataclass, field
 import pathlib
 import ast
 import html
-import numpy as np
 import json
 import pickle
 import cv2
 import xml.etree.ElementTree as ET
-from pycocotools import mask as M
 from typing import Dict, Sequence, Optional
+
+import numpy as np
 import torch
-import re
 import transformers
 from torch.utils.data import Dataset
-import numpy as np
 from PIL import Image
+from pycocotools import mask as M
 from fvcore.common.config import CfgNode
+
 import warnings
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
 from segearth_r2.model.mipha import conversation as conversation_lib
@@ -97,9 +97,6 @@ def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, ma
 def extract_seg_phrases(answer: str):
     """
     从 answer 中抽取 <p> ... </p> 内的短语。
-    例如:
-    <p>airplane engine</p> [SEG]
-    <p>wing</p> [SEG]
     """
     phrases = re.findall(r"<p>\s*(.*?)\s*</p>", answer, flags=re.IGNORECASE | re.DOTALL)
     phrases = [re.sub(r"\s+", " ", p).strip() for p in phrases]
@@ -267,22 +264,15 @@ class RRSISDDataset(RS_Base_Dataset):
         image_path = os.path.join(self.image_dir, ref["file_name"])
         data_id = ref["ref_id"]
 
-        # 文本描述
         if len(ref["sentences"]) > 0 and "sent" in ref["sentences"][0]:
             instruction = ref["sentences"][0]["sent"].strip()
         elif len(ref["sentences"]) > 0 and "raw" in ref["sentences"][0]:
             instruction = ref["sentences"][0]["raw"].strip()
         else:
-            ann = self.ann_dict[ref["ann_id"]]
-            cat_id = ann.get("categories_id", None)
-            cat_name = self.category_dict.get(cat_id, "target")
             instruction = f"segment the {cat_name} in this remote sensing image"
 
         answer = "[SEG]"
 
-        ann = self.ann_dict[ref["ann_id"]]
-
-        # segmentation 是 list_of_rle，已确认全量统一
         rle_list = ann["segmentation"]
         masks = []
         for rle in rle_list:
@@ -293,45 +283,38 @@ class RRSISDDataset(RS_Base_Dataset):
         masks = np.stack(masks, axis=0)
 
         data_dict = {}
-        data_dict['file_name'] = image_path
+        data_dict["file_name"] = image_path
 
         image_BGR = cv2.imread(image_path)
         image_height = image_BGR.shape[0]
         image_width = image_BGR.shape[1]
 
-        data_dict['height'] = image_height
-        data_dict['width'] = image_width
-        data_dict['image_id'] = ref["image_id"]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = ref["image_id"]
 
-        # process image
         image_RGB = preprocess_image(image_path)
         image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
-        data_dict['image'] = (image_tensor - self.pixel_mean) / self.pixel_std
-        data_dict['seg_phrase_input_ids'] = seg_phrase_input_ids
-        data_dict['annotations'] = []
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
 
-        # 这套数据已确认 image=ann=ref 一一对应，这里就是单目标
+        data_dict["annotations"] = []
+
         mask_num = 1
-        seg_phrases = extract_seg_phrases(answer)
 
-        # 最小稳妥策略：phrase 数量和 mask_num 不一致时，这个样本不做 contrastive supervision
-        if len(seg_phrases) != mask_num:
-            seg_phrase_input_ids = []
-        else:
-            seg_phrase_input_ids = [
-                torch.tensor(self.tokenizer.encode(p, add_special_tokens=False), dtype=torch.long)
-                for p in seg_phrases
-            ]
-        data_dict['annotations'].append({
-            'data_id': data_id,
-            'mask_id': 0,
-            'mask': np.expand_dims(masks[0], axis=0),
-            'image_path': image_path,
-            'height': image_height,
-            'width': image_width,
-            'image_id': os.path.basename(image_path).split(".")[0],
-            'category_id': int(cat_id) if cat_id is not None else 0,
-            'category_name': cat_name,
+        # RRSISD 不从 answer 抽 phrase，直接用 instruction 作为单目标 text
+        seg_phrase_input_ids = [
+            torch.tensor(self.tokenizer.encode(instruction, add_special_tokens=False), dtype=torch.long)
+        ]
+        data_dict["seg_phrase_input_ids"] = seg_phrase_input_ids
+
+        data_dict["annotations"].append({
+            "data_id": data_id,
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": os.path.basename(image_path).split(".")[0],
         })
 
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
@@ -339,12 +322,12 @@ class RRSISDDataset(RS_Base_Dataset):
         token_refer_id = self.preprocess_referring_instruction(instruction)
 
         sources = [[
-            {'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
-            {'from': 'gpt', 'value': '\n' + answer}
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n" + answer}
         ]]
 
         text_dict = self.preprocess_llama2(sources, self.tokenizer)
-        input_ids = text_dict['input_ids'][0]
+        input_ids = text_dict["input_ids"][0]
 
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
@@ -352,14 +335,13 @@ class RRSISDDataset(RS_Base_Dataset):
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
 
-        data_dict['input_ids'] = text_dict['input_ids'][0]
-        data_dict['labels'] = text_dict['labels'][0]
-        data_dict['dataset_type'] = 'rs_reason_seg'
-
-        data_dict['token_refer_id'] = token_refer_id
-        data_dict['refer_embedding_indices'] = refer_embedding_indices
-        data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
-        data_dict['mask_num'] = mask_num
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = mask_num
 
         return data_dict
     
@@ -404,13 +386,13 @@ class LaSeRSDataset(RS_Base_Dataset):
     
     def __getitem__(self, idx):
         data_info = self.reason_file[idx]
-        image_path = os.path.join(self.LaSeRS_image_path, data_info['image_name'])
-        ref = data_info['description']
-        answer = data_info['answer']
-        data_id = data_info['id']
+        image_path = os.path.join(self.LaSeRS_image_path, data_info["image_name"])
+        ref = data_info["description"]
+        answer = data_info["answer"]
+        data_id = data_info["id"]
 
-        if "mask" in data_info:        
-            rle_list = data_info['mask']
+        if "mask" in data_info:
+            rle_list = data_info["mask"]
             masks = []
             for rle in rle_list:
                 mask = M.decode(rle)
@@ -418,28 +400,27 @@ class LaSeRSDataset(RS_Base_Dataset):
             masks = np.stack(masks, axis=0)
         else:
             masks = None
-        
+
         data_dict = {}
-        data_dict['file_name'] = image_path
+        data_dict["file_name"] = image_path
+
         image_BGR = cv2.imread(image_path)
         image_height = image_BGR.shape[0]
         image_width = image_BGR.shape[1]
-        data_dict['height'] = image_height
-        data_dict['width'] = image_width
-        data_dict['image_id'] = idx
-        
-        # process image
-        # ResizeShortestEdge + FixedSizeCrop
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = idx
+
         image_RGB = preprocess_image(image_path)
         image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
-        data_dict['image'] = (image_tensor - self.pixel_mean) / self.pixel_std
-        data_dict['seg_phrase_input_ids'] = seg_phrase_input_ids
-        data_dict['annotations'] = []
-        
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        data_dict["annotations"] = []
+
         mask_num = answer.count("[SEG]")
         seg_phrases = extract_seg_phrases(answer)
 
-        # 最小稳妥策略：phrase 数量和 mask_num 不一致时，这个样本不做 contrastive supervision
+        # phrase 数量和 mask_num 不一致时，跳过 contrastive supervision
         if len(seg_phrases) != mask_num:
             seg_phrase_input_ids = []
         else:
@@ -447,46 +428,47 @@ class LaSeRSDataset(RS_Base_Dataset):
                 torch.tensor(self.tokenizer.encode(p, add_special_tokens=False), dtype=torch.long)
                 for p in seg_phrases
             ]
+
+        data_dict["seg_phrase_input_ids"] = seg_phrase_input_ids
+
         for i in range(mask_num):
-            data_dict['annotations'].append({
-                'data_id': data_id,
-                'mask_id': i,
-                'mask': np.expand_dims(masks[i], axis=0) if masks is not None else None,
-                'image_path': image_path,
-                'height': image_height,
-                'width': image_width,
-                'image_id': os.path.basename(image_path).split(".")[0],
-                'category_id': int(data_info.get('category_id', 0)),
-                'category_name': data_info.get('category_name', data_info.get('category', 'unknown')),
+            data_dict["annotations"].append({
+                "data_id": data_id,
+                "mask_id": i,
+                "mask": np.expand_dims(masks[i], axis=0) if masks is not None else None,
+                "image_path": image_path,
+                "height": image_height,
+                "width": image_width,
+                "image_id": os.path.basename(image_path).split(".")[0],
             })
-            
+
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
         instruction = ref.strip()
-        
+
         token_refer_id = self.preprocess_referring_instruction(instruction)
-        
-        sources = [[{'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
-                    {'from': 'gpt', 'value': '\n' + answer}]]
+
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n" + answer}
+        ]]
 
         text_dict = self.preprocess_llama2(sources, self.tokenizer)
-        input_ids = text_dict['input_ids'][0]
-        
+        input_ids = text_dict["input_ids"][0]
+
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
-        
+
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
-        
-        data_dict['input_ids'] = text_dict['input_ids'][0]
-        data_dict['labels'] = text_dict['labels'][0]
-        data_dict['dataset_type'] = 'rs_reason_seg'
-        
-        data_dict['token_refer_id'] = token_refer_id    
-        data_dict['refer_embedding_indices'] = refer_embedding_indices
-        data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
-        
-        data_dict['mask_num'] = mask_num
-        
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = mask_num
+
         return data_dict
 
 @dataclass
