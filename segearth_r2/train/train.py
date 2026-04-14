@@ -52,7 +52,7 @@ class DataArguments:
     switch_bs: int = 4 # 16
     fix_dataset_len: int = 0
     segmentation: bool = True
-
+    dataset_name: str = "rrsisd"
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     
@@ -103,9 +103,9 @@ class TrainingArguments(transformers.TrainingArguments):
     delta_grad_monitor_interval: int = field(default=0)
     loss_llm_weight: float = field(default=1.0)
     loss_mask_weight: float = field(default=1.0)
-    loss_attention_weight: float = field(default=0.01)
-    loss_itaa_weight: float = field(default=0.1)
-    enable_attention_loss: bool = field(default=True)
+    loss_attention_weight: float = field(default=0.0)
+    loss_itaa_weight: float = field(default=0.03)
+    enable_attention_loss: bool = field(default=False)
     enable_itaa_loss: bool = field(default=True)
 
 
@@ -198,20 +198,42 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     data_ratio = data_ratio.split('||')
     data_ratio = [int(data_) for data_ in data_ratio]
     datasets = []
-    if data_ratio[0] != 0:
-        RRSISTrainDataset = RRSISDDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            split='train'
-        )
-        datasets += [RRSISTrainDataset] * data_ratio[0]
 
-    
+    dataset_name = data_args.dataset_name.lower()
+
+    if data_ratio[0] != 0:
+        if dataset_name == "rrsisd":
+            train_dataset_single = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train'
+            )
+        elif dataset_name == "lasers":
+            train_dataset_single = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train_data.json'
+            )
+        else:
+            raise ValueError(
+                f"Unsupported dataset_name={data_args.dataset_name}. "
+                f"Expected one of: rrsisd, lasers"
+            )
+
+        datasets += [train_dataset_single] * data_ratio[0]
+
     print(f'the dataset ratio is: {data_ratio}')
-    train_dataset = UnifyDatasetSingleDatasetForBatch(datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len)
+    print(f'the dataset name is: {dataset_name}')
+    train_dataset = UnifyDatasetSingleDatasetForBatch(
+        datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len
+    )
     print(f'total unify datasest number is {len(train_dataset)}')
-    data_collator = DataCollatorForCOCODatasetV2(tokenizer=tokenizer, clip_image_processor=clip_image_processor)
+    data_collator = DataCollatorForCOCODatasetV2(
+        tokenizer=tokenizer,
+        clip_image_processor=clip_image_processor
+    )
     return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
 
 def train():

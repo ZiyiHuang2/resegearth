@@ -649,7 +649,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             query_to_image_index=None,
             gt_masks_per_query=None,
             dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
-        
+        bs = input_ids.shape[0]
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -702,12 +702,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             query_to_image_index = query_to_image_index.to(mask_features.device)
 
         itaa_loss = torch.tensor(0.0, device=mask_features.device)
-        if hasattr(self, 'itaa') and self.itaa is not None:
+        if hasattr(self, "itaa") and self.itaa is not None:
             gt_mask = None
             if gt_masks_per_query is not None:
                 gt_mask = gt_masks_per_query.to(mask_features.device)
-            elif seg_info is not None and len(seg_info) > 0 and 'mask' in seg_info[0]:
-                gt_mask = torch.stack([item['mask'] for item in seg_info], dim=0).to(mask_features.device)
+            elif seg_info is not None and len(seg_info) > 0 and "mask" in seg_info[0]:
+                gt_mask = torch.stack([item["mask"] for item in seg_info], dim=0).to(mask_features.device)
+
             SEG_embedding, itaa_loss = self.itaa(
                 mask_features,
                 SEG_embedding,
@@ -728,6 +729,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
         # 开始计算loss
         loss = None
 
+        zero = torch.tensor(0.0, device=mask_features.device)
+        loss_mask = zero.clone()
+        loss_dice = zero.clone()
         llm_loss = None
         if labels is not None:
             # if seg_query_mask is None or batch_dataset_type in seg_llm_loss_dataset:
@@ -744,27 +748,68 @@ class SegEarthR2(MiphaPhiForCausalLM):
             llm_loss = loss_fct(shift_logits, shift_labels)
             
         mask_loss = None
-        if seg_info is not None:
-            if 'padding_mask' in seg_info[0]:
+        loss_mask = torch.tensor(0.0, device=mask_features.device)
+        loss_dice = torch.tensor(0.0, device=mask_features.device)
+
+        targets = None
+        if gt_masks_per_query is not None:
+            # 直接按 query 维组织 target，避免 seg_info flatten 顺序和 query 顺序错位
+            gt_masks_per_query = gt_masks_per_query.to(mask_outputs["pred_masks"].device)
+
+            if gt_masks_per_query.dim() == 3:
+                gt_masks_per_query = gt_masks_per_query.unsqueeze(1)
+
+            targets = []
+            for i in range(gt_masks_per_query.shape[0]):
+                targets.append(
+                    {
+                        "labels": torch.tensor([0], device=mask_outputs["pred_masks"].device),
+                        "masks": gt_masks_per_query[i],
+                        "valid": None,
+                        "inst_id": None,
+                    }
+                )
+
+        elif seg_info is not None:
+            if "padding_mask" in seg_info[0]:
                 if isinstance(seg_info[0]["instances"], list):
                     gt_instances = [x["instances"][0].to(self.device) for x in seg_info]
                 else:
                     gt_instances = [x["instances"].to(self.device) for x in seg_info]
-
                 targets = self.prepare_targets(gt_instances, images)
-            elif 'mask' in seg_info[0]:
+
+            elif "mask" in seg_info[0]:
                 targets = []
-                for gt_mask in seg_info:
+                for item in seg_info:
                     targets.append(
                         {
-                            'labels': torch.tensor([0]).to(mask_outputs['pred_masks'].device),
-                            'masks': gt_mask['mask'].to(mask_outputs['pred_masks'].device),
-                            'valid': None,
-                            'inst_id': None
+                            "labels": torch.tensor([0], device=mask_outputs["pred_masks"].device),
+                            "masks": item["mask"].to(mask_outputs["pred_masks"].device),
+                            "valid": None,
+                            "inst_id": None,
                         }
                     )
-            else:
-                targets = None
+
+        if targets is not None:
+            if gt_masks_per_query is not None:
+                assert mask_outputs["pred_masks"].shape[0] == gt_masks_per_query.shape[0], \
+                    f"pred query num ({mask_outputs['pred_masks'].shape[0]}) != gt query num ({gt_masks_per_query.shape[0]})"
+            mask_losses = self.criterion(mask_outputs, targets)
+            weight_dict = self.weight_dict
+
+            for k in list(mask_losses.keys()):
+                if k in weight_dict:
+                    if mask_losses[k] is not None:
+                        mask_losses[k] *= weight_dict[k]
+
+                    if "_mask" in k:
+                        loss_mask += mask_losses[k]
+                    elif "_dice" in k:
+                        loss_dice += mask_losses[k]
+                else:
+                    mask_losses.pop(k)
+
+            mask_loss = loss_mask + loss_dice
             mask_losses = self.criterion(mask_outputs, targets)
             weight_dict = self.weight_dict
 
@@ -786,33 +831,38 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_loss = loss_mask + loss_dice
 
         loss_attention = None
-        masks = [_seg_info['mask'] for _seg_info in seg_info]
-        masks_resized = [
-            F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
-            for m in masks
-        ]
-        masks = torch.stack(masks_resized, dim=0) # [4, 1, 800, 800]
-        masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
-        masks_down = masks_down.view(masks_down.size(0), -1)
-        masks_down[masks_down > 0] = 1
-        
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
-        for full_attention_map in attentions:
-            batch_attentions_list = []
-            for batch_idx in range(bs):
-                attention_map = full_attention_map[batch_idx]
-                SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
-                image_features_mask = image_features_indices[batch_idx].bool()
-                attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
-                batch_attentions_list.append(attention)
-            batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
-            loss_attention += self.attention_loss(batch_attentions, masks_down)
+        enable_attention_loss = self._get_loss_flag("enable_attention_loss", True)
+
+        if enable_attention_loss and seg_info is not None:
+            masks = [_seg_info["mask"] for _seg_info in seg_info]
+            masks_resized = [
+                F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
+                for m in masks
+            ]
+            masks = torch.stack(masks_resized, dim=0)
+            masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
+            masks_down = masks_down.view(masks_down.size(0), -1)
+            masks_down[masks_down > 0] = 1
+
+            loss_attention = torch.tensor(0.0, device=mask_features.device)
+            for full_attention_map in attentions:
+                batch_attentions_list = []
+                for batch_idx in range(bs):
+                    attention_map = full_attention_map[batch_idx]
+                    SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
+                    image_features_mask = image_features_indices[batch_idx].bool()
+                    attention = attention_map[SEG_mask][:, image_features_mask]
+                    batch_attentions_list.append(attention)
+                batch_attentions = torch.cat(batch_attentions_list, dim=0)
+                loss_attention += self.attention_loss(batch_attentions, masks_down)
+        else:
+            loss_attention = torch.tensor(0.0, device=mask_features.device)
                              
         w_llm = self._get_loss_weight("loss_llm_weight", 1.0)
         w_mask = self._get_loss_weight("loss_mask_weight", 1.0)
-        w_attention = self._get_loss_weight("loss_attention_weight", 0.01)
-        w_itaa = self._get_loss_weight("loss_itaa_weight", 0.1)
-        enable_attention_loss = self._get_loss_flag("enable_attention_loss", True)
+        w_attention = self._get_loss_weight("loss_attention_weight", 0.0)
+        w_itaa = self._get_loss_weight("loss_itaa_weight", 0.03)
+        enable_attention_loss = self._get_loss_flag("enable_attention_loss", False)
         enable_itaa_loss = self._get_loss_flag("enable_itaa_loss", True)
 
         zero = torch.tensor(0.0, device=mask_features.device)
@@ -821,7 +871,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         attention_term = loss_attention if (enable_attention_loss and loss_attention is not None) else zero
         itaa_term = itaa_loss if (enable_itaa_loss and itaa_loss is not None) else zero
 
-        loss = w_llm * llm_loss_term + w_mask * mask_loss_term + w_attention * attention_term + w_itaa * itaa_term
+        loss = (
+            w_llm * llm_loss_term
+            + w_mask * mask_loss_term
+            + w_attention * attention_term
+            + w_itaa * itaa_term
+        )
 
         return CausalOutputWithMask(
             loss=loss,
