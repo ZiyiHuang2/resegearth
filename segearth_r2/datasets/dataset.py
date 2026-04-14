@@ -24,6 +24,7 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
+from segearth_r2.knowledge.static_kb import StaticRSKB
 
 warnings.filterwarnings('ignore')
 local_rank = None
@@ -223,6 +224,9 @@ class RRSISDDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.use_static_kb = getattr(data_args, "use_static_kb", False)
+        self.static_kb_max_chars = getattr(data_args, "static_kb_max_chars", 220)
+        self.static_kb = StaticRSKB() if self.use_static_kb else None
 
         # 官方目录结构
         self.image_dir = os.path.join(base_data_path, "images", "rrsisd", "JPEGImages")
@@ -311,7 +315,14 @@ class RRSISDDataset(RS_Base_Dataset):
 
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
 
-        token_refer_id = self.preprocess_referring_instruction(instruction)
+        if self.use_static_kb and self.static_kb is not None:
+            aug_instruction = self.static_kb.augment(
+                instruction,
+                max_chars=self.static_kb_max_chars,
+            )
+        else:
+            aug_instruction = instruction
+        token_refer_id = self.preprocess_referring_instruction(aug_instruction)
 
         sources = [[
             {'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
@@ -355,6 +366,12 @@ class LaSeRSDataset(RS_Base_Dataset):
         
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
+
+        self.use_static_kb = getattr(data_args, "use_static_kb", False)
+        self.static_kb_mode = getattr(data_args, "static_kb_mode", "rrsisd")
+        self.static_kb_max_chars = getattr(data_args, "static_kb_max_chars", 320)
+
+        self.static_kb = StaticRSKB(mode=self.static_kb_mode) if self.use_static_kb else None
 
         if "train" in split:
             self.LaSeRS_image_path = os.path.join(base_data_path, "train/images")
@@ -426,8 +443,14 @@ class LaSeRSDataset(RS_Base_Dataset):
             
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
         instruction = ref.strip()
-        
-        token_refer_id = self.preprocess_referring_instruction(instruction)
+        if self.use_static_kb and self.static_kb is not None:
+            aug_instruction = self.static_kb.augment(
+                instruction,
+                max_chars=self.static_kb_max_chars,
+            )
+        else:
+            aug_instruction = instruction
+        token_refer_id = self.preprocess_referring_instruction(aug_instruction)
         
         sources = [[{'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
                     {'from': 'gpt', 'value': '\n' + answer}]]
