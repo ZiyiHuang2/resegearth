@@ -1,28 +1,22 @@
+# segearth_r2/knowledge/static_kb.py
 class StaticRSKB:
-    def __init__(self, mode: str = "generic"):
+    def __init__(self, mode: str = "rrsisd"):
         self.mode = mode
         self.prior = self._build_prior(mode)
 
     def _build_prior(self, mode: str) -> str:
-        if mode == "generic":
-            return (
-                "Remote sensing image prior: object scales may vary greatly; "
-                "small targets and fragmented boundaries are common; "
-                "spatial relations and surrounding context such as roads, buildings, "
-                "vegetation and water can help identify the target."
-            )
-        elif mode == "rrsisd":
-            return (
-                "Remote sensing referring segmentation prior: targets may appear at different scales; "
-                "visual boundaries can be weak or fragmented; "
-                "target identity often depends on location words, nearby objects, "
-                "and scene context rather than category name alone."
-            )
-        else:
-            return (
-                "Remote sensing image prior: use spatial location, nearby objects, "
-                "and scene context to identify the target."
-            )
+        priors = {
+            "rrsisd": (
+                "Referring segmentation prior: identify the target mainly by category words, "
+                "location words, nearby objects, and scene context. "
+                "In remote sensing images, small targets and weak boundaries are common."
+            ),
+            "generic": (
+                "Segmentation prior: use target category, spatial location, nearby objects, "
+                "and scene context to identify the referred region."
+            ),
+        }
+        return priors.get(mode, priors["generic"])
 
     def sanitize(self, text: str) -> str:
         if not text:
@@ -32,9 +26,15 @@ class StaticRSKB:
         text = text.replace("[SEG]", "segment")
         return " ".join(text.split())
 
-    def augment(self, instruction: str, max_chars: int = 320) -> str:
+    def _safe_trim(self, text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        trimmed = text[:max_chars]
+        if " " in trimmed:
+            trimmed = trimmed.rsplit(" ", 1)[0]
+        return trimmed.rstrip(" ,;:.")
+
+    def augment(self, instruction: str, max_chars: int = 220) -> str:
         instruction = self.sanitize(instruction)
-        merged = f"{self.prior}\nQuery: {instruction}"
-        if len(merged) > max_chars:
-            merged = merged[:max_chars].rstrip()
-        return merged
+        merged = f"{self.prior}\nQuery: {instruction}"          # ← 这里加了 \n
+        return self._safe_trim(merged, max_chars)

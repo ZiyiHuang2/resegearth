@@ -55,7 +55,7 @@ class DataArguments:
     dataset_name: str = field(default="rrsisd")
     use_static_kb: bool = False
     static_kb_mode: str = "rrsisd"
-    static_kb_max_chars: int = 320
+    static_kb_max_chars: int = 220
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
