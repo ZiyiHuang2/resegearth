@@ -665,7 +665,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
                 image_features = self.get_vision_tower_feature(images)
-                bs = input_ids.shape[0]
             
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
@@ -748,8 +747,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             llm_loss = loss_fct(shift_logits, shift_labels)
             
         mask_loss = None
-        loss_mask = torch.tensor(0.0, device=mask_features.device)
-        loss_dice = torch.tensor(0.0, device=mask_features.device)
+
 
         targets = None
         if gt_masks_per_query is not None:
@@ -808,26 +806,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         loss_dice += mask_losses[k]
                 else:
                     mask_losses.pop(k)
-
-            mask_loss = loss_mask + loss_dice
-            mask_losses = self.criterion(mask_outputs, targets)
-            weight_dict = self.weight_dict
-
-            loss_mask = 0.0
-            loss_dice = 0.0
-        
-            for k in list(mask_losses.keys()):
-                if k in weight_dict:
-                    if mask_losses[k] is not None:
-                        mask_losses[k] *= weight_dict[k]
-                    
-                    if '_mask' in k:
-                        loss_mask += mask_losses[k]
-                    
-                    elif '_dice' in k:
-                        loss_dice += mask_losses[k]
-                else:
-                    mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
 
         loss_attention = None
@@ -865,7 +843,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
         enable_attention_loss = self._get_loss_flag("enable_attention_loss", False)
         enable_itaa_loss = self._get_loss_flag("enable_itaa_loss", True)
 
-        zero = torch.tensor(0.0, device=mask_features.device)
         llm_loss_term = llm_loss if llm_loss is not None else zero
         mask_loss_term = mask_loss if mask_loss is not None else zero
         attention_term = loss_attention if (enable_attention_loss and loss_attention is not None) else zero

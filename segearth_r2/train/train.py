@@ -48,8 +48,8 @@ class DataArguments:
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
     base_data_path: str = '/home/wangchengjun/huangziyi/data'
-    data_ratio: str = '1'  
-    switch_bs: int = 4 # 16
+    data_ratio: str = '1'
+    switch_bs: int = 4
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = "rrsisd"
@@ -325,8 +325,10 @@ def train():
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
-    tokenizer.add_tokens("[SEG]")
-    model.resize_token_embeddings(len(tokenizer))
+    seg_token = "[SEG]"
+    if tokenizer.convert_tokens_to_ids(seg_token) == tokenizer.unk_token_id:
+        tokenizer.add_tokens(seg_token)
+        model.resize_token_embeddings(len(tokenizer))
     # Delta trainables whitelist: modules in this list are explicitly unfrozen after LoRA wrapping.
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
