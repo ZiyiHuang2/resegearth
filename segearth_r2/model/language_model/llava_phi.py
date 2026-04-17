@@ -20,6 +20,7 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
+from ..mask_bridge.lgce_bridge import LanguageGuidedCrossScaleBridge
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
@@ -128,6 +129,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.cross_attn_index = cross_attn_index
 
         self.lm_head = nn.Linear(config.hidden_size, 51200, bias=False)
+        self.config.use_lgce_bridge = getattr(self.config, "use_lgce_bridge", True)
+        self.use_lgce_bridge = self.config.use_lgce_bridge
+        self.config.lgce_debug = getattr(self.config, "lgce_debug", False)
+        self.lgce_debug = self.config.lgce_debug
+        self.lgce_bridge = None
 
         is_train_mask_decode = getattr(config, 'mask_decode_train', False)
         self.is_train_mask_decode = is_train_mask_decode
@@ -150,6 +156,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.use_lgce_bridge = getattr(self.config, "use_lgce_bridge", True)
+        self.lgce_debug = getattr(self.config, "lgce_debug", False)
+        if self.use_lgce_bridge:
+            self.lgce_bridge = LanguageGuidedCrossScaleBridge(
+                text_dim=self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+                res3_channels=input_shape["res3"].channel,
+                res4_channels=input_shape["res4"].channel,
+            )
+        else:
+            self.lgce_bridge = None
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -596,11 +612,102 @@ class SegEarthR2(MiphaPhiForCausalLM):
         return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices
     
     def get_SEG_embedding(self, hidden_states, SEG_embedding_indices):
-        SEG_embedding_list = []
+        if SEG_embedding_indices is None:
+            raise ValueError("SEG_token_embedding_indices is None; cannot extract [SEG] embeddings.")
+
+        if hidden_states.shape[0] != SEG_embedding_indices.shape[0]:
+            raise ValueError(
+                f"Batch mismatch between hidden_states and SEG_token_embedding_indices: "
+                f"{hidden_states.shape[0]} vs {SEG_embedding_indices.shape[0]}"
+            )
+
+        seg_embedding_list = []
+        seg_counts_per_sample = []
         for current_hidden_state, current_token_indice in zip(hidden_states, SEG_embedding_indices):
-            current_refer_state = current_hidden_state[current_token_indice.bool()]
-            SEG_embedding_list.append(current_refer_state)
-        return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
+            current_mask = current_token_indice.bool()
+            current_refer_state = current_hidden_state[current_mask]
+            seg_counts_per_sample.append(int(current_mask.sum().item()))
+            if current_refer_state.numel() > 0:
+                seg_embedding_list.append(current_refer_state)
+
+        if len(seg_embedding_list) == 0:
+            raise ValueError(
+                f"No [SEG] token found in current batch. "
+                f"batch_size={hidden_states.shape[0]}, seg_counts_per_sample={seg_counts_per_sample}, "
+                f"SEG_embedding_indices_shape={tuple(SEG_embedding_indices.shape)}"
+            )
+        return torch.cat(seg_embedding_list, dim=0).unsqueeze(1)
+
+    def build_sample_guidance_from_seg(self, seg_embedding, mask_num):
+        """Build sample-level pooled language guidance [B, H] from SEG embeddings and mask_num."""
+        if seg_embedding.dim() == 3:
+            if seg_embedding.shape[1] != 1:
+                raise ValueError(f"Expected seg_embedding with shape [sum_q, 1, H], got {tuple(seg_embedding.shape)}")
+            seg_embedding = seg_embedding.squeeze(1)
+        elif seg_embedding.dim() != 2:
+            raise ValueError(f"Expected seg_embedding dim 2 or 3, got {seg_embedding.dim()}")
+
+        if mask_num is None:
+            raise ValueError("mask_num must not be None when building sample guidance.")
+
+        if torch.is_tensor(mask_num):
+            mask_num_list = [int(x) for x in mask_num.tolist()]
+        else:
+            mask_num_list = [int(x) for x in mask_num]
+
+        batch_size = len(mask_num_list)
+        total_queries = sum(mask_num_list)
+        if total_queries != seg_embedding.shape[0]:
+            raise ValueError(
+                "SEG/mask_num alignment error: "
+                f"batch_size={batch_size}, mask_num={mask_num_list}, sum(mask_num)={total_queries}, "
+                f"seg_embedding.shape={tuple(seg_embedding.shape)}"
+            )
+
+        if total_queries == 0:
+            # Keep zero-query samples as zero guidance for a safe no-op style conditioning.
+            if self.lgce_debug:
+                print(f"[LGCE][guidance] all-zero mask_num detected, returning zero guidance with batch_size={batch_size}")
+            return seg_embedding.new_zeros((batch_size, seg_embedding.shape[-1]))
+
+        sample_embeddings = []
+        for sample_chunk in torch.split(seg_embedding, mask_num_list, dim=0):
+            if sample_chunk.shape[0] == 0:
+                sample_embeddings.append(seg_embedding.new_zeros(seg_embedding.shape[-1]))
+            else:
+                sample_embeddings.append(sample_chunk.mean(dim=0))
+        return torch.stack(sample_embeddings, dim=0)
+
+    def _maybe_log_lgce_debug(self, stage, mask_num, sample_guidance, image_features_before=None, image_features_after=None):
+        if not self.lgce_debug:
+            return
+
+        mask_num_list = [int(x) for x in (mask_num.tolist() if torch.is_tensor(mask_num) else mask_num)]
+        msg = (
+            f"[LGCE][{stage}] mask_num={mask_num_list}, "
+            f"sample_guidance.shape={tuple(sample_guidance.shape)}"
+        )
+        if image_features_before is not None:
+            msg += (
+                f", res3_in={tuple(image_features_before['res3'].shape)}, "
+                f"res4_in={tuple(image_features_before['res4'].shape)}"
+            )
+        if image_features_after is not None:
+            msg += (
+                f", res3_out={tuple(image_features_after['res3'].shape)}, "
+                f"res4_out={tuple(image_features_after['res4'].shape)}"
+            )
+        print(msg)
+
+    def _apply_lgce_bridge(self, image_features, seg_embedding, mask_num, stage):
+        sample_guidance = self.build_sample_guidance_from_seg(seg_embedding, mask_num)
+        if self.use_lgce_bridge and self.lgce_bridge is not None:
+            image_features_before = image_features
+            image_features = self.lgce_bridge(image_features, sample_guidance)
+            self._maybe_log_lgce_debug(stage, mask_num, sample_guidance, image_features_before, image_features)
+        else:
+            self._maybe_log_lgce_debug(stage, mask_num, sample_guidance)
+        return image_features
            
     def forward(
             self,
@@ -631,13 +738,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        image_features = None
+        bs = input_ids.shape[0] if input_ids is not None else None
 
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
                 image_features = self.get_vision_tower_feature(images)
-                bs = input_ids.shape[0]
             
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
@@ -658,6 +766,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        if image_features is None:
+            if images is None:
+                raise RuntimeError(
+                    "image_features is undefined before mask decoding, and images is None. "
+                    f"input_ids.shape={tuple(input_ids.shape) if input_ids is not None else None}, "
+                    f"mask_num={mask_num}"
+                )
+            image_features = self.get_vision_tower_feature(images)
+        image_features = self._apply_lgce_bridge(image_features, SEG_embedding, mask_num, stage="forward")
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -809,6 +926,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state   
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        image_features = self._apply_lgce_bridge(image_features, SEG_embedding, mask_num, stage="eval_seg")
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)

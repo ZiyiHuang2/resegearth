@@ -37,6 +37,8 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default="swin_conv")
     model_version: Optional[str] = field(default="v1")
     load_mask2former: bool = field(default=True)
+    use_lgce_bridge: bool = field(default=True)
+    lgce_debug: bool = field(default=False)
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
@@ -186,6 +188,7 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     data_ratio = data_ratio.split('||')
     data_ratio = [int(data_) for data_ in data_ratio]
     datasets = []
+
     if data_ratio[0] != 0:
         RRSISTrainDataset = RRSISDDataset(
             base_data_path=data_args.base_data_path,
@@ -221,6 +224,12 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
                 )
+    model.config.use_lgce_bridge = model_args.use_lgce_bridge
+    model.use_lgce_bridge = model_args.use_lgce_bridge
+    model.config.lgce_debug = model_args.lgce_debug
+    model.lgce_debug = model_args.lgce_debug
+    if (not model_args.use_lgce_bridge) and hasattr(model, "lgce_bridge"):
+        model.lgce_bridge = None
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
@@ -288,7 +297,7 @@ def train():
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "lgce_bridge",
     ]
 
     if model_args.train_swin_backbone:
