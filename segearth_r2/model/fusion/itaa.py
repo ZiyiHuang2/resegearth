@@ -7,12 +7,13 @@ class ImageTextAlignmentAdapter(nn.Module):
     """
     Image-Text Alignment Adapter (ITAA)
 
-    设计原则：
-    1. 主前向融合路径在训练 / 推理保持一致：
-       始终使用 image feature 的全局池化 token 参与 cross-attention。
+    当前版本目标：
+    1. 主前向在训练 / 推理保持一致：
+       始终使用 image feature 的全局池化 token + dense visual tokens 做 cross-attention。
     2. GT mask 仅用于 align_loss，不直接改变主前向给 decoder 的 query。
-    3. 保留 query/image cross-attn + MLP 结构，但提高 seg_gate 初始值，
-       让新分支在训练初期真正参与优化。
+    3. 兼容 seg_embedding 输入维度：
+       - llm_dim（原始 LLM hidden）
+       - image_dim（已经过 projector 的 query）
     """
 
     def __init__(
@@ -26,26 +27,36 @@ class ImageTextAlignmentAdapter(nn.Module):
     ):
         super(ImageTextAlignmentAdapter, self).__init__()
 
-        # 1) text / query branch
+        self.image_dim = image_dim
+        self.llm_dim = llm_dim
+
+        # seg 输入如果还是 llm_dim，用这个投到 image_dim
         self.text_proj = nn.Sequential(
             nn.Linear(llm_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, image_dim),
         )
+
+        # seg 输入如果已经是 image_dim，再过一个轻量映射
+        self.text_proj_image_dim = nn.Sequential(
+            nn.Linear(image_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, image_dim),
+        )
         self.query_norm = nn.LayerNorm(image_dim)
 
-        # 2) image / value branch
+        # image/value branch
         self.image_proj = nn.Conv2d(image_dim, image_dim, kernel_size=1)
         self.image_norm = nn.LayerNorm(image_dim)
 
-        # 3) pooled token projection
+        # pooled token projection
         self.mask_proj = nn.Sequential(
             nn.Linear(image_dim, image_dim),
             nn.GELU(),
             nn.Linear(image_dim, image_dim),
         )
 
-        # 4) query <- image cross attention
+        # query <- image cross attention
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=image_dim,
             num_heads=num_heads,
@@ -54,7 +65,7 @@ class ImageTextAlignmentAdapter(nn.Module):
         )
         self.attn_norm = nn.LayerNorm(image_dim)
 
-        # 5) MLP + residual + norm
+        # MLP + residual + norm
         self.mlp = nn.Sequential(
             nn.Linear(image_dim, image_dim * 4),
             nn.GELU(),
@@ -63,7 +74,7 @@ class ImageTextAlignmentAdapter(nn.Module):
         )
         self.mlp_norm = nn.LayerNorm(image_dim)
 
-        # 提高初始值，避免新分支前期几乎完全失效
+        # 残差门控，初始不为 0，避免新分支前期几乎不生效
         self.seg_gate = nn.Parameter(torch.tensor(float(seg_gate_init)))
 
     def _normalize_seg_embedding(self, seg_embedding):
@@ -78,24 +89,42 @@ class ImageTextAlignmentAdapter(nn.Module):
             )
         return seg_embedding
 
+    def _project_text_feature(self, seg_embedding):
+        """
+        兼容两种输入：
+        1. 原始 LLM hidden: [Q, llm_dim]
+        2. 已经 projector 后的 query: [Q, image_dim]
+        """
+        if seg_embedding.shape[-1] == self.llm_dim:
+            text_feat = self.text_proj(seg_embedding)
+        elif seg_embedding.shape[-1] == self.image_dim:
+            text_feat = self.text_proj_image_dim(seg_embedding)
+        else:
+            raise ValueError(
+                f"Unsupported seg embedding dim {seg_embedding.shape[-1]}, "
+                f"expected {self.llm_dim} or {self.image_dim}"
+            )
+        return self.query_norm(text_feat)
+
     def _pool_image_feature(self, image_feat, gt_mask=None):
         if gt_mask is not None:
             if gt_mask.dim() == 3:
                 gt_mask = gt_mask.unsqueeze(1)
+
             if gt_mask.shape[-2:] != image_feat.shape[-2:]:
                 gt_mask = F.interpolate(
-                    gt_mask.float(),
+                    gt_mask.to(dtype=image_feat.dtype),
                     size=image_feat.shape[-2:],
                     mode="nearest",
                 )
             else:
-                gt_mask = gt_mask.float()
+                gt_mask = gt_mask.to(dtype=image_feat.dtype)
 
             masked_feat = image_feat * gt_mask
             mask_area = gt_mask.sum(dim=(2, 3)).clamp_min(1e-6)
             return masked_feat.sum(dim=(2, 3)) / mask_area
 
-        # 无 GT 时统一退化为全局平均池化
+        # 无 GT 时统一使用全局平均池化
         return image_feat.mean(dim=(2, 3))
 
     def _build_query_to_image_index(
@@ -108,14 +137,8 @@ class ImageTextAlignmentAdapter(nn.Module):
     ):
         if query_to_image_index is not None:
             if not torch.is_tensor(query_to_image_index):
-                query_to_image_index = torch.tensor(
-                    query_to_image_index,
-                    device=device,
-                )
-            query_to_image_index = query_to_image_index.to(
-                device=device,
-                dtype=torch.long,
-            )
+                query_to_image_index = torch.tensor(query_to_image_index, device=device)
+            query_to_image_index = query_to_image_index.to(device=device, dtype=torch.long)
             if query_to_image_index.numel() != num_queries:
                 raise ValueError(
                     f"query_to_image_index size mismatch, expected {num_queries}, got {query_to_image_index.numel()}"
@@ -153,12 +176,12 @@ class ImageTextAlignmentAdapter(nn.Module):
             image_embedding: [B, C, H, W]
             seg_embedding: [Q, 1, D] or [Q, D]
             gt_mask: optional GT mask
-            mask_num: number of queries per image
+            mask_num: queries per image
             query_to_image_index: [Q]
             gt_masks_per_query: optional per-query GT mask
 
         Returns:
-            aligned_seg_embedding: [Q, 1, C]
+            fused_seg_feat: [Q, 1, C]
             align_loss: scalar
         """
         B, C, H, W = image_embedding.shape
@@ -176,15 +199,15 @@ class ImageTextAlignmentAdapter(nn.Module):
         query_to_image_index = query_to_image_index.clamp(min=0, max=B - 1)
 
         # text query
-        text_feat = self.query_norm(self.text_proj(seg_embedding))  # [Q, C]
+        text_feat = self._project_text_feature(seg_embedding)  # [Q, C]
 
         # image features
-        img_feat_proj = self.image_proj(image_embedding)            # [B, C, H, W]
-        per_query_image_feat = img_feat_proj[query_to_image_index]  # [Q, C, H, W]
+        img_feat_proj = self.image_proj(image_embedding)              # [B, C, H, W]
+        per_query_image_feat = img_feat_proj[query_to_image_index]   # [Q, C, H, W]
 
         # 主前向统一使用全局 pooled token，保证 train / eval 一致
-        global_feat = self._pool_image_feature(per_query_image_feat)   # [Q, C]
-        global_feat = self.image_norm(self.mask_proj(global_feat))     # [Q, C]
+        global_feat = self._pool_image_feature(per_query_image_feat)     # [Q, C]
+        global_feat = self.image_norm(self.mask_proj(global_feat))       # [Q, C]
 
         # GT mask 只用于 align loss
         per_query_mask = gt_masks_per_query if gt_masks_per_query is not None else gt_mask
@@ -197,6 +220,7 @@ class ImageTextAlignmentAdapter(nn.Module):
         if self.training and per_query_mask is not None:
             if per_query_mask.dim() == 3:
                 per_query_mask = per_query_mask.unsqueeze(1)
+
             if per_query_mask.shape[0] != Q:
                 raise ValueError(
                     f"gt mask size mismatch, expected first dim {Q}, got {per_query_mask.shape[0]}"
@@ -204,7 +228,7 @@ class ImageTextAlignmentAdapter(nn.Module):
 
             masked_feat = self._pool_image_feature(per_query_image_feat, per_query_mask)
             masked_feat = self.image_norm(self.mask_proj(masked_feat))
-            align_loss = F.mse_loss(text_feat, masked_feat)
+            align_loss = F.mse_loss(text_feat.float(), masked_feat.float())
 
         # cross attention: query <- image tokens + global token
         value_tokens = per_query_image_feat.flatten(2).transpose(1, 2)  # [Q, HW, C]

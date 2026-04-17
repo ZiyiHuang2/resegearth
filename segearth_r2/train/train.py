@@ -62,6 +62,8 @@ class TrainingArguments(transformers.TrainingArguments):
     gradient_accumulation_steps: int = field(default=1)
     gradient_checkpointing: bool = field(default=False)
     deepspeed: Optional[str] = field(default='scripts/zero1.json')
+    seg_hidden_layer: int = field(default=-1)
+    seg_layer_fusion: str = field(default="single")
     
     output_dir: Optional[str] = field(default="output/model")
     cache_dir: Optional[str] = field(default=None)
@@ -267,7 +269,8 @@ def train():
     model.config.loss_itaa_weight = training_args.loss_itaa_weight
     model.config.enable_attention_loss = training_args.enable_attention_loss
     model.config.enable_itaa_loss = training_args.enable_itaa_loss
-    
+    model.config.seg_hidden_layer = training_args.seg_hidden_layer
+    model.config.seg_layer_fusion = training_args.seg_layer_fusion
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 

@@ -41,6 +41,7 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_itaa: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -622,6 +623,50 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return seg_embedding, torch.cat(query_to_image_index, dim=0)
         return seg_embedding
 
+    def get_selected_SEG_embedding(self, outputs, SEG_embedding_indices, return_query_to_image=False):
+        seg_layer_fusion = getattr(self.config, "seg_layer_fusion", "single")
+        seg_hidden_layer = getattr(self.config, "seg_hidden_layer", -1)
+
+        if seg_layer_fusion == "single":
+            if seg_hidden_layer == -1:
+                selected_hidden = outputs.last_hidden_state
+            else:
+                if outputs.hidden_states is None:
+                    raise ValueError("outputs.hidden_states is None, cannot select intermediate layer")
+                selected_hidden = outputs.hidden_states[seg_hidden_layer]
+
+            return self.get_SEG_embedding(
+                selected_hidden,
+                SEG_embedding_indices,
+                return_query_to_image=return_query_to_image,
+            )
+    
+        elif seg_layer_fusion == "avg_last2":
+            if outputs.hidden_states is None:
+                raise ValueError("outputs.hidden_states is None, cannot fuse layers")
+            selected_hidden = (outputs.hidden_states[-1] + outputs.hidden_states[-2]) / 2.0
+            return self.get_SEG_embedding(
+                selected_hidden,
+                SEG_embedding_indices,
+                return_query_to_image=return_query_to_image,
+            )
+
+        elif seg_layer_fusion == "avg_last3":
+            if outputs.hidden_states is None:
+               raise ValueError("outputs.hidden_states is None, cannot fuse layers")
+            selected_hidden = (
+                outputs.hidden_states[-1]
+                + outputs.hidden_states[-2]
+                + outputs.hidden_states[-3]
+            ) / 3.0
+            return self.get_SEG_embedding(
+                selected_hidden,
+                SEG_embedding_indices,
+                return_query_to_image=return_query_to_image,
+            )
+
+        else:
+            raise ValueError(f"Unsupported seg_layer_fusion: {seg_layer_fusion}")
     def _get_loss_weight(self, name, default):
         return float(getattr(self.config, name, default))
 
@@ -655,9 +700,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_dataset_type = dataset_type[0]
         else:
             batch_dataset_type = []
-        output_attentions = True
+        output_attentions = self._get_loss_flag("enable_attention_loss", False)
 
-        output_hidden_states = False
+        output_hidden_states = True
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if (SEG_token_embedding_indices == 1).sum() != 0:
@@ -683,9 +728,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
-        SEG_embedding_raw, seg_query_to_image = self.get_SEG_embedding(
-            hidden_states,
+
+        SEG_embedding_raw, seg_query_to_image = self.get_selected_SEG_embedding(
+            outputs,
             SEG_token_embedding_indices,
             return_query_to_image=True,
         )
@@ -865,6 +910,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach() if llm_loss is not None else zero,
             loss_attention=(w_attention * loss_attention).detach() if loss_attention is not None else zero,
+            loss_itaa=(w_itaa * itaa_loss).detach() if itaa_loss is not None else zero,
         )
     
     def eval_seg(
@@ -888,7 +934,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             gt_masks_per_query=None,
             use_gt_mask_for_alignment: bool = False):
         
-        output_attentions = True
+        output_attentions = self._get_loss_flag("enable_attention_loss", False)
         output_hidden_states = True
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -911,8 +957,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         hidden_states = outputs.last_hidden_state   
 
-        SEG_embedding_raw, seg_query_to_image = self.get_SEG_embedding(
-            hidden_states,
+        hidden_states = outputs.last_hidden_state
+
+        SEG_embedding_raw, seg_query_to_image = self.get_selected_SEG_embedding(
+            outputs,
             SEG_token_embedding_indices,
             return_query_to_image=True,
         )
