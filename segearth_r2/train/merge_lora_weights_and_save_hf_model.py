@@ -107,8 +107,10 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     vision_tower.to(device=device)
 
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head","predictor", "SEG_token_projector","itaa"
     ]
+    if not model_args.freeze_pixel_decoder:
+        train_module_list.append("pixel_decoder")
 
     if model_args.lora_enable:
         lora_r = model_args.lora_r
