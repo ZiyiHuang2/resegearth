@@ -23,7 +23,7 @@ from segearth_r2.model.language_model.llava_phi import SegEarthR2
 
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
-    kwargs = {"device_map": 'cpu'}
+    kwargs = {}
 
     if load_8bit:
         kwargs['load_in_8bit'] = True
@@ -37,6 +37,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         )
     else:
         kwargs['torch_dtype'] = torch.float16
+
+    kwargs["low_cpu_mem_usage"] = False
 
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
