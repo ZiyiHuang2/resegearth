@@ -1,0 +1,54 @@
+  0%|                                                                                       | 0/15000 [00:00<?, ?it/s]Traceback (most recent call last):
+  File "/home/wangchengjun/huangziyi/reseg/resegearth+iaa/segearth_r2/train/train.py", line 364, in <module>
+    train()
+  File "/home/wangchengjun/huangziyi/reseg/resegearth+iaa/segearth_r2/train/train.py", line 355, in train
+    trainer.train()
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/trainer.py", line 1624, in train
+    return inner_training_loop(
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/trainer.py", line 1961, in _inner_training_loop
+    tr_loss_step = self.training_step(model, inputs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/trainer.py", line 2902, in training_step
+    loss = self.compute_loss(model, inputs)
+  File "/home/wangchengjun/huangziyi/reseg/resegearth+iaa/segearth_r2/train/llava_trainer.py", line 312, in compute_loss
+    outputs = model(**inputs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/deepspeed/utils/nvtx.py", line 15, in wrapped_fn
+    ret_val = func(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/deepspeed/runtime/engine.py", line 1769, in forward
+    loss = self.module(*inputs, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/peft/peft_model.py", line 918, in forward
+    return self.base_model(
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/peft/tuners/tuners_utils.py", line 94, in forward
+    return self.model.forward(*args, **kwargs)
+  File "/home/wangchengjun/huangziyi/reseg/resegearth+iaa/segearth_r2/model/language_model/llava_phi.py", line 674, in forward
+    outputs = self.model(
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/models/phi/modeling_phi.py", line 925, in forward
+    layer_outputs = decoder_layer(
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/models/phi/modeling_phi.py", line 666, in forward
+    attn_outputs, self_attn_weights, present_key_value = self.self_attn(
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1518, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1527, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/home/wangchengjun/miniconda3/envs/reseg/lib/python3.10/site-packages/transformers/models/phi/modeling_phi.py", line 363, in forward
+    attn_weights = torch.matmul(
+torch.cuda.OutOfMemoryError: CUDA out of memory. Tried to allocate 86.00 MiB. GPU 0 has a total capacty of 23.52 GiB of which 3.00 MiB is free. Process 3678159 has 612.00 MiB memory in use. Process 3686086 has 1.05 GiB memory in use. Process 3685930 has 1.12 GiB memory in use. Process 3686024 has 1.13 GiB memory in use. Process 3686171 has 1.27 GiB memory in use. Process 3685974 has 1.04 GiB memory in use. Process 3686114 has 1.20 GiB memory in use. Process 3685977 has 1.03 GiB memory in use. Process 3686121 has 1.21 GiB memory in use. Process 3686144 has 1.18 GiB memory in use. Process 3685922 has 1.08 GiB memory in use. Including non-PyTorch memory, this process has 11.53 GiB memory in use. Of the allocated memory 10.58 GiB is allocated by PyTorch, and 275.94 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting max_split_size_mb to avoid fragmentation.  See documentation for Memory Management and PYTORCH_CUDA_ALLOC_CONF

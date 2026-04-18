@@ -222,6 +222,9 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
+                query_to_image_index=inputs.get("query_to_image_index", None),
+                gt_masks_per_query=inputs.get("gt_masks_per_query", None),
+                use_gt_mask_for_alignment=False,
             )
 
             for output in outputs:

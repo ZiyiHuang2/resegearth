@@ -19,7 +19,7 @@ local_rank = None
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="pretrained_model/mllm/Mipha-3B")
+    model_name_or_path: Optional[str] = field(default="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B")
    
     version: Optional[str] = field(default="phi-2")
 
@@ -27,8 +27,8 @@ class ModelArguments:
     train_clip_backbone: bool = field(default=False)
     train_swin_backbone: bool = field(default=False)
 
-    vision_tower: str = "pretrained_model/CLIP/siglip-so400m-patch14-384"
-    vision_tower_mask: str = "pretrained_model/mask2former/maskformer2_swin_base_IN21k_384_bs16_50ep.pkl"
+    vision_tower: str = "/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip2-so400m-patch14-384"
+    vision_tower_mask: str = "/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/maskformer2_swin_base_IN21k_384_bs16_50ep.pkl"
     with_norm: bool = field(default=True)
     with_layernorm: bool = field(default=False)
     skip_init_vision: bool = field(default=False)
@@ -37,7 +37,7 @@ class ModelArguments:
     mm_projector_type: Optional[str] = field(default="swin_conv")
     model_version: Optional[str] = field(default="v1")
     load_mask2former: bool = field(default=True)
-    mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
+    mask_config: Optional[str] = field(default="/home/wangchengjun/huangziyi/reseg/segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
@@ -47,13 +47,17 @@ class DataArguments:
     is_multimodal: bool = False
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
-    base_data_path: str = '/data1/xzp/data'
-    data_ratio: str = '1'  
-    switch_bs: int = 4 # 16
+    base_data_path: str = '/home/wangchengjun/huangziyi/data'
+    data_ratio: str = '1'
+    switch_bs: int = 4
     fix_dataset_len: int = 0
     segmentation: bool = True
+<<<<<<< HEAD
     dataset_name: str = field(default="rrsisd")
 
+=======
+    dataset_name: str = "rrsisd"
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     
@@ -63,6 +67,8 @@ class TrainingArguments(transformers.TrainingArguments):
     gradient_accumulation_steps: int = field(default=1)
     gradient_checkpointing: bool = field(default=False)
     deepspeed: Optional[str] = field(default='scripts/zero1.json')
+    seg_hidden_layer: int = field(default=-1)
+    seg_layer_fusion: str = field(default="single")
     
     output_dir: Optional[str] = field(default="output/model")
     cache_dir: Optional[str] = field(default=None)
@@ -107,6 +113,18 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
+    # Enable lightweight delta gradient logging for two modules:
+    # 1) ITAA, 2) SEG_token_projector.
+    # This monitor is NOT limited to ITAA only.
+    enable_delta_grad_monitor: bool = field(default=False)
+    # 0 means follow logging_steps; >0 uses a custom logging interval.
+    delta_grad_monitor_interval: int = field(default=0)
+    loss_llm_weight: float = field(default=1.0)
+    loss_mask_weight: float = field(default=1.0)
+    loss_attention_weight: float = field(default=0.0)
+    loss_itaa_weight: float = field(default=0.03)
+    enable_attention_loss: bool = field(default=False)
+    enable_itaa_loss: bool = field(default=True)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -203,6 +221,7 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
 
     if data_ratio[0] != 0:
         if dataset_name == "rrsisd":
+<<<<<<< HEAD
             train_dataset = RRSISDDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
@@ -237,14 +256,46 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
 
     print(f'the dataset ratio is: {data_ratio}')
     print(f'the dataset name is: {data_args.dataset_name}')
+=======
+            train_dataset_single = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train'
+            )
+        elif dataset_name == "lasers":
+            train_dataset_single = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train_data.json'
+            )
+        else:
+            raise ValueError(
+                f"Unsupported dataset_name={data_args.dataset_name}. "
+                f"Expected one of: rrsisd, lasers"
+            )
+
+        datasets += [train_dataset_single] * data_ratio[0]
+
+    print(f'the dataset ratio is: {data_ratio}')
+    print(f'the dataset name is: {dataset_name}')
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     train_dataset = UnifyDatasetSingleDatasetForBatch(
         datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len
     )
     print(f'total unify datasest number is {len(train_dataset)}')
     data_collator = DataCollatorForCOCODatasetV2(
+<<<<<<< HEAD
         tokenizer=tokenizer, clip_image_processor=clip_image_processor
     )
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
+=======
+        tokenizer=tokenizer,
+        clip_image_processor=clip_image_processor
+    )
+    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
 
 def train():
     global local_rank
@@ -275,7 +326,10 @@ def train():
         model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.config.use_cache = False
+<<<<<<< HEAD
 
+=======
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     model.config.loss_llm_weight = training_args.loss_llm_weight
     model.config.loss_mask_weight = training_args.loss_mask_weight
     model.config.loss_attention_weight = training_args.loss_attention_weight
@@ -284,7 +338,10 @@ def train():
     model.config.enable_itaa_loss = training_args.enable_itaa_loss
     model.config.seg_hidden_layer = training_args.seg_hidden_layer
     model.config.seg_layer_fusion = training_args.seg_layer_fusion
+<<<<<<< HEAD
 
+=======
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -342,10 +399,17 @@ def train():
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
-    tokenizer.add_tokens("[SEG]")
-    model.resize_token_embeddings(len(tokenizer))
+    seg_token = "[SEG]"
+    if tokenizer.convert_tokens_to_ids(seg_token) == tokenizer.unk_token_id:
+        tokenizer.add_tokens(seg_token)
+        model.resize_token_embeddings(len(tokenizer))
+    # Delta trainables whitelist: modules in this list are explicitly unfrozen after LoRA wrapping.
     train_module_list = [
+<<<<<<< HEAD
         "lm_head", "predictor", "SEG_token_projector","itaa"
+=======
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     ]
     if not training_args.freeze_pixel_decoder:
         train_module_list.append("pixel_decoder")

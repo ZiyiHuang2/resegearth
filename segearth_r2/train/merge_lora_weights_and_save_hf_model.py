@@ -106,8 +106,13 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     vision_tower.to(device=device)
 
+    # Keep merge-time trainable list aligned with training-time whitelist.
     train_module_list = [
+<<<<<<< HEAD
         "lm_head","predictor", "SEG_token_projector","itaa"
+=======
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
+>>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     ]
     if not model_args.freeze_pixel_decoder:
         train_module_list.append("pixel_decoder")
