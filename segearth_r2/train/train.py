@@ -40,6 +40,14 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    num_local_queries: int = field(default=4)
+    use_text_cross_attn_refine: bool = field(default=False)
+    use_query_score_supervision: bool = field(default=True)
+    use_query_margin_loss: bool = field(default=True)
+    query_score_loss_weight: float = field(default=0.25)
+    query_div_loss_weight: float = field(default=0.05)
+    query_margin_loss_weight: float = field(default=0.1)
+    inference_query_select_mode: str = field(default="soft")
 
 @dataclass
 class DataArguments:
@@ -52,6 +60,7 @@ class DataArguments:
     switch_bs: int = 4 # 16
     fix_dataset_len: int = 0
     segmentation: bool = True
+    dataset_name: str = field(default="rrsisd")
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -95,6 +104,8 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
+    seed: int = 42
+    data_seed: int = 42
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -186,21 +197,52 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     data_ratio = data_ratio.split('||')
     data_ratio = [int(data_) for data_ in data_ratio]
     datasets = []
-    if data_ratio[0] != 0:
-        RRSISTrainDataset = RRSISDDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            split='train'
-        )
-        datasets += [RRSISTrainDataset] * data_ratio[0]
+    eval_dataset = None
 
-    
+    dataset_name = data_args.dataset_name.lower()
+
+    if data_ratio[0] != 0:
+        if dataset_name == "rrsisd":
+            train_dataset = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
+        elif dataset_name == "lasers":
+            train_dataset = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train_data.json"
+            )
+            eval_dataset = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val_data.json"
+            )
+        else:
+            raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
+
+        datasets += [train_dataset] * data_ratio[0]
+
     print(f'the dataset ratio is: {data_ratio}')
-    train_dataset = UnifyDatasetSingleDatasetForBatch(datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len)
+    print(f'the dataset name is: {data_args.dataset_name}')
+    train_dataset = UnifyDatasetSingleDatasetForBatch(
+        datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len
+    )
     print(f'total unify datasest number is {len(train_dataset)}')
-    data_collator = DataCollatorForCOCODatasetV2(tokenizer=tokenizer, clip_image_processor=clip_image_processor)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    data_collator = DataCollatorForCOCODatasetV2(
+        tokenizer=tokenizer, clip_image_processor=clip_image_processor
+    )
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 def train():
     global local_rank
@@ -221,6 +263,14 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
                 )
+    model.config.num_local_queries = model_args.num_local_queries
+    model.config.use_text_cross_attn_refine = model_args.use_text_cross_attn_refine
+    model.config.use_query_score_supervision = model_args.use_query_score_supervision
+    model.config.use_query_margin_loss = model_args.use_query_margin_loss
+    model.config.query_score_loss_weight = model_args.query_score_loss_weight
+    model.config.query_div_loss_weight = model_args.query_div_loss_weight
+    model.config.query_margin_loss_weight = model_args.query_margin_loss_weight
+    model.config.inference_query_select_mode = model_args.inference_query_select_mode
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
@@ -288,7 +338,7 @@ def train():
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "seg_query_adapter",
     ]
 
     if model_args.train_swin_backbone:
@@ -325,6 +375,21 @@ def train():
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
+    if hasattr(training_args, "eval_strategy"):
+        if str(training_args.eval_strategy).lower().endswith("no"):
+            training_args.eval_strategy = "steps"
+    else:
+        if str(training_args.evaluation_strategy).lower().endswith("no"):
+            training_args.evaluation_strategy = "steps"
+    training_args.save_strategy = "steps"
+    if training_args.eval_steps is None or training_args.eval_steps <= 0:
+        training_args.eval_steps = 1000
+    training_args.save_steps = training_args.eval_steps
+    training_args.load_best_model_at_end = True
+    training_args.metric_for_best_model = "eval_score"
+    training_args.greater_is_better = True
+    if training_args.save_total_limit is None or training_args.save_total_limit <= 0:
+        training_args.save_total_limit = 2
     
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,

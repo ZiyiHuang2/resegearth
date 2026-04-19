@@ -1,0 +1,2 @@
+from .seg_query_adapter import SegQueryAdapter
+from .seg_query_adapter_v2 import SegQueryAdapterV2

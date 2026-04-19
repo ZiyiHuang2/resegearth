@@ -1,6 +1,7 @@
 import os
 import torch
 import shutil
+import torch.nn.functional as F
 from transformers import Trainer
 from transformers.modeling_utils import unwrap_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -182,6 +183,37 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 class LLaVATrainer(Trainer):
 
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        """
+        Keep train `dataloader_drop_last=True` behavior unchanged, but force eval to never drop
+        the last incomplete batch so best-checkpoint selection uses full validation data.
+        """
+        if eval_dataset is None and self.eval_dataset is None:
+            raise ValueError("Trainer: evaluation requires an eval_dataset.")
+
+        eval_dataset = eval_dataset if eval_dataset is not None else self.eval_dataset
+        data_collator = self.data_collator
+
+        if is_datasets_available() and "datasets" in globals() and isinstance(eval_dataset, datasets.Dataset):
+            eval_dataset = self._remove_unused_columns(eval_dataset, description="evaluation")
+        else:
+            data_collator = self._get_collator_with_removed_columns(data_collator, description="evaluation")
+
+        dataloader_params = {
+            "batch_size": self.args.eval_batch_size,
+            "sampler": self._get_eval_sampler(eval_dataset),
+            "collate_fn": data_collator,
+            "drop_last": False,
+            "num_workers": self.args.dataloader_num_workers,
+            "pin_memory": self.args.dataloader_pin_memory,
+            "persistent_workers": self.args.dataloader_persistent_workers,
+        }
+        if self.args.dataloader_num_workers > 0:
+            dataloader_params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+
+        eval_dataloader = DataLoader(eval_dataset, **dataloader_params)
+        return self.accelerator.prepare(eval_dataloader)
+
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -208,6 +240,117 @@ class LLaVATrainer(Trainer):
             pass
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        if self._memory_tracker is not None:
+            self._memory_tracker.start()
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        model = self.model
+        was_training = model.training
+        model.eval()
+
+        device = self.args.device
+        inter_sum = torch.tensor(0.0, device=device)
+        union_sum = torch.tensor(0.0, device=device)
+        ciou_sum = torch.tensor(0.0, device=device)
+        ciou_count = torch.tensor(0.0, device=device)
+
+        with torch.no_grad():
+            for inputs in eval_dataloader:
+                inputs = self._prepare_inputs(inputs)
+
+                outputs = model.eval_seg(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    images=inputs["images"],
+                    images_clip=inputs["images_clip"],
+                    seg_info=inputs["seg_info"],
+                    token_refer_id=inputs["token_refer_id"],
+                    SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
+                    labels=inputs["labels"],
+                    mask_num=inputs["mask_num"],
+                )
+
+                gt_map = {}
+                for gt_item in inputs["seg_info"]:
+                    gt_mask = gt_item.get("mask", None)
+                    if gt_mask is None:
+                        continue
+                    key = (
+                        str(gt_item.get("image_id", "")),
+                        str(gt_item.get("data_id", "")),
+                        int(gt_item.get("mask_id", -1)),
+                    )
+                    gt_map[key] = gt_mask
+
+                for pred_item in outputs:
+                    key = (
+                        str(pred_item.get("image_name", "")),
+                        str(pred_item.get("id", "")),
+                        int(pred_item.get("mask_id", -1)),
+                    )
+                    if key not in gt_map:
+                        continue
+
+                    pred = torch.as_tensor(pred_item["pred"], device=device)
+                    if pred.ndim > 2:
+                        pred = pred.squeeze()
+                    pred = pred > 0
+
+                    gt = gt_map[key]
+                    if gt.ndim == 3:
+                        gt = gt.squeeze(0)
+                    gt = gt > 0
+
+                    if gt.shape != pred.shape:
+                        gt = F.interpolate(
+                            gt.float().unsqueeze(0).unsqueeze(0),
+                            size=pred.shape[-2:],
+                            mode="nearest",
+                        ).squeeze(0).squeeze(0) > 0
+
+                    inter = (pred & gt).sum().float()
+                    union = (pred | gt).sum().float()
+                    if union > 0:
+                        inter_sum += inter
+                        union_sum += union
+                        ciou_sum += inter / union
+                        ciou_count += 1.0
+
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(inter_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(union_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ciou_sum, op=dist.ReduceOp.SUM)
+            dist.all_reduce(ciou_count, op=dist.ReduceOp.SUM)
+
+        # mask-level definition:
+        # gIoU: mean IoU over masks
+        # cIoU: global IoU over all mask pixels
+        eval_giou = (ciou_sum / ciou_count.clamp(min=1.0)).item()
+        eval_ciou = (inter_sum / (union_sum + 1e-6)).item()
+        eval_score = 0.5 * eval_giou + 0.5 * eval_ciou
+
+        metrics = {
+            f"{metric_key_prefix}_giou": eval_giou,
+            f"{metric_key_prefix}_ciou": eval_ciou,
+            f"{metric_key_prefix}_score": eval_score,
+        }
+        self.log(metrics)
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+
+        if self._memory_tracker is not None:
+            self._memory_tracker.stop_and_update_metrics(metrics)
+
+        if was_training:
+            model.train()
+
+        return metrics
 
     def update_history_loss_dict(self,outputs):
         if not hasattr(self,'history_loss_dict'):

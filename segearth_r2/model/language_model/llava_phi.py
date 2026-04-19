@@ -25,6 +25,7 @@ from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_e
 
 from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
+from ..query_adapter.seg_query_adapter_v2 import SegQueryAdapterV2
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
 
@@ -67,6 +68,49 @@ class AttentionLoss(nn.Module):
         elif self.reduction == 'mean':
             loss = loss / model_attention_logits.numel()  # Overall mean loss
         return loss
+
+
+def query_diversity_loss(query_feat, margin=0.2):
+    # query_feat: [Nq, K, C], only within each [SEG] group
+    query_feat = F.normalize(query_feat, dim=-1)
+    n_q, k, _ = query_feat.shape
+    if k <= 1:
+        return query_feat.new_tensor(0.0)
+
+    sim = torch.matmul(query_feat, query_feat.transpose(-1, -2))  # [Nq, K, K]
+    eye = torch.eye(k, device=query_feat.device, dtype=torch.bool).unsqueeze(0)
+    offdiag = sim[~eye].view(n_q, -1)
+    return F.relu(offdiag - (1.0 - margin)).mean()
+
+
+def query_margin_loss(quality, margin=0.05):
+    # quality: [Nq, K], mask-level quality proxy
+    if quality.shape[1] <= 1:
+        return quality.new_tensor(0.0)
+    sorted_q, _ = quality.sort(dim=1, descending=True)
+    top1 = sorted_q[:, 0]
+    top2 = sorted_q[:, 1]
+    return F.relu(margin - (top1 - top2)).mean()
+
+
+def compute_subquery_quality(sub_pred_masks, gt_masks):
+    # sub_pred_masks: [Nq, K, H, W], gt_masks: [Nq, 1, Hgt, Wgt]
+    n_q, k, h, w = sub_pred_masks.shape
+    gt = gt_masks
+    if gt.shape[-2:] != (h, w):
+        gt = F.interpolate(gt.float(), size=(h, w), mode="nearest")
+    gt = gt.clamp(min=0.0, max=1.0)
+
+    pred_prob = sub_pred_masks.sigmoid()
+    pred_prob = pred_prob.unsqueeze(2)  # [Nq, K, 1, H, W]
+    gt = gt.unsqueeze(1)  # [Nq, 1, 1, H, W]
+
+    inter = (pred_prob * gt).sum(dim=(-1, -2, -3))
+    union = (pred_prob + gt - pred_prob * gt).sum(dim=(-1, -2, -3))
+    iou = inter / (union + 1e-6)
+    dice = 2.0 * inter / (pred_prob.sum(dim=(-1, -2, -3)) + gt.sum(dim=(-1, -2, -3)) + 1e-6)
+    quality = 0.5 * (iou + dice)
+    return quality
 
 class SegEarthR2Model(MiphaPhiModel):
 
@@ -149,7 +193,68 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.pixel_decoder = self.pixel_decoder_init(cfg=self.mask_decoder_cfg, input_shape=input_shape)
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
-        self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        hidden_dim = self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+        self.num_local_queries = int(
+            getattr(model_args, "num_local_queries", getattr(self.config, "num_local_queries", 4))
+        )
+        self.use_text_cross_attn_refine = bool(
+            getattr(
+                model_args,
+                "use_text_cross_attn_refine",
+                getattr(self.config, "use_text_cross_attn_refine", False),
+            )
+        )
+        self.use_query_score_supervision = bool(
+            getattr(
+                model_args,
+                "use_query_score_supervision",
+                getattr(self.config, "use_query_score_supervision", True),
+            )
+        )
+        self.use_query_margin_loss = bool(
+            getattr(
+                model_args,
+                "use_query_margin_loss",
+                getattr(self.config, "use_query_margin_loss", True),
+            )
+        )
+        self.query_score_loss_weight = float(
+            getattr(
+                model_args,
+                "query_score_loss_weight",
+                getattr(self.config, "query_score_loss_weight", 0.25),
+            )
+        )
+        self.query_div_loss_weight = float(
+            getattr(
+                model_args,
+                "query_div_loss_weight",
+                getattr(self.config, "query_div_loss_weight", 0.05),
+            )
+        )
+        self.query_margin_loss_weight = float(
+            getattr(
+                model_args,
+                "query_margin_loss_weight",
+                getattr(self.config, "query_margin_loss_weight", 0.1),
+            )
+        )
+        self.inference_query_select_mode = str(
+            getattr(
+                model_args,
+                "inference_query_select_mode",
+                getattr(self.config, "inference_query_select_mode", "soft"),
+            )
+        )
+        self.query_score_warmup_steps = int(getattr(self.config, "query_score_warmup_steps", 1000))
+
+        self.SEG_token_projector = nn.Linear(self.config.hidden_size, hidden_dim)
+        self.seg_query_adapter = SegQueryAdapterV2(
+            hidden_dim=hidden_dim,
+            num_local_queries=self.num_local_queries,
+            text_dim=hidden_dim,
+            use_text_cross_attn_refine=self.use_text_cross_attn_refine,
+        )
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -184,6 +289,69 @@ class SegEarthR2(MiphaPhiForCausalLM):
             diff_predictor_msg = self.predictor.load_state_dict(predictor_weights,strict=False)
             print(diff_predictor_msg)
             print(diff_pixel_msg)
+
+    def build_text_context(self, hidden_states, attention_mask, mask_num):
+        # hidden_states: [bs, T, D]
+        if attention_mask is not None:
+            valid_mask = attention_mask.to(hidden_states.device).float()
+            denom = valid_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+            pooled = (hidden_states * valid_mask.unsqueeze(-1)).sum(dim=1) / denom
+        else:
+            pooled = hidden_states.mean(dim=1)
+
+        if mask_num is None:
+            return pooled
+        mask_num_tensor = torch.tensor(mask_num, device=hidden_states.device, dtype=torch.long)
+        return torch.repeat_interleave(pooled, repeats=mask_num_tensor, dim=0)
+
+    def aggregate_subquery_outputs(self, mask_outputs, query_scores, num_seed_queries, num_local_queries, mode="soft"):
+        score_logits = query_scores.squeeze(-1)  # [Nq, K]
+        if mode == "top1":
+            top_idx = torch.argmax(score_logits, dim=1, keepdim=True)
+            weights = torch.zeros_like(score_logits).scatter_(1, top_idx, 1.0)
+        elif mode == "threshold":
+            probs = torch.sigmoid(score_logits)
+            weights = (probs > 0.5).float()
+            weights = weights / weights.sum(dim=1, keepdim=True).clamp(min=1.0)
+        else:
+            weights = torch.softmax(score_logits, dim=1)
+
+        def _aggregate_tensor(tensor):
+            if not torch.is_tensor(tensor):
+                return tensor, None
+            if tensor.shape[0] != num_seed_queries * num_local_queries:
+                return tensor, None
+            view_shape = (num_seed_queries, num_local_queries) + tuple(tensor.shape[1:])
+            sub_tensor = tensor.view(view_shape)
+            w = weights.view(num_seed_queries, num_local_queries, *([1] * (tensor.dim() - 1)))
+            agg_tensor = (sub_tensor * w).sum(dim=1)
+            return agg_tensor, sub_tensor
+
+        agg_outputs = {}
+        sub_outputs = {}
+        for k, v in mask_outputs.items():
+            if k == "aux_outputs" and isinstance(v, list):
+                aux_list = []
+                aux_sub_list = []
+                for aux_item in v:
+                    aux_agg = {}
+                    aux_sub = {}
+                    for ak, av in aux_item.items():
+                        aa, asub = _aggregate_tensor(av)
+                        aux_agg[ak] = aa
+                        if asub is not None:
+                            aux_sub[ak] = asub
+                    aux_list.append(aux_agg)
+                    aux_sub_list.append(aux_sub)
+                agg_outputs[k] = aux_list
+                sub_outputs[k] = aux_sub_list
+                continue
+            aa, asub = _aggregate_tensor(v)
+            agg_outputs[k] = aa
+            if asub is not None:
+                sub_outputs[k] = asub
+
+        return agg_outputs, sub_outputs, weights
 
     def get_vision_tower_feature(self, images):
         features = self.get_model().get_vision_tower_mask()(images)
@@ -595,11 +763,26 @@ class SegEarthR2(MiphaPhiForCausalLM):
    
         return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices
     
-    def get_SEG_embedding(self, hidden_states, SEG_embedding_indices):
+    def get_SEG_embedding(self, hidden_states, SEG_embedding_indices, mask_num=None):
         SEG_embedding_list = []
+        seg_token_counts = []
         for current_hidden_state, current_token_indice in zip(hidden_states, SEG_embedding_indices):
-            current_refer_state = current_hidden_state[current_token_indice.bool()]
-            SEG_embedding_list.append(current_refer_state)
+            current_seg_mask = current_token_indice.bool()
+            seg_count = int(current_seg_mask.sum().item())
+            seg_token_counts.append(seg_count)
+            if seg_count > 0:
+                current_refer_state = current_hidden_state[current_seg_mask]
+                SEG_embedding_list.append(current_refer_state)
+
+        if len(SEG_embedding_list) == 0:
+            batch_size = int(hidden_states.shape[0])
+            mask_num_list = [int(x) for x in mask_num] if mask_num is not None else None
+            mask_num_sum = int(sum(mask_num_list)) if mask_num_list is not None else None
+            raise ValueError(
+                f"No valid [SEG] tokens found in batch. "
+                f"batch_size={batch_size}, seg_token_counts={seg_token_counts}, "
+                f"mask_num={mask_num_list}, sum(mask_num)={mask_num_sum}"
+            )
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
            
     def forward(
@@ -657,18 +840,43 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        mask_num_list = [int(x) for x in mask_num] if mask_num is not None else None
+        SEG_embedding = self.SEG_token_projector(
+            self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices, mask_num=mask_num_list)
+        )
+        text_context = self.build_text_context(hidden_states, attention_mask, mask_num_list)
+        sub_queries, query_scores, query_aux = self.seg_query_adapter(
+            SEG_embedding,
+            text_context=text_context,
+            visual_context=None,
+        )
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
-        mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
+        mask_num_tensor = torch.tensor(mask_num_list, device=mask_features.device)
+        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num_tensor, dim=0)
         multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
+            torch.repeat_interleave(feat, repeats=mask_num_tensor, dim=0)
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        n_q, local_k, q_dim = sub_queries.shape
+        flat_queries = sub_queries.reshape(n_q * local_k, 1, q_dim)
+        mask_features_k = torch.repeat_interleave(mask_features, repeats=local_k, dim=0)
+        multi_scale_features_k = [
+            torch.repeat_interleave(feat, repeats=local_k, dim=0)
+            for feat in multi_scale_features
+        ]
+
+        mask_outputs_sub = self.predictor(multi_scale_features_k, mask_features_k, None, None, flat_queries)
+        select_mode = "soft" if self.training else self.inference_query_select_mode
+        mask_outputs, sub_outputs, query_weights = self.aggregate_subquery_outputs(
+            mask_outputs_sub, query_scores, n_q, local_k, mode=select_mode
+        )
+        mask_outputs["query_scores"] = query_scores
+        mask_outputs["query_weights"] = query_weights
+        mask_outputs["query_aux"] = query_aux
+        mask_outputs["subquery_outputs"] = sub_outputs
 
         # 开始计算loss
         loss = None
@@ -713,22 +921,60 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_losses = self.criterion(mask_outputs, targets)
             weight_dict = self.weight_dict
 
-            loss_mask = 0.0
-            loss_dice = 0.0
+            loss_mask = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
+            loss_dice = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
+            loss_seg_class = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
         
             for k in list(mask_losses.keys()):
                 if k in weight_dict:
                     if mask_losses[k] is not None:
                         mask_losses[k] *= weight_dict[k]
+
+                    if "SEG_class" in k:
+                        loss_seg_class += mask_losses[k]
                     
-                    if '_mask' in k:
+                    elif '_mask' in k:
                         loss_mask += mask_losses[k]
                     
                     elif '_dice' in k:
                         loss_dice += mask_losses[k]
                 else:
                     mask_losses.pop(k)
-            mask_loss = loss_mask + loss_dice
+            loss_query_div = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
+            loss_query_score = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
+            loss_query_margin = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
+
+            query_feat = mask_outputs.get("query_aux", {}).get("query_feat")
+            if query_feat is not None:
+                loss_query_div = query_diversity_loss(query_feat)
+
+            sub_pred_masks = mask_outputs.get("subquery_outputs", {}).get("pred_masks")
+            if sub_pred_masks is not None and 'mask' in seg_info[0]:
+                gt_masks = []
+                for gt_item in seg_info:
+                    gt_mask = gt_item["mask"]
+                    gt_masks.append(gt_mask.to(sub_pred_masks.device).float())
+                gt_masks = torch.stack(gt_masks, dim=0)  # [Nq, 1, H, W]
+
+                quality = compute_subquery_quality(sub_pred_masks, gt_masks).detach()  # [Nq, K]
+                if self.use_query_score_supervision:
+                    quality_target = quality / quality.sum(dim=1, keepdim=True).clamp(min=1e-6)
+                    log_prob = F.log_softmax(query_scores.squeeze(-1), dim=1)
+                    loss_query_score = -(quality_target * log_prob).sum(dim=1).mean()
+                    if global_step is not None:
+                        warmup = min(1.0, float(global_step) / float(max(1, self.query_score_warmup_steps)))
+                        loss_query_score = loss_query_score * warmup
+                if self.use_query_margin_loss:
+                    loss_query_margin = query_margin_loss(quality)
+
+            mask_loss = (
+                loss_mask
+                + loss_dice
+                + loss_seg_class
+                + self.query_score_loss_weight * loss_query_score
+                + self.query_div_loss_weight * loss_query_div
+                + self.query_margin_loss_weight * loss_query_margin
+            )
 
         loss_attention = None
         masks = [_seg_info['mask'] for _seg_info in seg_info]
@@ -785,8 +1031,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             mask_num = None):
         
-        output_attentions = True
-        output_hidden_states = True
+        output_attentions = False
+        output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_features = self.get_vision_tower_feature(images)
@@ -808,7 +1054,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         hidden_states = outputs.last_hidden_state   
 
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        SEG_embedding = self.SEG_token_projector(
+            self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices, mask_num=mask_num)
+        )
+        text_context = self.build_text_context(hidden_states, attention_mask, mask_num)
+        sub_queries, query_scores, query_aux = self.seg_query_adapter(
+            SEG_embedding,
+            text_context=text_context,
+            visual_context=None,
+        )
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -822,7 +1076,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        n_q, local_k, q_dim = sub_queries.shape
+        flat_queries = sub_queries.reshape(n_q * local_k, 1, q_dim)
+        mask_features_k = torch.repeat_interleave(mask_features, repeats=local_k, dim=0)
+        multi_scale_features_k = [
+            torch.repeat_interleave(feat, repeats=local_k, dim=0)
+            for feat in multi_scale_features
+        ]
+
+        mask_outputs_sub = self.predictor(multi_scale_features_k, mask_features_k, None, None, flat_queries)
+        mask_outputs, sub_outputs, query_weights = self.aggregate_subquery_outputs(
+            mask_outputs_sub, query_scores, n_q, local_k, mode=self.inference_query_select_mode
+        )
+        mask_outputs["query_scores"] = query_scores
+        mask_outputs["query_weights"] = query_weights
+        mask_outputs["query_aux"] = query_aux
+        mask_outputs["subquery_outputs"] = sub_outputs
 
         
         mask_pred_results = mask_outputs["pred_masks"]
