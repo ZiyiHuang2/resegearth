@@ -153,6 +153,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             config=CLIPPriorConfig(map_size=map_size),
             clip_model_name_or_path=clip_model_name_or_path,
         )
+        prior_device = clip_model.device if hasattr(clip_model, "device") else next(clip_model.parameters()).device
+        self.clip_prior_generator.to(device=prior_device)
         self.clip_prior_generator.eval()
         for p in self.clip_prior_generator.parameters():
             p.requires_grad = False
