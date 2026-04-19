@@ -56,6 +56,21 @@ class DataArguments:
     use_static_kb: bool = False
     static_kb_mode: str = "rrsisd"
     static_kb_max_chars: int = 220
+    use_ss_kb: bool = False
+    ss_kb_inject_mode: str = "auto"
+    ss_kb_max_prefix_chars: int = 64
+    ss_kb_min_query_tokens: int = 3
+    use_semantic_kb: bool = False
+    semantic_kb_inject_mode: str = "hard"
+    semantic_kb_hard_query_max_tokens: int = 7
+    semantic_kb_max_prefix_chars: int = 72
+    semantic_kb_include_fields: str = "cat,rel,ctx,shape,scale"
+    semantic_kb_category_priors_path: Optional[str] = None
+    semantic_kb_relation_priors_path: Optional[str] = None
+    use_clip_prior: bool = False
+    clip_prior_alpha: float = 0.2
+    clip_prior_text_source: str = "semantic_cat"
+    clip_prior_map_size: int = 27
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -201,6 +216,12 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 data_args=data_args,
                 split="train"
             )
+            eval_dataset = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
         elif dataset_name == "lasers":
             train_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
@@ -208,10 +229,18 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 data_args=data_args,
                 split="train_data.json"
             )
+            eval_dataset = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val_data.json"
+            )
         else:
             raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
         datasets += [train_dataset] * data_ratio[0]
+    else:
+        raise ValueError("data_ratio[0] is 0; train dataset is empty.")
 
     print(f'the dataset ratio is: {data_ratio}')
     print(f'the dataset name is: {data_args.dataset_name}')
@@ -222,7 +251,7 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     data_collator = DataCollatorForCOCODatasetV2(
         tokenizer=tokenizer, clip_image_processor=clip_image_processor
     )
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 def train():
     global local_rank
@@ -230,6 +259,10 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if training_args.seed is None:
+        training_args.seed = 42
+    if training_args.data_seed is None:
+        training_args.data_seed = 42
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
@@ -243,6 +276,10 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
                 )
+    model.config.use_clip_prior = data_args.use_clip_prior
+    model.config.clip_prior_alpha = data_args.clip_prior_alpha
+    model.config.clip_prior_text_source = data_args.clip_prior_text_source
+    model.config.clip_prior_map_size = data_args.clip_prior_map_size
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
@@ -342,11 +379,33 @@ def train():
                 p.requires_grad = True
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    if data_args.use_clip_prior:
+        clip_prior_target = model.get_base_model() if hasattr(model, "get_base_model") else model
+        clip_prior_target.initialize_clip_prior(
+            clip_model=clip_prior_target.get_model().get_vision_tower(),
+            tokenizer=tokenizer,
+            clip_model_name_or_path=model_args.vision_tower,
+            map_size=data_args.clip_prior_map_size,
+            alpha=data_args.clip_prior_alpha,
+        )
     
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
+    if hasattr(training_args, "evaluation_strategy"):
+        training_args.evaluation_strategy = "steps"
+    if hasattr(training_args, "eval_strategy"):
+        training_args.eval_strategy = "steps"
+    training_args.save_strategy = "steps"
+    if training_args.save_steps is None or training_args.save_steps <= 0:
+        training_args.save_steps = 500
+    training_args.eval_steps = training_args.save_steps
+    training_args.load_best_model_at_end = True
+    training_args.metric_for_best_model = "eval_score"
+    training_args.greater_is_better = True
+    if training_args.save_total_limit is None or training_args.save_total_limit > 2:
+        training_args.save_total_limit = 2
     
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,

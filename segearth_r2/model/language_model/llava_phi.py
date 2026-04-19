@@ -25,6 +25,7 @@ from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_e
 
 from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
+from segearth_r2.model.prior.clip_prior import CLIPPriorConfig, CLIPPriorGenerator
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
 
@@ -135,7 +136,44 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if is_train_mask_decode:
             print('Mask Decoder has been trained, init directly')
             self.initial_mask_module()
+        self.use_clip_prior = getattr(config, "use_clip_prior", False)
+        self.clip_prior_alpha = getattr(config, "clip_prior_alpha", 0.0)
+        self.clip_prior_generator = None
         self.post_init()
+
+    def initialize_clip_prior(self, clip_model, tokenizer, clip_model_name_or_path, map_size: int = 27, alpha: float = 0.2):
+        self.use_clip_prior = True
+        self.clip_prior_alpha = alpha
+        self.config.use_clip_prior = True
+        self.config.clip_prior_alpha = alpha
+        self.config.clip_prior_map_size = map_size
+        self.clip_prior_generator = CLIPPriorGenerator(
+            clip_model=clip_model,
+            tokenizer=tokenizer,
+            config=CLIPPriorConfig(map_size=map_size),
+            clip_model_name_or_path=clip_model_name_or_path,
+        )
+        self.clip_prior_generator.eval()
+        for p in self.clip_prior_generator.parameters():
+            p.requires_grad = False
+
+    def apply_clip_prior(self, mask_features, images_clip, clip_prior_text):
+        if not (
+            self.use_clip_prior
+            and self.clip_prior_generator is not None
+            and images_clip is not None
+            and clip_prior_text is not None
+        ):
+            return mask_features
+
+        prior_map = self.clip_prior_generator(images_clip, clip_prior_text)
+        prior_map = F.interpolate(
+            prior_map,
+            size=mask_features.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        return mask_features + self.clip_prior_alpha * prior_map
 
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
@@ -617,6 +655,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict: Optional[bool] = None,
             seg_info=None,
             token_refer_id=None,
+            clip_prior_text=None,
+            raw_instruction=None,
             SEG_token_embedding_indices=None,
             global_step=None,
             mask_num=None,
@@ -661,6 +701,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
+        mask_features = self.apply_clip_prior(mask_features, images_clip, clip_prior_text)
         mask_num = torch.tensor(mask_num, device=mask_features.device)
         mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
         multi_scale_features = [
@@ -782,11 +823,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict: Optional[bool] = None,
             seg_info=None,
             token_refer_id=None,
+            clip_prior_text=None,
             SEG_token_embedding_indices=None,
             mask_num = None):
         
-        output_attentions = True
-        output_hidden_states = True
+        output_attentions = False
+        output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_features = self.get_vision_tower_feature(images)
@@ -812,6 +854,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
+        mask_features = self.apply_clip_prior(mask_features, images_clip, clip_prior_text)
     
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]

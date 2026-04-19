@@ -25,6 +25,8 @@ from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
 from segearth_r2.knowledge.static_kb import StaticRSKB
+from segearth_r2.knowledge.structured_kb import StructuredRSKB, SSKBConfig
+from segearth_r2.knowledge.semantic_kb import SemanticRSKB, SemanticKBConfig
 
 warnings.filterwarnings('ignore')
 local_rank = None
@@ -227,7 +229,38 @@ class RRSISDDataset(RS_Base_Dataset):
         self.use_static_kb = getattr(data_args, "use_static_kb", False)
         self.static_kb_max_chars = getattr(data_args, "static_kb_max_chars", 220)
         self.static_kb = StaticRSKB() if self.use_static_kb else None
-
+        self.use_ss_kb = getattr(data_args, "use_ss_kb", False)
+        self.ss_kb = None
+        if self.use_ss_kb:
+            inject_mode = getattr(data_args, "ss_kb_inject_mode", "auto")
+            max_prefix_chars = getattr(data_args, "ss_kb_max_prefix_chars", 64)
+            min_query_tokens = getattr(data_args, "ss_kb_min_query_tokens", 3)
+            self.ss_kb = StructuredRSKB(
+                SSKBConfig(
+                    min_query_tokens=min_query_tokens,
+                    max_prefix_chars=max_prefix_chars,
+                    inject_mode=inject_mode,
+                )
+            )
+        self.use_semantic_kb = getattr(data_args, "use_semantic_kb", False)
+        self.clip_prior_text_source = getattr(data_args, "clip_prior_text_source", "semantic_cat")
+        self.semantic_kb = None
+        if self.use_semantic_kb:
+            if self.use_ss_kb or self.use_static_kb:
+                raise ValueError(
+                    "For clean ablation, please enable only one KB path. "
+                    "Set use_ss_kb=False and use_static_kb=False when use_semantic_kb=True."
+                )
+            self.semantic_kb = SemanticRSKB(
+                SemanticKBConfig(
+                    inject_mode=getattr(data_args, "semantic_kb_inject_mode", "hard"),
+                    hard_query_max_tokens=getattr(data_args, "semantic_kb_hard_query_max_tokens", 7),
+                    max_prefix_chars=getattr(data_args, "semantic_kb_max_prefix_chars", 72),
+                    include_fields=getattr(data_args, "semantic_kb_include_fields", "cat,rel,ctx,shape,scale"),
+                    category_priors_path=getattr(data_args, "semantic_kb_category_priors_path", None),
+                    relation_priors_path=getattr(data_args, "semantic_kb_relation_priors_path", None),
+                )
+            )
         # 官方目录结构
         self.image_dir = os.path.join(base_data_path, "images", "rrsisd", "JPEGImages")
         self.refs_path = os.path.join(base_data_path, "rrsisd", "refs(unc).p")
@@ -315,13 +348,29 @@ class RRSISDDataset(RS_Base_Dataset):
 
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
 
-        if self.use_static_kb and self.static_kb is not None:
+        if self.use_semantic_kb and self.semantic_kb is not None:
+            aug_instruction = self.semantic_kb.augment(instruction)
+        elif self.use_ss_kb and self.ss_kb is not None:
+            aug_instruction = self.ss_kb.augment(instruction)
+        elif self.use_static_kb and self.static_kb is not None:
             aug_instruction = self.static_kb.augment(
                 instruction,
                 max_chars=self.static_kb_max_chars,
             )
         else:
             aug_instruction = instruction
+
+        prior_text = instruction
+        if (
+            self.clip_prior_text_source == "semantic_cat"
+            and self.use_semantic_kb
+            and self.semantic_kb is not None
+        ):
+            parsed = self.semantic_kb.parse(instruction)
+            semantic_cat = parsed.get("cat", "")
+            if semantic_cat:
+                prior_text = semantic_cat
+
         token_refer_id = self.preprocess_referring_instruction(aug_instruction)
 
         sources = [[
@@ -343,6 +392,8 @@ class RRSISDDataset(RS_Base_Dataset):
         data_dict['dataset_type'] = 'rs_reason_seg'
 
         data_dict['token_refer_id'] = token_refer_id
+        data_dict['raw_instruction'] = instruction
+        data_dict['clip_prior_text'] = prior_text
         data_dict['refer_embedding_indices'] = refer_embedding_indices
         data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
         data_dict['mask_num'] = mask_num
@@ -579,6 +630,12 @@ class DataCollatorForCOCODatasetV2(object):
         
         if 'mask_num' in instances[0]:
             batch['mask_num'] = [instance['mask_num'] for instance in instances]
+
+        if 'clip_prior_text' in instances[0]:
+            batch['clip_prior_text'] = [instance['clip_prior_text'] for instance in instances]
+
+        if 'raw_instruction' in instances[0]:
+            batch['raw_instruction'] = [instance['raw_instruction'] for instance in instances]
         
         return batch
 

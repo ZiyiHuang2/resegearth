@@ -1,28 +1,23 @@
 import os
 import sys
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
-sys.path.insert(0, project_root)
+from dataclasses import dataclass, field
+from typing import Optional
 
+import numpy as np
 import torch
 import torch.distributed as distributed
-import numpy as np
-import zipfile
+import transformers
 from tifffile import imwrite as imsave
 from tqdm import tqdm
 from transformers import SiglipImageProcessor
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(current_dir))
+sys.path.insert(0, project_root)
+
+from segearth_r2.datasets.dataset import DataCollatorForCOCODatasetV2, LaSeRSDataset, RRSISDDataset
 from segearth_r2.utils import conversation as conversation_lib
 from segearth_r2.utils.builder import load_pretrained_model
-from segearth_r2.datasets.dataset import (
-    DataCollatorForCOCODatasetV2,
-    LaSeRSDataset,
-    RRSISDDataset,
-)
-
-from dataclasses import dataclass, field
-import transformers
-from typing import Optional
 
 
 @dataclass
@@ -47,10 +42,22 @@ class DataArguments:
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
 
-    # 新增：数据集类型与 split
-    dataset_name: str = "lasers"   # "lasers" or "rrsisd"
-    split: str = "val"             # for rrsisd: train / val / test
-    zip_results: bool = True       # 是否自动打包输出目录
+    dataset_name: str = "lasers"
+    split: str = "val"
+    zip_results: bool = True
+
+    use_semantic_kb: bool = False
+    semantic_kb_inject_mode: str = "hard"
+    semantic_kb_hard_query_max_tokens: int = 7
+    semantic_kb_max_prefix_chars: int = 72
+    semantic_kb_include_fields: str = "cat,rel,ctx,shape,scale"
+    semantic_kb_category_priors_path: Optional[str] = None
+    semantic_kb_relation_priors_path: Optional[str] = None
+
+    use_clip_prior: bool = False
+    clip_prior_alpha: float = 0.2
+    clip_prior_text_source: str = "semantic_cat"
+    clip_prior_map_size: int = 27
 
 
 def init_distributed_mode(args):
@@ -72,6 +79,8 @@ def init_distributed_mode(args):
 
 
 def zip_folder(folder_path):
+    import zipfile
+
     folder_path = os.path.abspath(folder_path)
     zip_path = f"{folder_path}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -106,7 +115,7 @@ def build_eval_datasets(data_args, tokenizer):
 
         return eval_sets
 
-    elif dataset_name == "rrsisd":
+    if dataset_name == "rrsisd":
         split = data_args.split.lower()
         if split not in ["train", "val", "test"]:
             raise ValueError(f"Unsupported RRSISD split: {split}. Must be train / val / test")
@@ -121,12 +130,10 @@ def build_eval_datasets(data_args, tokenizer):
             split=split,
         )
 
-        # 为输出命名保留统一形式
         split_name = f"{split}.json"
         return [(split_name, eval_dataset)]
 
-    else:
-        raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
+    raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
 
 def evaluation():
@@ -136,7 +143,10 @@ def evaluation():
     init_distributed_mode(data_args)
 
     if data_args.local_rank == 0:
-        print(f"[Eval] dataset_name={data_args.dataset_name}, split={data_args.split}, base_data_path={data_args.base_data_path}")
+        print(
+            f"[Eval] dataset_name={data_args.dataset_name}, split={data_args.split}, "
+            f"base_data_path={data_args.base_data_path}"
+        )
 
     model_path = os.path.expanduser(data_args.model_path)
 
@@ -154,6 +164,23 @@ def evaluation():
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
 
     clip_image_processor = SiglipImageProcessor.from_pretrained(data_args.vision_tower)
+
+    use_clip_prior = data_args.use_clip_prior or getattr(model.config, "use_clip_prior", False)
+    if use_clip_prior:
+        clip_prior_alpha = getattr(model.config, "clip_prior_alpha", data_args.clip_prior_alpha)
+        clip_prior_map_size = getattr(model.config, "clip_prior_map_size", data_args.clip_prior_map_size)
+        model.config.use_clip_prior = True
+        model.config.clip_prior_alpha = clip_prior_alpha
+        model.config.clip_prior_text_source = data_args.clip_prior_text_source
+        model.config.clip_prior_map_size = clip_prior_map_size
+        model.initialize_clip_prior(
+            clip_model=model.get_model().get_vision_tower(),
+            tokenizer=tokenizer,
+            clip_model_name_or_path=data_args.vision_tower,
+            map_size=clip_prior_map_size,
+            alpha=clip_prior_alpha,
+        )
+
     data_collator = DataCollatorForCOCODatasetV2(
         tokenizer=tokenizer,
         clip_image_processor=clip_image_processor,
@@ -219,6 +246,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 images_clip=inputs["images_clip"].float(),
                 seg_info=inputs["seg_info"],
                 token_refer_id=inputs["token_refer_id"],
+                clip_prior_text=inputs.get("clip_prior_text"),
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
