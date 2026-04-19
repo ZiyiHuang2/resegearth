@@ -16,7 +16,7 @@ GPU_ID="2"
 ########################################
 # Project dir
 ########################################
-REPO_DIR="/home/wangchengjun/huangziyi/reseg/SegearthR2"
+REPO_DIR="/home/wangchengjun/huangziyi/reseg/resegearth+itaa"
 cd "${REPO_DIR}"
 
 ########################################

@@ -52,12 +52,8 @@ class DataArguments:
     switch_bs: int = 4
     fix_dataset_len: int = 0
     segmentation: bool = True
-<<<<<<< HEAD
     dataset_name: str = field(default="rrsisd")
 
-=======
-    dataset_name: str = "rrsisd"
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     
@@ -77,16 +73,17 @@ class TrainingArguments(transformers.TrainingArguments):
     freeze_mm_mlp_adapter: bool = field(default=True)
     mpt_attn_impl: Optional[str] = field(default="triton")
     freeze_pixel_decoder: bool = field(default=False)
-    loss_llm_weight: float = 1.0
-    loss_mask_weight: float = 1.0
-    loss_attention_weight: float = 0.0
-    loss_itaa_weight: float = 0.03
 
-    enable_attention_loss: bool = False
-    enable_itaa_loss: bool = True
+    loss_llm_weight: float = field(default=1.0)
+    loss_mask_weight: float = field(default=1.0)
+    loss_attention_weight: float = field(default=0.0)
+    loss_itaa_weight: float = field(default=0.03)
 
-    seg_hidden_layer: int = -1
-    seg_layer_fusion: str = "single"
+    enable_attention_loss: bool = field(default=False)
+    enable_itaa_loss: bool = field(default=True)
+
+    seg_hidden_layer: int = field(default=-1)
+    seg_layer_fusion: str = field(default="single")
     model_max_length: int = field(
         default=2048,
         metadata={
@@ -221,7 +218,6 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
 
     if data_ratio[0] != 0:
         if dataset_name == "rrsisd":
-<<<<<<< HEAD
             train_dataset = RRSISDDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
@@ -256,46 +252,14 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
 
     print(f'the dataset ratio is: {data_ratio}')
     print(f'the dataset name is: {data_args.dataset_name}')
-=======
-            train_dataset_single = RRSISDDataset(
-                base_data_path=data_args.base_data_path,
-                tokenizer=tokenizer,
-                data_args=data_args,
-                split='train'
-            )
-        elif dataset_name == "lasers":
-            train_dataset_single = LaSeRSDataset(
-                base_data_path=data_args.base_data_path,
-                tokenizer=tokenizer,
-                data_args=data_args,
-                split='train_data.json'
-            )
-        else:
-            raise ValueError(
-                f"Unsupported dataset_name={data_args.dataset_name}. "
-                f"Expected one of: rrsisd, lasers"
-            )
-
-        datasets += [train_dataset_single] * data_ratio[0]
-
-    print(f'the dataset ratio is: {data_ratio}')
-    print(f'the dataset name is: {dataset_name}')
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     train_dataset = UnifyDatasetSingleDatasetForBatch(
         datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len
     )
     print(f'total unify datasest number is {len(train_dataset)}')
     data_collator = DataCollatorForCOCODatasetV2(
-<<<<<<< HEAD
         tokenizer=tokenizer, clip_image_processor=clip_image_processor
     )
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
-=======
-        tokenizer=tokenizer,
-        clip_image_processor=clip_image_processor
-    )
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
 
 def train():
     global local_rank
@@ -326,10 +290,6 @@ def train():
         model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.config.use_cache = False
-<<<<<<< HEAD
-
-=======
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     model.config.loss_llm_weight = training_args.loss_llm_weight
     model.config.loss_mask_weight = training_args.loss_mask_weight
     model.config.loss_attention_weight = training_args.loss_attention_weight
@@ -338,10 +298,6 @@ def train():
     model.config.enable_itaa_loss = training_args.enable_itaa_loss
     model.config.seg_hidden_layer = training_args.seg_hidden_layer
     model.config.seg_layer_fusion = training_args.seg_layer_fusion
-<<<<<<< HEAD
-
-=======
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
 
@@ -405,11 +361,7 @@ def train():
         model.resize_token_embeddings(len(tokenizer))
     # Delta trainables whitelist: modules in this list are explicitly unfrozen after LoRA wrapping.
     train_module_list = [
-<<<<<<< HEAD
-        "lm_head", "predictor", "SEG_token_projector","itaa"
-=======
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
+                "lm_head", "predictor", "SEG_token_projector","itaa"
     ]
     if not training_args.freeze_pixel_decoder:
         train_module_list.append("pixel_decoder")

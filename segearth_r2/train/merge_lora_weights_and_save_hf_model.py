@@ -47,6 +47,16 @@ def parse_args(args):
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
+    def str2bool(v):
+        if isinstance(v, bool):
+            return v
+        if v.lower() in ("yes", "true", "t", "1"):
+            return True
+        if v.lower() in ("no", "false", "f", "0"):
+            return False
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+    parser.add_argument("--freeze_pixel_decoder", default=False, type=str2bool)
     
     return parser.parse_args(args)
 
@@ -108,11 +118,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     # Keep merge-time trainable list aligned with training-time whitelist.
     train_module_list = [
-<<<<<<< HEAD
         "lm_head","predictor", "SEG_token_projector","itaa"
-=======
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "itaa",
->>>>>>> afa692edf9184821a18a71587130b4a93163d82e
     ]
     if not model_args.freeze_pixel_decoder:
         train_module_list.append("pixel_decoder")
