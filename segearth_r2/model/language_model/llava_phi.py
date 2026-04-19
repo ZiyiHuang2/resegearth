@@ -112,6 +112,28 @@ def compute_subquery_quality(sub_pred_masks, gt_masks):
     quality = 0.5 * (iou + dice)
     return quality
 
+
+def build_query_group_metadata(mask_num, num_local_queries):
+    sample_indices = []
+    seg_indices_within_sample = []
+    query_indices = []
+    gt_indices = []
+    q_idx = 0
+    for sample_idx, n_seg in enumerate(mask_num):
+        for seg_idx in range(int(n_seg)):
+            sample_indices.append(int(sample_idx))
+            seg_indices_within_sample.append(int(seg_idx))
+            query_indices.append(int(q_idx))
+            gt_indices.append(int(q_idx))
+            q_idx += 1
+    return {
+        "query_index": query_indices,
+        "sample_index": sample_indices,
+        "seg_index_within_sample": seg_indices_within_sample,
+        "gt_index": gt_indices,
+        "num_local_queries": int(num_local_queries),
+    }
+
 class SegEarthR2Model(MiphaPhiModel):
 
     def __init__(self, config: PhiConfig, mask_decoder_cfg=None):
@@ -877,6 +899,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         mask_outputs["query_weights"] = query_weights
         mask_outputs["query_aux"] = query_aux
         mask_outputs["subquery_outputs"] = sub_outputs
+        mask_outputs["query_group_metadata"] = build_query_group_metadata(mask_num_list, local_k)
 
         # 开始计算loss
         loss = None
@@ -950,11 +973,51 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             sub_pred_masks = mask_outputs.get("subquery_outputs", {}).get("pred_masks")
             if sub_pred_masks is not None and 'mask' in seg_info[0]:
+                # Alignment assumption for score supervision:
+                # current implementation aligns query groups and GT masks by order:
+                #   query_group_i <-> seg_info[i]["mask"]
+                # This relies on seg_info order being consistent with mask_num expansion order.
+                # We add explicit shape/length checks and cache query-group metadata for debugging.
+                n_q = int(query_scores.shape[0])
+                sub_n_q = int(sub_pred_masks.shape[0])
+                seg_len = int(len(seg_info))
+                mask_num_safe = [int(x) for x in mask_num_list] if mask_num_list is not None else []
+                mask_num_sum = int(sum(mask_num_safe))
+                if sub_n_q != n_q:
+                    raise ValueError(
+                        f"Query/GT alignment mismatch: sub_pred_masks.shape[0] != Nq. "
+                        f"Nq={n_q}, len(seg_info)={seg_len}, mask_num={mask_num_safe}, "
+                        f"sum(mask_num)={mask_num_sum}, sub_pred_masks.shape={tuple(sub_pred_masks.shape)}, "
+                        f"gt_masks.shape=None"
+                    )
+                if seg_len != n_q:
+                    raise ValueError(
+                        f"Query/GT alignment mismatch: len(seg_info) != Nq. "
+                        f"Nq={n_q}, len(seg_info)={seg_len}, mask_num={mask_num_safe}, "
+                        f"sum(mask_num)={mask_num_sum}, sub_pred_masks.shape={tuple(sub_pred_masks.shape)}, "
+                        f"gt_masks.shape=None"
+                    )
+                if mask_num_sum != n_q:
+                    raise ValueError(
+                        f"Query/GT alignment mismatch: sum(mask_num) != Nq. "
+                        f"Nq={n_q}, len(seg_info)={seg_len}, mask_num={mask_num_safe}, "
+                        f"sum(mask_num)={mask_num_sum}, sub_pred_masks.shape={tuple(sub_pred_masks.shape)}, "
+                        f"gt_masks.shape=None"
+                    )
+
                 gt_masks = []
                 for gt_item in seg_info:
                     gt_mask = gt_item["mask"]
                     gt_masks.append(gt_mask.to(sub_pred_masks.device).float())
                 gt_masks = torch.stack(gt_masks, dim=0)  # [Nq, 1, H, W]
+
+                if gt_masks.shape[0] != n_q:
+                    raise ValueError(
+                        f"Query/GT alignment mismatch: gt_masks.shape[0] != Nq. "
+                        f"Nq={n_q}, len(seg_info)={seg_len}, mask_num={mask_num_safe}, "
+                        f"sum(mask_num)={mask_num_sum}, sub_pred_masks.shape={tuple(sub_pred_masks.shape)}, "
+                        f"gt_masks.shape={tuple(gt_masks.shape)}"
+                    )
 
                 quality = compute_subquery_quality(sub_pred_masks, gt_masks).detach()  # [Nq, K]
                 if self.use_query_score_supervision:
