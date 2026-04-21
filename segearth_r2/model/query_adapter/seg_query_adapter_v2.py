@@ -26,8 +26,15 @@ class SegQueryAdapterV2(nn.Module):
         )
 
         ctx_dim = hidden_dim if text_dim is None else text_dim
+        self.hidden_dim = hidden_dim
+        self.text_dim = text_dim if text_dim is not None else hidden_dim
+
+        if self.text_dim != hidden_dim:
+            self.text_proj = nn.Linear(self.text_dim, hidden_dim)
+        else:
+            self.text_proj = None
         self.text_to_scale_shift = nn.Sequential(
-            nn.Linear(ctx_dim, hidden_dim * 2),
+            nn.Linear(hidden_dim, hidden_dim * 2),
             nn.GELU(),
             nn.Linear(hidden_dim * 2, hidden_dim * 2),
         )
@@ -63,9 +70,25 @@ class SegQueryAdapterV2(nn.Module):
         if text_context is not None:
             text_ctx = text_context
             if self.text_proj is not None:
+                proj0 = self.text_proj
+    
+                text_ctx = text_ctx.to(device=proj0.weight.device, dtype=proj0.weight.dtype)
                 text_ctx = self.text_proj(text_ctx)
+            if text_ctx.shape[-1] != self.hidden_dim:
+                    raise ValueError(
+                        f"text_ctx dim mismatch after text_proj: got {text_ctx.shape[-1]}, "
+                        f"expected {self.hidden_dim}"
+                    )
+
+            ss0 = self.text_to_scale_shift[0]
+            text_ctx = text_ctx.to(device=ss0.weight.device, dtype=ss0.weight.dtype)
+
             scale_shift = self.text_to_scale_shift(text_ctx)  # [Nq, 2C]
             scale, shift = scale_shift.chunk(2, dim=-1)
+
+            scale = scale.to(dtype=sub_queries.dtype, device=sub_queries.device)
+            shift = shift.to(dtype=sub_queries.dtype, device=sub_queries.device)
+
             sub_queries = sub_queries + scale.unsqueeze(1) * self.norm(sub_queries) + shift.unsqueeze(1)
 
         if visual_context is not None:

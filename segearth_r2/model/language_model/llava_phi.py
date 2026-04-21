@@ -93,24 +93,64 @@ def query_margin_loss(quality, margin=0.05):
     return F.relu(margin - (top1 - top2)).mean()
 
 
-def compute_subquery_quality(sub_pred_masks, gt_masks):
-    # sub_pred_masks: [Nq, K, H, W], gt_masks: [Nq, 1, Hgt, Wgt]
+def compute_subquery_quality(sub_pred_masks, gt_masks, eps=1e-6):
+    """
+    sub_pred_masks:
+        [Nq, K, H, W] or [Nq, K, 1, H, W]
+    gt_masks:
+        [Nq, 1, H_gt, W_gt] or [Nq, H_gt, W_gt]
+    returns:
+        quality: [Nq, K]
+    """
+
+    # ---- normalize pred shape ----
+    if sub_pred_masks.dim() == 5:
+        if sub_pred_masks.shape[2] != 1:
+            raise ValueError(
+                f"Unexpected sub_pred_masks shape: {tuple(sub_pred_masks.shape)}. "
+                "Expected channel dim == 1 when 5D."
+            )
+        sub_pred_masks = sub_pred_masks.squeeze(2)   # [Nq, K, H, W]
+    elif sub_pred_masks.dim() != 4:
+        raise ValueError(
+            f"Unexpected sub_pred_masks shape: {tuple(sub_pred_masks.shape)}. "
+            "Expected [Nq,K,H,W] or [Nq,K,1,H,W]."
+        )
+
+    # ---- normalize gt shape ----
+    if gt_masks.dim() == 4:
+        if gt_masks.shape[1] != 1:
+            raise ValueError(
+                f"Unexpected gt_masks shape: {tuple(gt_masks.shape)}. "
+                "Expected channel dim == 1 when 4D."
+            )
+    elif gt_masks.dim() == 3:
+        gt_masks = gt_masks.unsqueeze(1)  # [Nq,1,H_gt,W_gt]
+    else:
+        raise ValueError(
+            f"Unexpected gt_masks shape: {tuple(gt_masks.shape)}. "
+            "Expected [Nq,1,H,W] or [Nq,H,W]."
+        )
+
     n_q, k, h, w = sub_pred_masks.shape
-    gt = gt_masks
-    if gt.shape[-2:] != (h, w):
-        gt = F.interpolate(gt.float(), size=(h, w), mode="nearest")
-    gt = gt.clamp(min=0.0, max=1.0)
 
-    pred_prob = sub_pred_masks.sigmoid()
-    pred_prob = pred_prob.unsqueeze(2)  # [Nq, K, 1, H, W]
-    gt = gt.unsqueeze(1)  # [Nq, 1, 1, H, W]
+    # ---- resize GT to pred resolution ----
+    if gt_masks.shape[-2:] != (h, w):
+        gt_masks = F.interpolate(
+            gt_masks.float(),
+            size=(h, w),
+            mode="nearest",
+        )
 
-    inter = (pred_prob * gt).sum(dim=(-1, -2, -3))
-    union = (pred_prob + gt - pred_prob * gt).sum(dim=(-1, -2, -3))
-    iou = inter / (union + 1e-6)
-    dice = 2.0 * inter / (pred_prob.sum(dim=(-1, -2, -3)) + gt.sum(dim=(-1, -2, -3)) + 1e-6)
-    quality = 0.5 * (iou + dice)
-    return quality
+    pred = torch.sigmoid(sub_pred_masks)     # [Nq,K,H,W]
+    gt = gt_masks.float().squeeze(1)         # [Nq,H,W]
+    gt = gt.unsqueeze(1)                     # [Nq,1,H,W]
+
+    inter = (pred * gt).sum(dim=(-1, -2))    # [Nq,K]
+    union = pred.sum(dim=(-1, -2)) + gt.sum(dim=(-1, -2))  # [Nq,K]
+    dice = (2 * inter + eps) / (union + eps)
+
+    return dice
 
 
 def build_query_group_metadata(mask_num, num_local_queries):
@@ -274,7 +314,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.seg_query_adapter = SegQueryAdapterV2(
             hidden_dim=hidden_dim,
             num_local_queries=self.num_local_queries,
-            text_dim=hidden_dim,
+            text_dim=self.config.hidden_size,
             use_text_cross_attn_refine=self.use_text_cross_attn_refine,
         )
             
@@ -949,20 +989,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_seg_class = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
         
             for k in list(mask_losses.keys()):
-                if k in weight_dict:
-                    if mask_losses[k] is not None:
-                        mask_losses[k] *= weight_dict[k]
+                if k not in weight_dict:
+                    mask_losses.pop(k)
+                    continue
 
-                    if "SEG_class" in k:
-                        loss_seg_class += mask_losses[k]
-                    
-                    elif '_mask' in k:
-                        loss_mask += mask_losses[k]
-                    
-                    elif '_dice' in k:
-                        loss_dice += mask_losses[k]
+                if mask_losses[k] is None:
+                    continue
+
+                mask_losses[k] = mask_losses[k] * weight_dict[k]
+
+                if "SEG_class" in k:
+                    loss_seg_class += mask_losses[k]
+                elif "_mask" in k:
+                    loss_mask += mask_losses[k]
+                elif "_dice" in k:
+                    loss_dice += mask_losses[k]
                 else:
                     mask_losses.pop(k)
+
             loss_query_div = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
             loss_query_score = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
             loss_query_margin = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
@@ -1093,7 +1137,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             token_refer_id=None,
             SEG_token_embedding_indices=None,
             mask_num = None):
-        
+
         output_attentions = False
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1103,7 +1147,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
             token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
-    
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1115,7 +1159,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict=return_dict
         )
 
-        hidden_states = outputs.last_hidden_state   
+        hidden_states = outputs.last_hidden_state
 
         SEG_embedding = self.SEG_token_projector(
             self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices, mask_num=mask_num)
@@ -1129,7 +1173,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
-    
+
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
         mask_num = torch.tensor(mask_num, device=mask_features.device)
@@ -1156,7 +1200,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
         mask_outputs["query_aux"] = query_aux
         mask_outputs["subquery_outputs"] = sub_outputs
 
-        
         mask_pred_results = mask_outputs["pred_masks"]
         images = ImageList.from_tensors(images, self.size_divisibility)
         mask_pred_results = F.interpolate(
@@ -1165,11 +1208,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mode="bilinear",
             align_corners=False,
         )
-        
+
         processed_results = []
         for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
             instance_r = {
-                'pred': ((mask_pred_result.cpu().numpy() > 0) * 255).astype(np.uint8),
+                'pred': ((mask_pred_result.detach().float().cpu().numpy() > 0) * 255).astype(np.uint8),
                 'image_name': _seg_info['image_id'],
                 'id': _seg_info['data_id'],
                 'mask_id': _seg_info['mask_id'],
