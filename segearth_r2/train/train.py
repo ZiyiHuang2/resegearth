@@ -40,14 +40,14 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
-    num_local_queries: int = field(default=4)
+    num_local_queries: int = field(default=16)   # 或 32
     use_text_cross_attn_refine: bool = field(default=False)
-    use_query_score_supervision: bool = field(default=True)
-    use_query_margin_loss: bool = field(default=True)
-    query_score_loss_weight: float = field(default=0.25)
-    query_div_loss_weight: float = field(default=0.05)
-    query_margin_loss_weight: float = field(default=0.1)
-    inference_query_select_mode: str = field(default="soft")
+    use_query_score_supervision: bool = field(default=False)
+    use_query_margin_loss: bool = field(default=False)
+    query_score_loss_weight: float = field(default=0.25)   # 先保留，虽然A1里不会用到
+    query_div_loss_weight: float = field(default=0.0)
+    query_margin_loss_weight: float = field(default=0.0)
+    inference_query_select_mode: str = field(default="top1")
 
 @dataclass
 class DataArguments:

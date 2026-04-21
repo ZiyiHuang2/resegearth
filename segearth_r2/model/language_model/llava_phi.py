@@ -365,9 +365,27 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return pooled
         mask_num_tensor = torch.tensor(mask_num, device=hidden_states.device, dtype=torch.long)
         return torch.repeat_interleave(pooled, repeats=mask_num_tensor, dim=0)
+    def build_text_tokens_and_mask(self, hidden_states, attention_mask, mask_num):
+        # hidden_states: [bs, T, D]
+        # attention_mask: [bs, T], 1 for valid, 0 for pad
+        if mask_num is None:
+            text_tokens = hidden_states
+            key_padding_mask = None if attention_mask is None else ~attention_mask.bool()
+            return text_tokens, key_padding_mask
 
+        mask_num_tensor = torch.tensor(mask_num, device=hidden_states.device, dtype=torch.long)
+
+        text_tokens = torch.repeat_interleave(hidden_states, repeats=mask_num_tensor, dim=0)
+
+        if attention_mask is not None:
+            attn = torch.repeat_interleave(attention_mask, repeats=mask_num_tensor, dim=0)
+            key_padding_mask = ~attn.bool()
+        else:
+            key_padding_mask = None
+
+        return text_tokens, key_padding_mask
     def aggregate_subquery_outputs(self, mask_outputs, query_scores, num_seed_queries, num_local_queries, mode="soft"):
-        score_logits = query_scores.squeeze(-1)  # [Nq, K]
+        score_logits = query_scores  # already [Nq, K]  # [Nq, K]
         if mode == "top1":
             top_idx = torch.argmax(score_logits, dim=1, keepdim=True)
             weights = torch.zeros_like(score_logits).scatter_(1, top_idx, 1.0)
@@ -866,7 +884,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             global_step=None,
             mask_num=None,
             dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
-        
+
+        bs = input_ids.shape[0]
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -906,10 +925,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
         SEG_embedding = self.SEG_token_projector(
             self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices, mask_num=mask_num_list)
         )
-        text_context = self.build_text_context(hidden_states, attention_mask, mask_num_list)
+        text_tokens, text_key_padding_mask = self.build_text_tokens_and_mask(
+            hidden_states, attention_mask, mask_num_list
+        )
+
         sub_queries, query_scores, query_aux = self.seg_query_adapter(
             SEG_embedding,
-            text_context=text_context,
+            text_context=None,
+            text_tokens=text_tokens,
+            text_key_padding_mask=text_key_padding_mask,
             visual_context=None,
         )
         
@@ -931,7 +955,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         ]
 
         mask_outputs_sub = self.predictor(multi_scale_features_k, mask_features_k, None, None, flat_queries)
-        select_mode = "soft" if self.training else self.inference_query_select_mode
+        select_mode = "top1"
         mask_outputs, sub_outputs, query_weights = self.aggregate_subquery_outputs(
             mask_outputs_sub, query_scores, n_q, local_k, mode=select_mode
         )
@@ -1012,7 +1036,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_query_margin = torch.tensor(0.0, device=mask_outputs["pred_masks"].device)
 
             query_feat = mask_outputs.get("query_aux", {}).get("query_feat")
-            if query_feat is not None:
+            if self.query_div_loss_weight > 0 and query_feat is not None:
                 loss_query_div = query_diversity_loss(query_feat)
 
             sub_pred_masks = mask_outputs.get("subquery_outputs", {}).get("pred_masks")
@@ -1066,7 +1090,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 quality = compute_subquery_quality(sub_pred_masks, gt_masks).detach()  # [Nq, K]
                 if self.use_query_score_supervision:
                     quality_target = quality / quality.sum(dim=1, keepdim=True).clamp(min=1e-6)
-                    log_prob = F.log_softmax(query_scores.squeeze(-1), dim=1)
+                    log_prob = F.log_softmax(query_scores, dim=1)
                     loss_query_score = -(quality_target * log_prob).sum(dim=1).mean()
                     if global_step is not None:
                         warmup = min(1.0, float(global_step) / float(max(1, self.query_score_warmup_steps)))
@@ -1137,7 +1161,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             token_refer_id=None,
             SEG_token_embedding_indices=None,
             mask_num = None):
-
+        mask_num_list = [int(x) for x in mask_num] if mask_num is not None else None
         output_attentions = False
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1165,9 +1189,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices, mask_num=mask_num)
         )
         text_context = self.build_text_context(hidden_states, attention_mask, mask_num)
+        text_tokens, text_key_padding_mask = self.build_text_tokens_and_mask(
+            hidden_states, attention_mask, mask_num
+        )
+
         sub_queries, query_scores, query_aux = self.seg_query_adapter(
             SEG_embedding,
-            text_context=text_context,
+            text_context=None,
+            text_tokens=text_tokens,
+            text_key_padding_mask=text_key_padding_mask,
             visual_context=None,
         )
 
@@ -1193,7 +1223,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         mask_outputs_sub = self.predictor(multi_scale_features_k, mask_features_k, None, None, flat_queries)
         mask_outputs, sub_outputs, query_weights = self.aggregate_subquery_outputs(
-            mask_outputs_sub, query_scores, n_q, local_k, mode=self.inference_query_select_mode
+            mask_outputs_sub, query_scores, n_q, local_k, mode="top1"
         )
         mask_outputs["query_scores"] = query_scores
         mask_outputs["query_weights"] = query_weights

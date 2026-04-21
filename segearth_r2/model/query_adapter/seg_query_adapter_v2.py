@@ -1,22 +1,38 @@
+import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class SegQueryAdapterV2(nn.Module):
     def __init__(
         self,
         hidden_dim,
-        num_local_queries=4,
+        num_local_queries=16,
         text_dim=None,
         use_text_cross_attn_refine=False,
+        use_ffn=False,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_local_queries = int(num_local_queries)
-        self.use_text_cross_attn_refine = use_text_cross_attn_refine
+        self.use_text_cross_attn_refine = bool(use_text_cross_attn_refine)
+        self.use_ffn = bool(use_ffn)
 
-        self.local_offsets = nn.Parameter(torch.zeros(self.num_local_queries, hidden_dim))
-        nn.init.normal_(self.local_offsets, std=0.02)
+        self.text_dim = text_dim if text_dim is not None else hidden_dim
+
+        self.query_bank = nn.Parameter(
+            torch.randn(self.num_local_queries, hidden_dim) * 0.02
+        )
+
+        if self.text_dim != hidden_dim:
+            self.text_proj = nn.Linear(self.text_dim, hidden_dim)
+        else:
+            self.text_proj = nn.Identity()
+
+        self.lang_k = nn.Linear(hidden_dim, hidden_dim)
+        self.lang_v = nn.Linear(hidden_dim, hidden_dim)
+        self.seed_proj = nn.Linear(hidden_dim, hidden_dim)
 
         self.norm = nn.LayerNorm(hidden_dim)
         self.ffn = nn.Sequential(
@@ -25,27 +41,12 @@ class SegQueryAdapterV2(nn.Module):
             nn.Linear(hidden_dim * 4, hidden_dim),
         )
 
-        ctx_dim = hidden_dim if text_dim is None else text_dim
-        self.hidden_dim = hidden_dim
-        self.text_dim = text_dim if text_dim is not None else hidden_dim
-
-        if self.text_dim != hidden_dim:
-            self.text_proj = nn.Linear(self.text_dim, hidden_dim)
-        else:
-            self.text_proj = None
-        self.text_to_scale_shift = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim * 2),
-            nn.GELU(),
-            nn.Linear(hidden_dim * 2, hidden_dim * 2),
-        )
-        self.text_proj = None
-        if ctx_dim != hidden_dim:
-            self.text_proj = nn.Linear(ctx_dim, hidden_dim)
-
         self.cross_attn = None
         if self.use_text_cross_attn_refine:
             self.cross_attn = nn.MultiheadAttention(
-                embed_dim=hidden_dim, num_heads=4, batch_first=True
+                embed_dim=hidden_dim,
+                num_heads=4,
+                batch_first=True,
             )
 
         self.score_head = nn.Sequential(
@@ -57,59 +58,77 @@ class SegQueryAdapterV2(nn.Module):
 
     def forward(
         self,
-        seed_queries,
-        text_context=None,
-        text_tokens=None,
-        text_key_padding_mask=None,
-        visual_context=None,
+        seed_queries,               # [Nq, 1, C]
+        text_context=None,          # [Nq, C] optional
+        text_tokens=None,           # [Nq, T, Ct]
+        text_key_padding_mask=None, # [Nq, T], True means padding
+        visual_context=None,        # [Nq, C] optional
     ):
-        # seed_queries: [Nq, 1, C]
+        assert seed_queries.dim() == 3, f"expected seed_queries [Nq,1,C], got {seed_queries.shape}"
+        assert seed_queries.shape[1] == 1, f"expected seed_queries second dim == 1, got {seed_queries.shape}"
+        assert text_tokens is not None and text_tokens.dim() == 3, \
+            f"expected text_tokens [Nq,T,Ct], got {None if text_tokens is None else text_tokens.shape}"
+
         q_seed = seed_queries.squeeze(1)  # [Nq, C]
-        sub_queries = q_seed.unsqueeze(1) + self.local_offsets.unsqueeze(0)  # [Nq, K, C]
+        Nq, C = q_seed.shape
+
+        text_tokens = self.text_proj(text_tokens)   # [Nq, T, C]
+        text_tokens = F.gelu(text_tokens)
+
+        assert text_tokens.shape[0] == Nq, \
+            f"batch mismatch: seed_queries batch={Nq}, text_tokens batch={text_tokens.shape[0]}"
+        assert text_tokens.shape[2] == C, \
+            f"channel mismatch: seed dim={C}, text dim={text_tokens.shape[2]}"
+
+        q_bank = self.query_bank.unsqueeze(0).expand(Nq, -1, -1)  # [Nq, K, C]
+
+        lang_k = self.lang_k(text_tokens)  # [Nq, T, C]
+        lang_v = self.lang_v(text_tokens)  # [Nq, T, C]
+
+        attn_logits = torch.matmul(q_bank, lang_k.transpose(-1, -2)) / math.sqrt(C)  # [Nq, K, T]
+
+        if text_key_padding_mask is not None:
+            assert text_key_padding_mask.shape == (Nq, text_tokens.shape[1]), \
+                f"expected key_padding_mask shape {(Nq, text_tokens.shape[1])}, got {text_key_padding_mask.shape}"
+            attn_logits = attn_logits.masked_fill(
+                text_key_padding_mask.unsqueeze(1),  # [Nq,1,T] -> broadcast to [Nq,K,T]
+                float("-inf")
+            )
+
+        A_bi = torch.softmax(attn_logits, dim=-1)   # [Nq, K, T]
+        q_lang = torch.matmul(A_bi, lang_v)         # [Nq, K, C]
+
+        sub_queries = q_lang + self.seed_proj(q_seed).unsqueeze(1)
 
         if text_context is not None:
-            text_ctx = text_context
-            if self.text_proj is not None:
-                proj0 = self.text_proj
-    
-                text_ctx = text_ctx.to(device=proj0.weight.device, dtype=proj0.weight.dtype)
-                text_ctx = self.text_proj(text_ctx)
-            if text_ctx.shape[-1] != self.hidden_dim:
-                    raise ValueError(
-                        f"text_ctx dim mismatch after text_proj: got {text_ctx.shape[-1]}, "
-                        f"expected {self.hidden_dim}"
-                    )
-
-            ss0 = self.text_to_scale_shift[0]
-            text_ctx = text_ctx.to(device=ss0.weight.device, dtype=ss0.weight.dtype)
-
-            scale_shift = self.text_to_scale_shift(text_ctx)  # [Nq, 2C]
-            scale, shift = scale_shift.chunk(2, dim=-1)
-
-            scale = scale.to(dtype=sub_queries.dtype, device=sub_queries.device)
-            shift = shift.to(dtype=sub_queries.dtype, device=sub_queries.device)
-
-            sub_queries = sub_queries + scale.unsqueeze(1) * self.norm(sub_queries) + shift.unsqueeze(1)
+            assert text_context.shape == (Nq, C), \
+                f"expected text_context {(Nq, C)}, got {text_context.shape}"
+            sub_queries = sub_queries + text_context.unsqueeze(1)
 
         if visual_context is not None:
+            assert visual_context.shape == (Nq, C), \
+                f"expected visual_context {(Nq, C)}, got {visual_context.shape}"
             sub_queries = sub_queries + visual_context.unsqueeze(1)
 
-        if self.cross_attn is not None and text_tokens is not None:
-            q = sub_queries
-            k = text_tokens
-            v = text_tokens
+        if self.cross_attn is not None:
             attn_out, _ = self.cross_attn(
-                q, k, v, key_padding_mask=text_key_padding_mask, need_weights=False
+                sub_queries,
+                text_tokens,
+                text_tokens,
+                key_padding_mask=text_key_padding_mask,
+                need_weights=False,
             )
             sub_queries = sub_queries + attn_out
 
-        sub_queries = sub_queries + self.ffn(self.norm(sub_queries))
-        query_scores = self.score_head(sub_queries)  # [Nq, K, 1]
+        if self.use_ffn:
+            sub_queries = sub_queries + self.ffn(self.norm(sub_queries))
+
+        query_scores = self.score_head(sub_queries).squeeze(-1)  # [Nq, K]
 
         aux = {
             "query_feat": sub_queries,
             "seed_feat": q_seed,
-            "local_offsets": self.local_offsets,
+            "query_bank": self.query_bank,
+            "lqca_attn": A_bi,
         }
         return sub_queries, query_scores, aux
-
