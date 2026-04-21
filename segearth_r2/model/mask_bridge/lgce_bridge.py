@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -6,76 +6,29 @@ import torch.nn.functional as F
 
 
 class LanguageGuidedCrossScaleBridge(nn.Module):
-    """Multi-scale sample-level language guided cross-scale bridge."""
+    """Lightweight sentence-guided dual-scale bridge for res3/res4."""
 
     def __init__(
         self,
         text_dim: int,
-        feat_channels: Dict[str, int],
-        enabled_scales: Tuple[str, ...] = ("res3", "res4", "res5"),
-        cross_scale_init: float = 0.1,
+        res3_channels: int,
+        res4_channels: int,
         residual_init: float = 0.05,
-        enable_long_skip: bool = True,
+        cross_scale_init: float = 0.1,
     ) -> None:
         super().__init__()
 
-        if len(enabled_scales) < 2:
-            raise ValueError(f"enabled_scales must contain at least 2 levels, got {enabled_scales}")
+        self.text_proj_res3 = nn.Linear(text_dim, res3_channels)
+        self.text_proj_res4 = nn.Linear(text_dim, res4_channels)
 
-        self.enabled_scales = tuple(enabled_scales)
-        self.feat_channels = feat_channels
-        self.enable_long_skip = enable_long_skip
+        self.res4_to_res3 = nn.Conv2d(res4_channels, res3_channels, kernel_size=1, bias=False)
+        self.res3_to_res4 = nn.Conv2d(res3_channels, res4_channels, kernel_size=1, bias=False)
 
-        for s in self.enabled_scales:
-            if s not in feat_channels:
-                raise KeyError(f"Scale {s} missing from feat_channels: {feat_channels.keys()}")
+        self.gamma3 = nn.Parameter(torch.tensor(residual_init, dtype=torch.float32))
+        self.gamma4 = nn.Parameter(torch.tensor(residual_init, dtype=torch.float32))
 
-        # per-scale language gates
-        self.text_proj = nn.ModuleDict({
-            s: nn.Linear(text_dim, feat_channels[s]) for s in self.enabled_scales
-        })
-
-        # per-scale residual strength
-        self.gamma = nn.ParameterDict({
-            s: nn.Parameter(torch.tensor(residual_init, dtype=torch.float32))
-            for s in self.enabled_scales
-        })
-
-        # lightweight per-scale fusion after aggregation
-        self.fuse = nn.ModuleDict({
-            s: nn.Conv2d(feat_channels[s], feat_channels[s], kernel_size=1, bias=False)
-            for s in self.enabled_scales
-        })
-
-        # cross-scale projections
-        self.cross_proj = nn.ModuleDict()
-        self.cross_alpha = nn.ParameterDict()
-
-        self._build_cross_scale_links(cross_scale_init)
-
-    def _add_cross_proj(self, src: str, dst: str, init_value: float) -> None:
-        name = f"{src}_to_{dst}"
-        self.cross_proj[name] = nn.Conv2d(
-            self.feat_channels[src],
-            self.feat_channels[dst],
-            kernel_size=1,
-            bias=False,
-        )
-        self.cross_alpha[name] = nn.Parameter(torch.tensor(init_value, dtype=torch.float32))
-
-    def _build_cross_scale_links(self, cross_scale_init: float) -> None:
-        # adjacent bi-directional links
-        for i in range(len(self.enabled_scales) - 1):
-            src = self.enabled_scales[i]
-            dst = self.enabled_scales[i + 1]
-            self._add_cross_proj(src, dst, cross_scale_init)
-            self._add_cross_proj(dst, src, cross_scale_init)
-
-        # optional long skip: highest -> lowest
-        if self.enable_long_skip and len(self.enabled_scales) >= 3:
-            low = self.enabled_scales[0]
-            high = self.enabled_scales[-1]
-            self._add_cross_proj(high, low, cross_scale_init)
+        self.alpha = nn.Parameter(torch.tensor(cross_scale_init, dtype=torch.float32))
+        self.beta = nn.Parameter(torch.tensor(cross_scale_init, dtype=torch.float32))
 
     @staticmethod
     def _resize_like(x: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
@@ -91,40 +44,55 @@ class LanguageGuidedCrossScaleBridge(nn.Module):
         if sample_guidance.dim() != 2:
             raise ValueError(f"sample_guidance must be [B, H], got {tuple(sample_guidance.shape)}")
 
-        for s in self.enabled_scales:
-            if s not in image_features:
-                raise KeyError(f"Required feature {s} not found in image_features: {image_features.keys()}")
+        if "res3" not in image_features or "res4" not in image_features:
+            raise KeyError(f"image_features must contain res3/res4, got {image_features.keys()}")
 
+        res3 = image_features["res3"]
+        res4 = image_features["res4"]
         batch_size = sample_guidance.shape[0]
-        output = dict(image_features)
 
-        gates = {}
-        for s in self.enabled_scales:
-            feat = image_features[s]
-            if feat.shape[0] != batch_size:
-                raise ValueError(
-                    f"Batch size mismatch on {s}: feat={feat.shape[0]}, guidance={batch_size}"
-                )
-            gates[s] = torch.sigmoid(self.text_proj[s](sample_guidance)).view(batch_size, -1, 1, 1)
+        if res3.shape[0] != batch_size or res4.shape[0] != batch_size:
+            raise ValueError(
+                f"Batch mismatch: guidance={batch_size}, res3={res3.shape[0]}, res4={res4.shape[0]}"
+            )
 
-        for dst in self.enabled_scales:
-            feat_dst = image_features[dst]
-            cross_sum = torch.zeros_like(feat_dst)
+        gate3 = torch.sigmoid(self.text_proj_res3(sample_guidance)).view(batch_size, -1, 1, 1)
+        gate4 = torch.sigmoid(self.text_proj_res4(sample_guidance)).view(batch_size, -1, 1, 1)
 
-            for src in self.enabled_scales:
-                if src == dst:
-                    continue
-                proj_key = f"{src}_to_{dst}"
-                if proj_key not in self.cross_proj:
-                    continue
+        res4_to_res3 = self._resize_like(self.res4_to_res3(res4), res3)
+        res3_to_res4 = self._resize_like(self.res3_to_res4(res3), res4)
 
-                feat_src = image_features[src]
-                feat_src = self._resize_like(feat_src, feat_dst)
-                cross_feat = self.cross_proj[proj_key](feat_src)
-                cross_sum = cross_sum + self.cross_alpha[proj_key] * cross_feat
+        out = dict(image_features)
+        out["res3"] = res3 + self.gamma3 * (gate3 * res3 + self.alpha * res4_to_res3)
+        out["res4"] = res4 + self.gamma4 * (gate4 * res4 + self.beta * res3_to_res4)
+        return out
 
-            fused = self.fuse[dst](gates[dst] * feat_dst + cross_sum)
-            delta = self.gamma[dst] * fused
-            output[dst] = feat_dst + delta
+class LightweightDualScaleLGCE(nn.Module):
+    def __init__(self, text_dim, res3_channels, res4_channels):
+        super().__init__()
+        self.text_proj_res3 = nn.Linear(text_dim, res3_channels)
+        self.text_proj_res4 = nn.Linear(text_dim, res4_channels)
 
-        return output
+        self.fuse_res3 = nn.Sequential(
+            nn.Conv2d(res3_channels * 2, res3_channels, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(res3_channels, res3_channels, kernel_size=1, bias=False),
+        )
+        self.fuse_res4 = nn.Sequential(
+            nn.Conv2d(res4_channels * 2, res4_channels, kernel_size=1, bias=False),
+            nn.GELU(),
+            nn.Conv2d(res4_channels, res4_channels, kernel_size=1, bias=False),
+        )
+
+    def forward(self, image_features, sample_guidance):
+        res3 = image_features["res3"]
+        res4 = image_features["res4"]
+        B = sample_guidance.shape[0]
+
+        text3 = self.text_proj_res3(sample_guidance).view(B, -1, 1, 1).expand_as(res3)
+        text4 = self.text_proj_res4(sample_guidance).view(B, -1, 1, 1).expand_as(res4)
+
+        out = dict(image_features)
+        out["res3"] = self.fuse_res3(torch.cat([res3, text3], dim=1))
+        out["res4"] = self.fuse_res4(torch.cat([res4, text4], dim=1))
+        return out

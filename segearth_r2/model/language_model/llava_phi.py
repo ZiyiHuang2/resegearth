@@ -12,7 +12,7 @@ from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from transformers.modeling_outputs import CausalLMOutputWithPast, BaseModelOutputWithPast
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.utils.memory import retry_if_cuda_oom
-
+from ..mask_bridge.lgce_bridge import LanguageGuidedCrossScaleBridge, LightweightDualScaleLGCE
 from ..mipha.model.language_model.mipha_phi import (MiphaPhiForCausalLM, MiphaPhiModel)
 
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
@@ -20,7 +20,6 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
-from ..mask_bridge.lgce_bridge import LanguageGuidedCrossScaleBridge
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
@@ -175,30 +174,30 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.lgce_guidance_dim        # 256
         )
 
-        lgce_scales = getattr(self.config, "lgce_scales", "res3,res4,res5")
-        if isinstance(lgce_scales, str):
-            lgce_scales = tuple([x.strip() for x in lgce_scales.split(",") if x.strip()])
-
-        lgce_residual_init = getattr(self.config, "lgce_residual_init", 0.05)
-        lgce_cross_scale_init = getattr(self.config, "lgce_cross_scale_init", 0.1)
-        lgce_enable_long_skip = getattr(self.config, "lgce_enable_long_skip", True)
+        self.lgce_variant = getattr(self.config, "lgce_variant", "baseline")
 
         if self.use_lgce_bridge:
-            feat_channels = {
-                k: input_shape[k].channel
-                for k in lgce_scales
-            }
+            if self.lgce_variant == "baseline":
+                self.lgce_bridge = LanguageGuidedCrossScaleBridge(
+                    text_dim=self.lgce_guidance_dim,
+                    res3_channels=input_shape["res3"].channel,
+                    res4_channels=input_shape["res4"].channel,
+                )
+                self.lgce_v1_fuser = None
 
-            self.lgce_bridge = LanguageGuidedCrossScaleBridge(
-                text_dim=self.lgce_guidance_dim,
-                feat_channels=feat_channels,
-                enabled_scales=lgce_scales,
-                cross_scale_init=lgce_cross_scale_init,
-                residual_init=lgce_residual_init,
-                enable_long_skip=lgce_enable_long_skip,
-            )
+            elif self.lgce_variant == "v1_dual_concat":
+                self.lgce_bridge = None
+                self.lgce_v1_fuser = LightweightDualScaleLGCE(
+                    text_dim=self.lgce_guidance_dim,
+                    res3_channels=input_shape["res3"].channel,
+                    res4_channels=input_shape["res4"].channel,
+                )
+
+            else:
+                raise ValueError(f"Unsupported lgce_variant: {self.lgce_variant}")
         else:
             self.lgce_bridge = None
+            self.lgce_v1_fuser = None
 
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -788,17 +787,28 @@ class SegEarthR2(MiphaPhiForCausalLM):
         mask_num,
         stage,
         hidden_states=None,
+        attention_mask=None,
     ):
-        sample_guidance = self.build_sample_guidance_from_seg(seg_embedding, mask_num)
-
         raw_guidance = None
-        if hidden_states is not None and getattr(self, "lgce_guidance_mode", "sentence_mean") == "sentence_mean":
-        # 如果你后面要从 hidden_states 构 raw guidance，可以在这里扩展
-            raw_guidance = hidden_states
 
-        if self.use_lgce_bridge and self.lgce_bridge is not None:
+        if self.lgce_guidance_mode == "sentence_mean":
+            raw_guidance = self.build_sample_guidance_from_sentence(hidden_states, attention_mask)   # [B, 2560]
+            sample_guidance = self.lgce_sentence_projector(raw_guidance)                             # [B, 256]
+        else:
+            sample_guidance = self.build_sample_guidance_from_seg(seg_embedding, mask_num)
+        if self.use_lgce_bridge:
             image_features_before = image_features
-            image_features = self.lgce_bridge(image_features, sample_guidance)
+            if self.lgce_variant == "baseline":
+                image_features = self.lgce_bridge(image_features, sample_guidance)
+            elif self.lgce_variant == "v1_dual_concat":
+                image_features = self.lgce_v1_fuser(image_features, sample_guidance)
+            else:
+                    raise ValueError(
+                        f"Invalid LGCE runtime state: variant={self.lgce_variant}, "
+                        f"lgce_bridge={self.lgce_bridge is not None}, "
+                        f"lgce_v1_fuser={self.lgce_v1_fuser is not None}"
+                    )
+            
             self._maybe_log_lgce_debug(
                 stage=stage,
                 mask_num=mask_num,
@@ -887,6 +897,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_embedding=SEG_embedding,
             mask_num=mask_num,
             hidden_states=hidden_states,
+            attention_mask=attention_mask,
             stage="forward",
         )
         
@@ -1045,6 +1056,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_embedding=SEG_embedding,
             mask_num=mask_num,
             hidden_states=hidden_states,
+            attention_mask=attention_mask,
             stage="eval_seg",
         )
 

@@ -43,10 +43,7 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
-    lgce_scales: Optional[str] = field(default="res3,res4,res5")
-    lgce_residual_init: float = field(default=0.05)
-    lgce_cross_scale_init: float = field(default=0.1)
-    lgce_enable_long_skip: bool = field(default=True)
+    lgce_variant: Optional[str] = field(default="baseline")
 
 @dataclass
 class DataArguments:
@@ -271,10 +268,9 @@ def train():
     model.config.lgce_guidance_mode = model_args.lgce_guidance_mode
     model.lgce_guidance_mode = model_args.lgce_guidance_mode
 
-    model.config.lgce_scales = model_args.lgce_scales
-    model.config.lgce_residual_init = model_args.lgce_residual_init
-    model.config.lgce_cross_scale_init = model_args.lgce_cross_scale_init
-    model.config.lgce_enable_long_skip = model_args.lgce_enable_long_skip
+    model.config.lgce_variant = model_args.lgce_variant
+    model.lgce_variant = model_args.lgce_variant
+
     if (not model_args.use_lgce_bridge) and hasattr(model, "lgce_bridge"):
         model.lgce_bridge = None
 
@@ -344,7 +340,8 @@ def train():
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "lgce_bridge",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "lgce_bridge","lgce_v1_fuser",
+
     ]
 
     if model_args.train_swin_backbone:
