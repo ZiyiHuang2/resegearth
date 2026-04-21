@@ -133,6 +133,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.use_lgce_bridge = self.config.use_lgce_bridge
         self.config.lgce_debug = getattr(self.config, "lgce_debug", False)
         self.lgce_debug = self.config.lgce_debug
+        self.config.lgce_guidance_mode = getattr(self.config, "lgce_guidance_mode", "sentence_mean")
+        self.lgce_guidance_mode = self.config.lgce_guidance_mode
         self.lgce_bridge = None
 
         is_train_mask_decode = getattr(config, 'mask_decode_train', False)
@@ -149,24 +151,55 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.config.mask_decode_train = True
 
         self.attention_loss = AttentionLoss()
-        
+
         self.test_topk_per_image = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         input_shape = self.output_shape()
         self.pixel_decoder = self.pixel_decoder_init(cfg=self.mask_decoder_cfg, input_shape=input_shape)
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
-        self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.SEG_token_projector = nn.Linear(
+            self.config.hidden_size,
+            self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+        )
+
         self.use_lgce_bridge = getattr(self.config, "use_lgce_bridge", True)
         self.lgce_debug = getattr(self.config, "lgce_debug", False)
+        self.lgce_guidance_mode = getattr(self.config, "lgce_guidance_mode", "sentence_mean")
+
+        # 统一给 bridge 的 guidance 维度
+        self.lgce_guidance_dim = self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+
+        # sentence_mean: 先从 LLM hidden size 投到 guidance dim
+        self.lgce_sentence_projector = nn.Linear(
+            self.config.hidden_size,      # 2560
+            self.lgce_guidance_dim        # 256
+        )
+
+        lgce_scales = getattr(self.config, "lgce_scales", "res3,res4,res5")
+        if isinstance(lgce_scales, str):
+            lgce_scales = tuple([x.strip() for x in lgce_scales.split(",") if x.strip()])
+
+        lgce_residual_init = getattr(self.config, "lgce_residual_init", 0.05)
+        lgce_cross_scale_init = getattr(self.config, "lgce_cross_scale_init", 0.1)
+        lgce_enable_long_skip = getattr(self.config, "lgce_enable_long_skip", True)
+
         if self.use_lgce_bridge:
+            feat_channels = {
+                k: input_shape[k].channel
+                for k in lgce_scales
+            }
+
             self.lgce_bridge = LanguageGuidedCrossScaleBridge(
-                text_dim=self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
-                res3_channels=input_shape["res3"].channel,
-                res4_channels=input_shape["res4"].channel,
+                text_dim=self.lgce_guidance_dim,
+                feat_channels=feat_channels,
+                enabled_scales=lgce_scales,
+                cross_scale_init=lgce_cross_scale_init,
+                residual_init=lgce_residual_init,
+                enable_long_skip=lgce_enable_long_skip,
             )
         else:
             self.lgce_bridge = None
-            
+
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
             def get_w(weights, keyword):
@@ -678,35 +711,110 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 sample_embeddings.append(sample_chunk.mean(dim=0))
         return torch.stack(sample_embeddings, dim=0)
 
-    def _maybe_log_lgce_debug(self, stage, mask_num, sample_guidance, image_features_before=None, image_features_after=None):
+    def build_sample_guidance_from_sentence(self, hidden_states, attention_mask):
+        """Build raw sentence-level pooled language guidance [B, H_llm]."""
+        if hidden_states is None:
+            raise ValueError("hidden_states must not be None when lgce_guidance_mode='sentence_mean'.")
+        if hidden_states.dim() != 3:
+            raise ValueError(f"Expected hidden_states with shape [B, T, H], got {tuple(hidden_states.shape)}")
+
+        if attention_mask is None:
+            valid_mask = torch.ones(
+                hidden_states.shape[:2],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        else:
+            if attention_mask.dim() != 2:
+                raise ValueError(f"attention_mask must be [B, T], got {tuple(attention_mask.shape)}")
+            if attention_mask.shape[0] != hidden_states.shape[0] or attention_mask.shape[1] != hidden_states.shape[1]:
+                raise ValueError(
+                    f"attention_mask shape {tuple(attention_mask.shape)} is incompatible with "
+                    f"hidden_states shape {tuple(hidden_states.shape)}"
+                )
+            valid_mask = attention_mask.to(device=hidden_states.device, dtype=hidden_states.dtype)
+
+        valid_mask = valid_mask.unsqueeze(-1)                # [B, T, 1]
+        denom = valid_mask.sum(dim=1).clamp_min(1.0)        # [B, 1]
+        pooled = (hidden_states * valid_mask).sum(dim=1) / denom   # [B, H_llm]
+        return pooled
+
+    def _maybe_log_lgce_debug(
+        self,
+        stage,
+        mask_num,
+        sample_guidance,
+        raw_guidance=None,
+        image_features_before=None,
+        image_features_after=None,
+    ):
         if not self.lgce_debug:
             return
 
         mask_num_list = [int(x) for x in (mask_num.tolist() if torch.is_tensor(mask_num) else mask_num)]
-        msg = (
-            f"[LGCE][{stage}] mask_num={mask_num_list}, "
-            f"sample_guidance.shape={tuple(sample_guidance.shape)}"
-        )
-        if image_features_before is not None:
-            msg += (
-                f", res3_in={tuple(image_features_before['res3'].shape)}, "
-                f"res4_in={tuple(image_features_before['res4'].shape)}"
-            )
-        if image_features_after is not None:
-            msg += (
-                f", res3_out={tuple(image_features_after['res3'].shape)}, "
-                f"res4_out={tuple(image_features_after['res4'].shape)}"
-            )
-        print(msg)
+        msg = [
+            f"[LGCE][{stage}]",
+            f"mask_num={mask_num_list}",
+            f"sample_guidance.shape={tuple(sample_guidance.shape)}",
+        ]
 
-    def _apply_lgce_bridge(self, image_features, seg_embedding, mask_num, stage):
+        if raw_guidance is not None:
+            msg.append(f"raw_guidance.shape={tuple(raw_guidance.shape)}")
+
+        if self.lgce_bridge is not None and hasattr(self.lgce_bridge, "enabled_scales"):
+            msg.append(f"enabled_scales={self.lgce_bridge.enabled_scales}")
+
+        if image_features_before is not None:
+            before_shapes = {
+                k: tuple(v.shape)
+                for k, v in image_features_before.items()
+                if self.lgce_bridge is None or k in self.lgce_bridge.enabled_scales
+            }
+            msg.append(f"before={before_shapes}")
+
+        if image_features_after is not None:
+            after_shapes = {
+                k: tuple(v.shape)
+                for k, v in image_features_after.items()
+                if self.lgce_bridge is None or k in self.lgce_bridge.enabled_scales
+            }
+            msg.append(f"after={after_shapes}")
+
+        print(", ".join(msg))
+    def _apply_lgce_bridge(
+        self,
+        image_features,
+        seg_embedding,
+        mask_num,
+        stage,
+        hidden_states=None,
+    ):
         sample_guidance = self.build_sample_guidance_from_seg(seg_embedding, mask_num)
+
+        raw_guidance = None
+        if hidden_states is not None and getattr(self, "lgce_guidance_mode", "sentence_mean") == "sentence_mean":
+        # 如果你后面要从 hidden_states 构 raw guidance，可以在这里扩展
+            raw_guidance = hidden_states
+
         if self.use_lgce_bridge and self.lgce_bridge is not None:
             image_features_before = image_features
             image_features = self.lgce_bridge(image_features, sample_guidance)
-            self._maybe_log_lgce_debug(stage, mask_num, sample_guidance, image_features_before, image_features)
+            self._maybe_log_lgce_debug(
+                stage=stage,
+                mask_num=mask_num,
+                sample_guidance=sample_guidance,
+                raw_guidance=raw_guidance,
+                image_features_before=image_features_before,
+                image_features_after=image_features,
+            )
         else:
-            self._maybe_log_lgce_debug(stage, mask_num, sample_guidance)
+            self._maybe_log_lgce_debug(
+                stage=stage,
+                mask_num=mask_num,
+                sample_guidance=sample_guidance,
+                raw_guidance=raw_guidance,
+            )
+
         return image_features
            
     def forward(
@@ -774,7 +882,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     f"mask_num={mask_num}"
                 )
             image_features = self.get_vision_tower_feature(images)
-        image_features = self._apply_lgce_bridge(image_features, SEG_embedding, mask_num, stage="forward")
+        image_features = self._apply_lgce_bridge(
+            image_features=image_features,
+            seg_embedding=SEG_embedding,
+            mask_num=mask_num,
+            hidden_states=hidden_states,
+            stage="forward",
+        )
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -902,8 +1016,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             mask_num = None):
         
-        output_attentions = True
-        output_hidden_states = True
+        output_attentions = False
+        output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_features = self.get_vision_tower_feature(images)
@@ -926,7 +1040,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state   
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        image_features = self._apply_lgce_bridge(image_features, SEG_embedding, mask_num, stage="eval_seg")
+        image_features = self._apply_lgce_bridge(
+            image_features=image_features,
+            seg_embedding=SEG_embedding,
+            mask_num=mask_num,
+            hidden_states=hidden_states,
+            stage="eval_seg",
+        )
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -955,7 +1075,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         processed_results = []
         for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
             instance_r = {
-                'pred': ((mask_pred_result.cpu().numpy() > 0) * 255).astype(np.uint8),
+                'pred': ((mask_pred_result.detach().float().cpu().numpy() > 0) * 255).astype(np.uint8),
                 'image_name': _seg_info['image_id'],
                 'id': _seg_info['data_id'],
                 'mask_id': _seg_info['mask_id'],

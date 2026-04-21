@@ -353,9 +353,11 @@ class LLaVATrainer(Trainer):
         eval_dataloader = self.get_eval_dataloader(eval_dataset)
         model_dtype = next(model.parameters()).dtype
 
-        giou_sum = 0.0
-        ciou_sum = 0.0
+        iou_sum = 0.0
+        total_inter = 0.0
+        total_union = 0.0
         valid_count = 0
+        eps = 1e-7
 
         for inputs in eval_dataloader:
             with torch.no_grad():
@@ -416,28 +418,26 @@ class LLaVATrainer(Trainer):
                     )
                     pred_mask_np = (pred_mask_np > 0).astype(np.uint8)
 
-                pred_box = self._bbox_from_mask(pred_mask_np)
-                gt_box = self._bbox_from_mask(gt_mask_np)
-                if pred_box is None or gt_box is None:
-                    giou = 0.0
-                    ciou = 0.0
-                else:
-                    giou, ciou = self._box_giou_ciou(pred_box, gt_box)
+                inter = float(np.logical_and(pred_mask_np > 0, gt_mask_np > 0).sum())
+                union = float(np.logical_or(pred_mask_np > 0, gt_mask_np > 0).sum())
+                iou = inter / (union + eps)
 
-                giou_sum += giou
-                ciou_sum += ciou
+                iou_sum += iou
+                total_inter += inter
+                total_union += union
                 valid_count += 1
 
         if dist.is_available() and dist.is_initialized():
-            stats = torch.tensor([giou_sum, ciou_sum, float(valid_count)], device=self.args.device)
+            stats = torch.tensor([iou_sum, total_inter, total_union, float(valid_count)], device=self.args.device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            giou_sum = float(stats[0].item())
-            ciou_sum = float(stats[1].item())
-            valid_count = int(stats[2].item())
+            iou_sum = float(stats[0].item())
+            total_inter = float(stats[1].item())
+            total_union = float(stats[2].item())
+            valid_count = int(stats[3].item())
 
         if valid_count > 0:
-            eval_giou = giou_sum / valid_count
-            eval_ciou = ciou_sum / valid_count
+            eval_giou = iou_sum / valid_count
+            eval_ciou = total_inter / (total_union + eps)
         else:
             eval_giou = 0.0
             eval_ciou = 0.0

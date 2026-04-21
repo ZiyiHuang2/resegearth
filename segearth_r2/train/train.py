@@ -39,9 +39,14 @@ class ModelArguments:
     load_mask2former: bool = field(default=True)
     use_lgce_bridge: bool = field(default=True)
     lgce_debug: bool = field(default=False)
+    lgce_guidance_mode: Optional[str] = field(default="sentence_mean")
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    lgce_scales: Optional[str] = field(default="res3,res4,res5")
+    lgce_residual_init: float = field(default=0.05)
+    lgce_cross_scale_init: float = field(default=0.1)
+    lgce_enable_long_skip: bool = field(default=True)
 
 @dataclass
 class DataArguments:
@@ -242,6 +247,10 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if training_args.seed is None:
+        training_args.seed = 42
+    if training_args.data_seed is None:
+        training_args.data_seed = 42
     local_rank = training_args.local_rank
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
@@ -259,6 +268,13 @@ def train():
     model.use_lgce_bridge = model_args.use_lgce_bridge
     model.config.lgce_debug = model_args.lgce_debug
     model.lgce_debug = model_args.lgce_debug
+    model.config.lgce_guidance_mode = model_args.lgce_guidance_mode
+    model.lgce_guidance_mode = model_args.lgce_guidance_mode
+
+    model.config.lgce_scales = model_args.lgce_scales
+    model.config.lgce_residual_init = model_args.lgce_residual_init
+    model.config.lgce_cross_scale_init = model_args.lgce_cross_scale_init
+    model.config.lgce_enable_long_skip = model_args.lgce_enable_long_skip
     if (not model_args.use_lgce_bridge) and hasattr(model, "lgce_bridge"):
         model.lgce_bridge = None
 
@@ -376,8 +392,8 @@ def train():
     training_args.load_best_model_at_end = True
     training_args.metric_for_best_model = "eval_score"
     training_args.greater_is_better = True
-    if training_args.save_total_limit is None or training_args.save_total_limit > 3:
-        training_args.save_total_limit = 3
+    if training_args.save_total_limit is None or training_args.save_total_limit > 2:
+        training_args.save_total_limit = 2
     
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,
