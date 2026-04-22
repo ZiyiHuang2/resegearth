@@ -1,5 +1,7 @@
 import os
 import torch
+import numpy as np
+import cv2
 import shutil
 from transformers import Trainer
 from transformers.modeling_utils import unwrap_model
@@ -264,3 +266,189 @@ class LLaVATrainer(Trainer):
                 self.log(loss_dict)
 
         return (loss, outputs) if return_outputs else loss
+
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        # Keep train drop_last behavior unchanged, but force eval to keep tail batches.
+        original_drop_last = self.args.dataloader_drop_last
+        self.args.dataloader_drop_last = False
+        try:
+            return super().get_eval_dataloader(eval_dataset)
+        finally:
+            self.args.dataloader_drop_last = original_drop_last
+
+    @staticmethod
+    def _bbox_from_mask(mask_np):
+        ys, xs = np.where(mask_np > 0)
+        if len(xs) == 0 or len(ys) == 0:
+            return None
+        return [float(xs.min()), float(ys.min()), float(xs.max()), float(ys.max())]
+
+    @staticmethod
+    def _bbox_area(box):
+        x1, y1, x2, y2 = box
+        return max(0.0, x2 - x1 + 1) * max(0.0, y2 - y1 + 1)
+
+    @classmethod
+    def _bbox_iou(cls, box1, box2, eps=1e-7):
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        inter = 0.0
+        if x2 >= x1 and y2 >= y1:
+            inter = (x2 - x1 + 1) * (y2 - y1 + 1)
+        union = cls._bbox_area(box1) + cls._bbox_area(box2) - inter
+        return float(inter / (union + eps))
+
+    @classmethod
+    def _box_giou_ciou(cls, box1, box2, eps=1e-7):
+        iou = cls._bbox_iou(box1, box2, eps=eps)
+
+        cx1 = min(box1[0], box2[0])
+        cy1 = min(box1[1], box2[1])
+        cx2 = max(box1[2], box2[2])
+        cy2 = max(box1[3], box2[3])
+        c_area = cls._bbox_area([cx1, cy1, cx2, cy2])
+
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        inter = 0.0
+        if x2 >= x1 and y2 >= y1:
+            inter = (x2 - x1 + 1) * (y2 - y1 + 1)
+        union = cls._bbox_area(box1) + cls._bbox_area(box2) - inter
+        giou = float(iou - (c_area - union) / (c_area + eps))
+
+        b1x = (box1[0] + box1[2]) / 2.0
+        b1y = (box1[1] + box1[3]) / 2.0
+        b2x = (box2[0] + box2[2]) / 2.0
+        b2y = (box2[1] + box2[3]) / 2.0
+        center_dist_sq = (b1x - b2x) ** 2 + (b1y - b2y) ** 2
+
+        cw = cx2 - cx1 + 1.0
+        ch = cy2 - cy1 + 1.0
+        c_diag_sq = cw ** 2 + ch ** 2 + eps
+
+        w1 = box1[2] - box1[0] + 1.0
+        h1 = box1[3] - box1[1] + 1.0
+        w2 = box2[2] - box2[0] + 1.0
+        h2 = box2[3] - box2[1] + 1.0
+        v = (4.0 / (math.pi ** 2)) * (math.atan(w1 / h1) - math.atan(w2 / h2)) ** 2
+        alpha = v / (1.0 - iou + v + eps)
+        ciou = float(iou - (center_dist_sq / c_diag_sq) - alpha * v)
+        return giou, ciou
+
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        self._memory_tracker.start()
+
+        model = self._wrap_model(self.model, training=False, dataloader=None)
+        model.eval()
+
+        eval_dataloader = self.get_eval_dataloader(eval_dataset)
+        model_dtype = next(model.parameters()).dtype
+
+        iou_sum = 0.0
+        total_inter = 0.0
+        total_union = 0.0
+        valid_count = 0
+        eps = 1e-7
+
+        for inputs in eval_dataloader:
+            with torch.no_grad():
+                inputs = self._prepare_inputs(inputs)
+                token_refer_id = [ids.to(self.args.device) for ids in inputs["token_refer_id"]]
+                outputs = model.eval_seg(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    images=inputs["images"].to(dtype=model_dtype),
+                    images_clip=inputs["images_clip"].to(dtype=model_dtype),
+                    seg_info=inputs["seg_info"],
+                    token_refer_id=token_refer_id,
+                    SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
+                    labels=inputs["labels"],
+                    mask_num=inputs["mask_num"],
+                )
+
+            gt_by_key = {}
+            for gt_item in inputs["seg_info"]:
+                gt_key = (
+                    str(gt_item.get("image_id")),
+                    str(gt_item.get("data_id")),
+                    str(gt_item.get("mask_id")),
+                )
+                gt_by_key[gt_key] = gt_item
+
+            for pred_item in outputs:
+                pred_key = (
+                    str(pred_item.get("image_name")),
+                    str(pred_item.get("id")),
+                    str(pred_item.get("mask_id")),
+                )
+                gt_item = gt_by_key.get(pred_key)
+                if gt_item is None:
+                    continue
+
+                gt_mask = gt_item.get("mask")
+                if gt_mask is None:
+                    continue
+                if torch.is_tensor(gt_mask):
+                    gt_mask_np = gt_mask.detach().cpu().numpy()
+                else:
+                    gt_mask_np = np.asarray(gt_mask)
+                if gt_mask_np.ndim > 2:
+                    gt_mask_np = np.squeeze(gt_mask_np)
+                gt_mask_np = (gt_mask_np > 0).astype(np.uint8)
+
+                pred_mask_np = np.asarray(pred_item.get("pred"))
+                if pred_mask_np.ndim > 2:
+                    pred_mask_np = np.squeeze(pred_mask_np)
+                pred_mask_np = (pred_mask_np > 0).astype(np.uint8)
+
+                if pred_mask_np.shape != gt_mask_np.shape:
+                    pred_mask_np = cv2.resize(
+                        pred_mask_np,
+                        (gt_mask_np.shape[1], gt_mask_np.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                    pred_mask_np = (pred_mask_np > 0).astype(np.uint8)
+
+                inter = float(np.logical_and(pred_mask_np > 0, gt_mask_np > 0).sum())
+                union = float(np.logical_or(pred_mask_np > 0, gt_mask_np > 0).sum())
+                iou = inter / (union + eps)
+
+                iou_sum += iou
+                total_inter += inter
+                total_union += union
+                valid_count += 1
+
+        if dist.is_available() and dist.is_initialized():
+            stats = torch.tensor([iou_sum, total_inter, total_union, float(valid_count)], device=self.args.device)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+            iou_sum = float(stats[0].item())
+            total_inter = float(stats[1].item())
+            total_union = float(stats[2].item())
+            valid_count = int(stats[3].item())
+
+        if valid_count > 0:
+            eval_giou = iou_sum / valid_count
+            eval_ciou = total_inter / (total_union + eps)
+        else:
+            eval_giou = 0.0
+            eval_ciou = 0.0
+        eval_score = 0.5 * eval_giou + 0.5 * eval_ciou
+
+        metrics = {
+            f"{metric_key_prefix}_giou": float(eval_giou),
+            f"{metric_key_prefix}_ciou": float(eval_ciou),
+            f"{metric_key_prefix}_score": float(eval_score),
+        }
+        self.log(metrics)
+        self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
+        self._memory_tracker.stop_and_update_metrics(metrics)
+        return metrics

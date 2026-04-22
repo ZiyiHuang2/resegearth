@@ -785,8 +785,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             mask_num = None):
         
-        output_attentions = True
-        output_hidden_states = True
+        output_attentions = False
+        output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_features = self.get_vision_tower_feature(images)
@@ -837,7 +837,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         processed_results = []
         for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
             instance_r = {
-                'pred': ((mask_pred_result.cpu().numpy() > 0) * 255).astype(np.uint8),
+                'pred': ((mask_pred_result.detach().float().cpu().numpy() > 0) * 255).astype(np.uint8),
                 'image_name': _seg_info['image_id'],
                 'id': _seg_info['data_id'],
                 'mask_id': _seg_info['mask_id'],
