@@ -53,6 +53,8 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
+    use_precomputed_structured_maps: bool = field(default=False)
+    structured_map_dir: Optional[str] = field(default=None)
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -96,6 +98,17 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
+    max_grad_norm: float = field(default=1.0)
+    use_attention_loss: bool = field(default=True)
+    use_structured_attention_loss: bool = field(default=False)
+    attention_loss_weight: float = field(default=0.01)
+    attention_loss_reduction: str = field(default="batchmean")
+    attention_loss_last_k_layers: int = field(default=0)
+    attention_audit_mode: bool = field(default=False)
+    attention_audit_dir: Optional[str] = field(default=None)
+    structured_fg_bg_weight: float = field(default=1.0)
+    structured_boundary_outer_weight: float = field(default=1.0)
+    structured_attention_margin: float = field(default=0.0)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -231,7 +244,9 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     )
     print(f'total unify datasest number is {len(train_dataset)}')
     data_collator = DataCollatorForCOCODatasetV2(
-        tokenizer=tokenizer, clip_image_processor=clip_image_processor
+        tokenizer=tokenizer,
+        clip_image_processor=clip_image_processor,
+        use_precomputed_structured_maps=data_args.use_precomputed_structured_maps,
     )
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
@@ -258,10 +273,24 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
                 )
+    model.config.use_attention_loss = training_args.use_attention_loss
+    model.config.use_structured_attention_loss = training_args.use_structured_attention_loss
+    model.config.attention_loss_weight = training_args.attention_loss_weight
+    model.config.attention_loss_reduction = training_args.attention_loss_reduction
+    model.config.attention_loss_last_k_layers = training_args.attention_loss_last_k_layers
+    model.config.attention_audit_mode = training_args.attention_audit_mode
+    model.config.attention_audit_dir = training_args.attention_audit_dir
+    model.config.structured_fg_bg_weight = training_args.structured_fg_bg_weight
+    model.config.structured_boundary_outer_weight = training_args.structured_boundary_outer_weight
+    model.config.structured_attention_margin = training_args.structured_attention_margin
+    model.config.use_precomputed_structured_maps = data_args.use_precomputed_structured_maps
+    model.config.structured_map_dir = data_args.structured_map_dir
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+    if hasattr(model, "set_attention_loss_config"):
+        model.set_attention_loss_config()
 
     model.config.use_cache = False
 

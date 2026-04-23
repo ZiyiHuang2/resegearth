@@ -206,6 +206,73 @@ class RS_Base_Dataset(Dataset):
             labels=targets,
         )
 
+    def _structured_key_tuple(self, image_id, data_id, mask_id):
+        return (str(image_id), str(data_id), str(mask_id))
+
+    def _structured_key_str(self, image_id, data_id, mask_id):
+        return f"{str(image_id)}_{str(data_id)}_{str(mask_id)}"
+
+    def _init_structured_map_index(self, data_args):
+        self.use_precomputed_structured_maps = bool(getattr(data_args, "use_precomputed_structured_maps", False))
+        self.structured_map_dir = getattr(data_args, "structured_map_dir", None)
+        self.structured_map_index = {}
+        self.structured_map_stem_index = {}
+
+        if not self.use_precomputed_structured_maps or not self.structured_map_dir:
+            return
+        if not os.path.isdir(self.structured_map_dir):
+            print(f"[StructuredMap] directory not found: {self.structured_map_dir}, fallback to online maps.")
+            return
+
+        meta_path = os.path.join(self.structured_map_dir, "meta.json")
+        if not os.path.isfile(meta_path):
+            return
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                records = json.load(f)
+        except Exception as e:
+            print(f"[StructuredMap] failed to load meta.json: {e}")
+            return
+
+        if not isinstance(records, list):
+            return
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            output_npz = record.get("output_npz", None)
+            if output_npz is None:
+                continue
+            output_path = output_npz if os.path.isabs(output_npz) else os.path.join(self.structured_map_dir, output_npz)
+            stem = os.path.splitext(os.path.basename(output_path))[0]
+            self.structured_map_stem_index[stem] = output_path
+            explicit_key = record.get("structured_map_key", None)
+            if explicit_key is not None:
+                self.structured_map_stem_index[str(explicit_key)] = output_path
+            if "image_id" in record and "data_id" in record and "mask_id" in record:
+                key_tuple = self._structured_key_tuple(record["image_id"], record["data_id"], record["mask_id"])
+                self.structured_map_index[key_tuple] = output_path
+
+    def _resolve_structured_map_path(self, image_id, data_id, mask_id):
+        if not self.use_precomputed_structured_maps or not self.structured_map_dir:
+            return None
+        key_tuple = self._structured_key_tuple(image_id, data_id, mask_id)
+        if key_tuple in self.structured_map_index and os.path.isfile(self.structured_map_index[key_tuple]):
+            return self.structured_map_index[key_tuple]
+
+        key_stem = self._structured_key_str(image_id, data_id, mask_id)
+        if key_stem in self.structured_map_stem_index and os.path.isfile(self.structured_map_stem_index[key_stem]):
+            return self.structured_map_stem_index[key_stem]
+
+        candidate = os.path.join(self.structured_map_dir, f"{key_stem}.npz")
+        if os.path.isfile(candidate):
+            return candidate
+        return None
+
+    def _attach_structured_map_meta(self, ann, image_id, data_id, mask_id):
+        ann["structured_map_key"] = self._structured_key_str(image_id, data_id, mask_id)
+        ann["structured_map_path"] = self._resolve_structured_map_path(image_id, data_id, mask_id)
+        return ann
+
 
 class RRSISDDataset(RS_Base_Dataset):
 
@@ -223,6 +290,7 @@ class RRSISDDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self._init_structured_map_index(data_args)
 
         # 官方目录结构
         self.image_dir = os.path.join(base_data_path, "images", "rrsisd", "JPEGImages")
@@ -299,7 +367,7 @@ class RRSISDDataset(RS_Base_Dataset):
         # 这套数据已确认 image=ann=ref 一一对应，这里就是单目标
         mask_num = 1
 
-        data_dict['annotations'].append({
+        ann = {
             'data_id': data_id,
             'mask_id': 0,
             'mask': np.expand_dims(masks[0], axis=0),
@@ -307,7 +375,14 @@ class RRSISDDataset(RS_Base_Dataset):
             'height': image_height,
             'width': image_width,
             'image_id': os.path.basename(image_path).split(".")[0],
-        })
+        }
+        ann = self._attach_structured_map_meta(
+            ann=ann,
+            image_id=ann['image_id'],
+            data_id=ann['data_id'],
+            mask_id=ann['mask_id'],
+        )
+        data_dict['annotations'].append(ann)
 
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
 
@@ -355,6 +430,7 @@ class LaSeRSDataset(RS_Base_Dataset):
         
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
+        self._init_structured_map_index(data_args)
 
         if "train" in split:
             self.LaSeRS_image_path = os.path.join(base_data_path, "train/images")
@@ -414,7 +490,7 @@ class LaSeRSDataset(RS_Base_Dataset):
         mask_num = answer.count("[SEG]")
 
         for i in range(mask_num):
-            data_dict['annotations'].append({
+            ann = {
                 'data_id': data_id,
                 'mask_id': i,
                 'mask': np.expand_dims(masks[i], axis=0) if masks is not None else None,
@@ -422,7 +498,14 @@ class LaSeRSDataset(RS_Base_Dataset):
                 'height': image_height,
                 'width': image_width,
                 'image_id': os.path.basename(image_path).split(".")[0],
-            })
+            }
+            ann = self._attach_structured_map_meta(
+                ann=ann,
+                image_id=ann['image_id'],
+                data_id=ann['data_id'],
+                mask_id=ann['mask_id'],
+            )
+            data_dict['annotations'].append(ann)
             
         prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
         instruction = ref.strip()
@@ -459,6 +542,44 @@ class DataCollatorForCOCODatasetV2(object):
 
     tokenizer: transformers.PreTrainedTokenizer
     clip_image_processor: transformers.SiglipImageProcessor
+    use_precomputed_structured_maps: bool = False
+
+    @staticmethod
+    def _to_map_tensor(arr):
+        if arr is None:
+            return None
+        tensor = torch.as_tensor(arr, dtype=torch.uint8)
+        if tensor.ndim > 2:
+            tensor = tensor.squeeze()
+        return tensor
+
+    def _attach_precomputed_maps(self, seg):
+        seg["precomputed_structured_loaded"] = False
+        seg["precomputed_structured_missing"] = False
+        if not self.use_precomputed_structured_maps:
+            return
+        map_path = seg.get("structured_map_path", None)
+        if map_path is None:
+            seg["precomputed_structured_missing"] = True
+            return
+        if not os.path.isfile(map_path):
+            seg["precomputed_structured_missing"] = True
+            return
+        try:
+            with np.load(map_path) as maps:
+                if "fg_map" in maps:
+                    seg["fg_map"] = self._to_map_tensor(maps["fg_map"])
+                if "boundary_map" in maps:
+                    seg["boundary_map"] = self._to_map_tensor(maps["boundary_map"])
+                if "outer_ring_map" in maps:
+                    seg["outer_ring_map"] = self._to_map_tensor(maps["outer_ring_map"])
+            if seg.get("fg_map", None) is not None and seg.get("boundary_map", None) is not None and seg.get("outer_ring_map", None) is not None:
+                seg["precomputed_structured_loaded"] = True
+            else:
+                seg["precomputed_structured_missing"] = True
+        except Exception:
+            seg["precomputed_structured_missing"] = True
+            return
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
@@ -537,6 +658,7 @@ class DataCollatorForCOCODatasetV2(object):
             for instance_list in instances:
                 for seg in instance_list['annotations']:
                     seg['mask'] = torch.as_tensor(seg['mask'], dtype=torch.uint8) if seg['mask'] is not None else None
+                    self._attach_precomputed_maps(seg)
                     batch['seg_info'].append(seg)
         
         if 'dataset_type' in instances[0]:

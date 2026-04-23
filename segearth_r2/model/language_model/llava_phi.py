@@ -1,3 +1,4 @@
+import os
 from typing import List, Optional, Tuple, Union
 from addict import Dict
 from dataclasses import dataclass
@@ -39,6 +40,13 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_attn_fg_bg: Optional[torch.FloatTensor] = None
+    loss_attn_boundary_outer: Optional[torch.FloatTensor] = None
+    precomputed_structured_count: Optional[torch.FloatTensor] = None
+    fallback_structured_count: Optional[torch.FloatTensor] = None
+    missing_precomputed_count: Optional[torch.FloatTensor] = None
+    selected_attn_layers: Optional[torch.FloatTensor] = None
+    attention_audit: Optional[dict] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -67,6 +75,71 @@ class AttentionLoss(nn.Module):
         elif self.reduction == 'mean':
             loss = loss / model_attention_logits.numel()  # Overall mean loss
         return loss
+
+
+class StructuredAttentionLoss(nn.Module):
+    def __init__(
+        self,
+        reduction='batchmean',
+        fg_bg_weight: float = 1.0,
+        boundary_outer_weight: float = 1.0,
+        margin: float = 0.0,
+    ):
+        super(StructuredAttentionLoss, self).__init__()
+        self.reduction = reduction
+        self.fg_bg_weight = fg_bg_weight
+        self.boundary_outer_weight = boundary_outer_weight
+        self.margin = margin
+
+    def _reduce(self, loss: torch.Tensor, batch_size: int, numel: int) -> torch.Tensor:
+        if self.reduction == 'batchmean':
+            return loss / max(batch_size, 1)
+        if self.reduction == 'mean':
+            return loss / max(numel, 1)
+        return loss
+
+    def forward(
+        self,
+        model_attention_logits: torch.Tensor,
+        fg_mask: torch.Tensor,
+        boundary_map: Optional[torch.Tensor] = None,
+        outer_ring_map: Optional[torch.Tensor] = None,
+        return_components: bool = False,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+        device = model_attention_logits.device
+        loss = torch.tensor(0.0, device=device)
+        loss_fg_bg = torch.tensor(0.0, device=device)
+        loss_boundary_outer = torch.tensor(0.0, device=device)
+        for idx in range(model_attention_logits.shape[0]):
+            attn = model_attention_logits[idx]
+            fg = fg_mask[idx] > 0
+            bg = ~fg
+            if fg.sum() == 0 or bg.sum() == 0:
+                continue
+            fg_mean = attn[fg].mean()
+            bg_mean = attn[bg].mean()
+            fg_bg_penalty = F.relu(self.margin - (fg_mean - bg_mean))
+            sample_loss_fg_bg = self.fg_bg_weight * fg_bg_penalty
+            sample_loss_boundary_outer = torch.tensor(0.0, device=device)
+
+            if boundary_map is not None and outer_ring_map is not None:
+                boundary = boundary_map[idx] > 0
+                outer = outer_ring_map[idx] > 0
+                if boundary.sum() > 0 and outer.sum() > 0:
+                    boundary_mean = attn[boundary].mean()
+                    outer_mean = attn[outer].mean()
+                    bo_penalty = F.relu(self.margin - (boundary_mean - outer_mean))
+                    sample_loss_boundary_outer = self.boundary_outer_weight * bo_penalty
+            sample_loss = sample_loss_fg_bg + sample_loss_boundary_outer
+            loss = loss + sample_loss
+            loss_fg_bg = loss_fg_bg + sample_loss_fg_bg
+            loss_boundary_outer = loss_boundary_outer + sample_loss_boundary_outer
+        loss = self._reduce(loss, model_attention_logits.shape[0], model_attention_logits.numel())
+        if not return_components:
+            return loss
+        loss_fg_bg = self._reduce(loss_fg_bg, model_attention_logits.shape[0], model_attention_logits.numel())
+        loss_boundary_outer = self._reduce(loss_boundary_outer, model_attention_logits.shape[0], model_attention_logits.numel())
+        return loss, loss_fg_bg, loss_boundary_outer
 
 class SegEarthR2Model(MiphaPhiModel):
 
@@ -143,6 +216,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.config.mask_decode_train = True
 
         self.attention_loss = AttentionLoss()
+        self.structured_attention_loss = StructuredAttentionLoss()
         
         self.test_topk_per_image = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         input_shape = self.output_shape()
@@ -601,6 +675,287 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
+
+    def set_attention_loss_config(self):
+        self.attention_loss = AttentionLoss(
+            reduction=getattr(self.config, "attention_loss_reduction", "batchmean")
+        )
+        self.structured_attention_loss = StructuredAttentionLoss(
+            reduction=getattr(self.config, "attention_loss_reduction", "batchmean"),
+            fg_bg_weight=getattr(self.config, "structured_fg_bg_weight", 1.0),
+            boundary_outer_weight=getattr(self.config, "structured_boundary_outer_weight", 1.0),
+            margin=getattr(self.config, "structured_attention_margin", 0.0),
+        )
+
+    def _build_structured_maps(self, fg_mask_2d: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        fg = (fg_mask_2d > 0).float().unsqueeze(1)
+        dilated = (F.max_pool2d(fg, kernel_size=3, stride=1, padding=1) > 0).float()
+        eroded = (1.0 - F.max_pool2d(1.0 - fg, kernel_size=3, stride=1, padding=1)).clamp(min=0.0, max=1.0)
+        boundary = (fg - eroded).clamp(min=0.0, max=1.0).squeeze(1)
+        outer_ring = (dilated - fg).clamp(min=0.0, max=1.0).squeeze(1)
+        return boundary, outer_ring
+
+    def _resize_binary_map(self, map_tensor, target_hw, device, mode="nearest"):
+        if map_tensor is None:
+            return None
+        if not torch.is_tensor(map_tensor):
+            map_tensor = torch.as_tensor(map_tensor)
+        map_tensor = map_tensor.to(device=device, dtype=torch.float32)
+        if map_tensor.ndim == 2:
+            map_tensor = map_tensor.unsqueeze(0).unsqueeze(0)
+        elif map_tensor.ndim == 3:
+            if map_tensor.shape[0] == 1:
+                map_tensor = map_tensor.unsqueeze(0)
+            elif map_tensor.shape[-1] == 1:
+                map_tensor = map_tensor.permute(2, 0, 1).unsqueeze(0)
+            else:
+                map_tensor = map_tensor[:1].unsqueeze(0)
+        elif map_tensor.ndim == 4:
+            pass
+        else:
+            return None
+        if mode in {"linear", "bilinear", "bicubic", "trilinear"}:
+            resized = F.interpolate(map_tensor, size=target_hw, mode=mode, align_corners=False)
+        else:
+            resized = F.interpolate(map_tensor, size=target_hw, mode=mode)
+        resized = resized.squeeze(0).squeeze(0)
+        return (resized > 0).float()
+
+    def _prepare_attention_supervision(self, seg_info, target_hw=(27, 27), device=None):
+        if seg_info is None or len(seg_info) == 0:
+            return None, None, None, {
+                "precomputed_structured_count": 0.0,
+                "fallback_structured_count": 0.0,
+                "missing_precomputed_count": 0.0,
+            }
+        if device is None:
+            device = self.device
+        use_precomputed_maps = getattr(self.config, "use_precomputed_structured_maps", False)
+        h, w = target_hw
+        fg_masks = []
+        boundary_maps = []
+        outer_maps = []
+        precomputed_structured_count = 0.0
+        fallback_structured_count = 0.0
+        missing_precomputed_count = 0.0
+        for item in seg_info:
+            has_precomputed_triplet = (
+                item.get("fg_map", None) is not None
+                and item.get("boundary_map", None) is not None
+                and item.get("outer_ring_map", None) is not None
+            )
+            if use_precomputed_maps:
+                if has_precomputed_triplet:
+                    precomputed_structured_count += 1.0
+                else:
+                    fallback_structured_count += 1.0
+                    if item.get("structured_map_path", None) is not None:
+                        missing_precomputed_count += 1.0
+            fg = None
+            if use_precomputed_maps and item.get("fg_map", None) is not None:
+                fg = self._resize_binary_map(item["fg_map"], target_hw=(h, w), device=device, mode="nearest")
+            if fg is None and item.get("mask", None) is not None:
+                mask = item["mask"].to(device=device, dtype=torch.float32)
+                mask = F.interpolate(mask.unsqueeze(0), size=(800, 800), mode="nearest").squeeze(0)
+                mask_down = F.interpolate(mask.unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
+                fg = (mask_down > 0).float()
+            if fg is None:
+                fg = torch.zeros((h, w), device=device, dtype=torch.float32)
+            fg_masks.append(fg)
+
+            boundary = None
+            outer = None
+            if use_precomputed_maps and item.get("boundary_map", None) is not None and item.get("outer_ring_map", None) is not None:
+                boundary = self._resize_binary_map(item["boundary_map"], target_hw=(h, w), device=device, mode="nearest")
+                outer = self._resize_binary_map(item["outer_ring_map"], target_hw=(h, w), device=device, mode="nearest")
+            boundary_maps.append(boundary)
+            outer_maps.append(outer)
+
+        fg_stack = torch.stack(fg_masks, dim=0)
+        fg_flat = fg_stack.view(fg_stack.size(0), -1)
+
+        boundary_final = []
+        outer_final = []
+        for idx in range(fg_stack.size(0)):
+            if boundary_maps[idx] is not None and outer_maps[idx] is not None:
+                boundary_final.append(boundary_maps[idx])
+                outer_final.append(outer_maps[idx])
+            else:
+                b, o = self._build_structured_maps(fg_stack[idx:idx + 1])
+                boundary_final.append(b.squeeze(0))
+                outer_final.append(o.squeeze(0))
+        boundary_flat = torch.stack(boundary_final, dim=0).view(fg_stack.size(0), -1)
+        outer_flat = torch.stack(outer_final, dim=0).view(fg_stack.size(0), -1)
+        if use_precomputed_maps and missing_precomputed_count > 0 and not hasattr(self, "_warned_missing_precomputed_maps"):
+            print(f"[StructuredMap] missing precomputed maps in batch: {int(missing_precomputed_count)}; fallback to online maps.")
+            self._warned_missing_precomputed_maps = True
+        stats = {
+            "precomputed_structured_count": precomputed_structured_count,
+            "fallback_structured_count": fallback_structured_count,
+            "missing_precomputed_count": missing_precomputed_count,
+        }
+        return fg_flat, boundary_flat, outer_flat, stats
+
+    def _extract_seg_to_image_attentions(
+        self,
+        attentions,
+        SEG_token_embedding_indices: torch.Tensor,
+        image_features_indices: torch.Tensor,
+    ):
+        per_layer_head = []
+        per_layer_baseline = []
+        bs = SEG_token_embedding_indices.shape[0]
+        for layer_attention in attentions:
+            layer_head_rows = []
+            layer_baseline_rows = []
+            for batch_idx in range(bs):
+                attn = layer_attention[batch_idx]  # [heads, seq, seq]
+                seg_mask = SEG_token_embedding_indices[batch_idx].bool()
+                image_mask = image_features_indices[batch_idx].bool()
+                seg_to_img = attn[:, seg_mask][:, :, image_mask]  # [heads, seg, image]
+                if seg_to_img.shape[1] == 0 or seg_to_img.shape[2] == 0:
+                    continue
+                seg_to_img = seg_to_img.mean(dim=1)  # [heads, image]
+                layer_head_rows.append(seg_to_img)
+                layer_baseline_rows.append(seg_to_img.sum(dim=0, keepdim=True))  # [1, image]
+            if len(layer_head_rows) == 0:
+                continue
+            per_layer_head.append(torch.stack(layer_head_rows, dim=0))  # [bs, heads, image]
+            per_layer_baseline.append(torch.cat(layer_baseline_rows, dim=0))  # [bs, image]
+        return per_layer_head, per_layer_baseline
+
+    def _maybe_dump_attention_audit(
+        self,
+        per_layer_head,
+        fg_mask,
+        boundary_map,
+        outer_ring_map,
+        seg_info,
+        global_step,
+    ):
+        if not getattr(self.config, "attention_audit_mode", False):
+            return None
+        payload = {
+            "seg_to_image_attn": [x.detach().cpu() for x in per_layer_head],
+            "fg_mask": fg_mask.detach().cpu() if fg_mask is not None else None,
+            "boundary_map": boundary_map.detach().cpu() if boundary_map is not None else None,
+            "outer_ring_map": outer_ring_map.detach().cpu() if outer_ring_map is not None else None,
+            "meta": [
+                {
+                    "image_id": str(item.get("image_id", "")),
+                    "data_id": str(item.get("data_id", "")),
+                    "mask_id": str(item.get("mask_id", "")),
+                }
+                for item in (seg_info or [])
+            ],
+        }
+        audit_dir = getattr(self.config, "attention_audit_dir", None)
+        if audit_dir:
+            os.makedirs(audit_dir, exist_ok=True)
+            step = int(global_step) if global_step is not None else -1
+            filename = f"attention_audit_step{step:08d}.pt" if step >= 0 else "attention_audit_step_unknown.pt"
+            save_path = os.path.join(audit_dir, filename)
+            if os.path.exists(save_path):
+                stem, ext = os.path.splitext(save_path)
+                uniq = int(torch.randint(low=0, high=10**9, size=(1,)).item())
+                save_path = f"{stem}_{os.getpid()}_{uniq}{ext}"
+            torch.save(payload, save_path)
+            payload["saved_path"] = save_path
+        return payload
+
+    def _compute_attention_loss(
+        self,
+        attentions,
+        SEG_token_embedding_indices,
+        image_features_indices,
+        seg_info,
+        global_step=None,
+    ):
+        if not getattr(self.config, "use_attention_loss", True):
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, None, {
+                "loss_attn_fg_bg": zero,
+                "loss_attn_boundary_outer": zero,
+                "precomputed_structured_count": zero,
+                "fallback_structured_count": zero,
+                "missing_precomputed_count": zero,
+                "selected_attn_layers": zero,
+            }
+        fg_mask, boundary_map, outer_ring_map, supervision_stats = self._prepare_attention_supervision(
+            seg_info=seg_info, target_hw=(27, 27), device=self.device
+        )
+        if fg_mask is None:
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, None, {
+                "loss_attn_fg_bg": zero,
+                "loss_attn_boundary_outer": zero,
+                "precomputed_structured_count": zero,
+                "fallback_structured_count": zero,
+                "missing_precomputed_count": zero,
+                "selected_attn_layers": zero,
+            }
+        per_layer_head, per_layer_baseline = self._extract_seg_to_image_attentions(
+            attentions=attentions,
+            SEG_token_embedding_indices=SEG_token_embedding_indices,
+            image_features_indices=image_features_indices,
+        )
+        if len(per_layer_baseline) == 0:
+            zero = torch.tensor(0.0, device=self.device)
+            return zero, None, {
+                "loss_attn_fg_bg": zero,
+                "loss_attn_boundary_outer": zero,
+                "precomputed_structured_count": zero,
+                "fallback_structured_count": zero,
+                "missing_precomputed_count": zero,
+                "selected_attn_layers": zero,
+            }
+        last_k_layers = int(getattr(self.config, "attention_loss_last_k_layers", 0) or 0)
+        if last_k_layers > 0 and len(per_layer_baseline) > last_k_layers:
+            per_layer_head = per_layer_head[-last_k_layers:]
+            per_layer_baseline = per_layer_baseline[-last_k_layers:]
+
+        selected_attn_layers = torch.tensor(float(len(per_layer_baseline)), device=fg_mask.device)
+        use_structured = getattr(self.config, "use_structured_attention_loss", False)
+        loss_attention = torch.tensor(0.0, device=fg_mask.device)
+        loss_attn_fg_bg = torch.tensor(0.0, device=fg_mask.device)
+        loss_attn_boundary_outer = torch.tensor(0.0, device=fg_mask.device)
+        for baseline_attention in per_layer_baseline:
+            if use_structured:
+                layer_total, layer_fg_bg, layer_boundary_outer = self.structured_attention_loss(
+                    baseline_attention,
+                    fg_mask,
+                    boundary_map=boundary_map,
+                    outer_ring_map=outer_ring_map,
+                    return_components=True,
+                )
+                loss_attention = loss_attention + layer_total
+                loss_attn_fg_bg = loss_attn_fg_bg + layer_fg_bg
+                loss_attn_boundary_outer = loss_attn_boundary_outer + layer_boundary_outer
+            else:
+                loss_attention = loss_attention + self.attention_loss(baseline_attention, fg_mask)
+        audit_payload = self._maybe_dump_attention_audit(
+            per_layer_head=per_layer_head,
+            fg_mask=fg_mask,
+            boundary_map=boundary_map,
+            outer_ring_map=outer_ring_map,
+            seg_info=seg_info,
+            global_step=global_step,
+        )
+        stats = {
+            "loss_attn_fg_bg": loss_attn_fg_bg,
+            "loss_attn_boundary_outer": loss_attn_boundary_outer,
+            "precomputed_structured_count": torch.tensor(
+                supervision_stats["precomputed_structured_count"], device=fg_mask.device, dtype=torch.float32
+            ),
+            "fallback_structured_count": torch.tensor(
+                supervision_stats["fallback_structured_count"], device=fg_mask.device, dtype=torch.float32
+            ),
+            "missing_precomputed_count": torch.tensor(
+                supervision_stats["missing_precomputed_count"], device=fg_mask.device, dtype=torch.float32
+            ),
+            "selected_attn_layers": selected_attn_layers,
+        }
+        return loss_attention, audit_payload, stats
            
     def forward(
             self,
@@ -656,7 +1011,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
@@ -730,30 +1084,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
 
-        loss_attention = None
-        masks = [_seg_info['mask'] for _seg_info in seg_info]
-        masks_resized = [
-            F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
-            for m in masks
-        ]
-        masks = torch.stack(masks_resized, dim=0) # [4, 1, 800, 800]
-        masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
-        masks_down = masks_down.view(masks_down.size(0), -1)
-        masks_down[masks_down > 0] = 1
-        
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
-        for full_attention_map in attentions:
-            batch_attentions_list = []
-            for batch_idx in range(bs):
-                attention_map = full_attention_map[batch_idx]
-                SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
-                image_features_mask = image_features_indices[batch_idx].bool()
-                attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
-                batch_attentions_list.append(attention)
-            batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
-            loss_attention += self.attention_loss(batch_attentions, masks_down)
-                             
-        loss = llm_loss + mask_loss + 0.01 * loss_attention
+        loss_attention, attention_audit, attention_stats = self._compute_attention_loss(
+            attentions=outputs.attentions,
+            SEG_token_embedding_indices=SEG_token_embedding_indices,
+            image_features_indices=image_features_indices,
+            seg_info=seg_info,
+            global_step=global_step,
+        )
+        attention_loss_weight = getattr(self.config, "attention_loss_weight", 0.01)
+        loss = llm_loss + mask_loss + attention_loss_weight * loss_attention
 
         return CausalOutputWithMask(
             loss=loss,
@@ -764,7 +1103,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_mask=loss_mask.detach(),
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
-            loss_attention=0.01 * loss_attention.detach(),
+            loss_attention=attention_loss_weight * loss_attention.detach(),
+            loss_attn_fg_bg=attention_stats["loss_attn_fg_bg"].detach(),
+            loss_attn_boundary_outer=attention_stats["loss_attn_boundary_outer"].detach(),
+            precomputed_structured_count=attention_stats["precomputed_structured_count"].detach(),
+            fallback_structured_count=attention_stats["fallback_structured_count"].detach(),
+            missing_precomputed_count=attention_stats["missing_precomputed_count"].detach(),
+            selected_attn_layers=attention_stats["selected_attn_layers"].detach(),
+            attention_audit=attention_audit,
         )
     
     def eval_seg(

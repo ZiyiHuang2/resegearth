@@ -222,6 +222,33 @@ class LLaVATrainer(Trainer):
                     if value != 0:
                         self.history_loss_dict[name] = value.item()
 
+    @staticmethod
+    def _to_float_metric(value):
+        if value is None:
+            return None
+        if torch.is_tensor(value):
+            if value.numel() == 0:
+                return None
+            return float(value.detach().float().mean().item())
+        if isinstance(value, (float, int)):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _resolve_subset_name(gt_item):
+        subset = gt_item.get("subset", None)
+        if subset is None:
+            subset = gt_item.get("subset_name", None)
+        if subset is None:
+            subset = gt_item.get("eval_subset", None)
+        if subset is None:
+            return None
+        subset = str(subset).strip().upper()
+        if subset.startswith("B"):
+            return "B"
+        if subset.startswith("R"):
+            return "R"
+        return None
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
@@ -235,8 +262,19 @@ class LLaVATrainer(Trainer):
             labels = None
         global_step = self.state.global_step
         inputs['global_step'] = global_step
-        
+        iter_start = time.perf_counter()
+        data_time = 0.0
+        if hasattr(self, "_last_iter_end_time"):
+            data_time = max(0.0, iter_start - self._last_iter_end_time)
+        forward_start = time.perf_counter()
         outputs = model(**inputs)
+        forward_time = max(0.0, time.perf_counter() - forward_start)
+        iter_time = max(0.0, time.perf_counter() - iter_start)
+        batch_size = None
+        if isinstance(inputs, dict) and "input_ids" in inputs and torch.is_tensor(inputs["input_ids"]):
+            batch_size = int(inputs["input_ids"].shape[0])
+        throughput = float(batch_size / iter_time) if batch_size is not None and iter_time > 0 else 0.0
+        self._last_iter_end_time = time.perf_counter()
 
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
@@ -254,16 +292,34 @@ class LLaVATrainer(Trainer):
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-            if isinstance(outputs, dict) and 'loss_dice' in outputs:
-                loss_dict = {}
-                for name,value in outputs.items():
+            if isinstance(outputs, dict):
+                metric_dict = {
+                    "loss": self._to_float_metric(loss),
+                    "data_time": data_time,
+                    "iter_time": iter_time,
+                    "forward_time": forward_time,
+                    "throughput": throughput,
+                }
+                for name, value in outputs.items():
                     if 'loss' in name and name != 'loss':
-                        loss_value = value.item()
-                        if loss_value == 0 and hasattr(self,'history_loss_dict'):
+                        loss_value = self._to_float_metric(value)
+                        if loss_value is None:
+                            continue
+                        if loss_value == 0 and hasattr(self,'history_loss_dict') and name in self.history_loss_dict:
                             loss_value = self.history_loss_dict[name]
-                        loss_dict[name] = loss_value
+                        metric_dict[name] = loss_value
+                for key in [
+                    "precomputed_structured_count",
+                    "fallback_structured_count",
+                    "missing_precomputed_count",
+                    "selected_attn_layers",
+                ]:
+                    if key in outputs:
+                        scalar = self._to_float_metric(outputs[key])
+                        if scalar is not None:
+                            metric_dict[key] = scalar
                 self.update_history_loss_dict(outputs)
-                self.log(loss_dict)
+                self.log({k: v for k, v in metric_dict.items() if v is not None})
 
         return (loss, outputs) if return_outputs else loss
 
@@ -358,6 +414,10 @@ class LLaVATrainer(Trainer):
         total_union = 0.0
         valid_count = 0
         eps = 1e-7
+        subset_stats = {
+            "B": {"iou_sum": 0.0, "inter": 0.0, "union": 0.0, "count": 0.0},
+            "R": {"iou_sum": 0.0, "inter": 0.0, "union": 0.0, "count": 0.0},
+        }
 
         for inputs in eval_dataloader:
             with torch.no_grad():
@@ -426,14 +486,44 @@ class LLaVATrainer(Trainer):
                 total_inter += inter
                 total_union += union
                 valid_count += 1
+                subset_name = self._resolve_subset_name(gt_item)
+                if subset_name in subset_stats:
+                    subset_stats[subset_name]["iou_sum"] += iou
+                    subset_stats[subset_name]["inter"] += inter
+                    subset_stats[subset_name]["union"] += union
+                    subset_stats[subset_name]["count"] += 1.0
 
         if dist.is_available() and dist.is_initialized():
-            stats = torch.tensor([iou_sum, total_inter, total_union, float(valid_count)], device=self.args.device)
+            stats = torch.tensor(
+                [
+                    iou_sum,
+                    total_inter,
+                    total_union,
+                    float(valid_count),
+                    subset_stats["B"]["iou_sum"],
+                    subset_stats["B"]["inter"],
+                    subset_stats["B"]["union"],
+                    subset_stats["B"]["count"],
+                    subset_stats["R"]["iou_sum"],
+                    subset_stats["R"]["inter"],
+                    subset_stats["R"]["union"],
+                    subset_stats["R"]["count"],
+                ],
+                device=self.args.device,
+            )
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             iou_sum = float(stats[0].item())
             total_inter = float(stats[1].item())
             total_union = float(stats[2].item())
             valid_count = int(stats[3].item())
+            subset_stats["B"]["iou_sum"] = float(stats[4].item())
+            subset_stats["B"]["inter"] = float(stats[5].item())
+            subset_stats["B"]["union"] = float(stats[6].item())
+            subset_stats["B"]["count"] = float(stats[7].item())
+            subset_stats["R"]["iou_sum"] = float(stats[8].item())
+            subset_stats["R"]["inter"] = float(stats[9].item())
+            subset_stats["R"]["union"] = float(stats[10].item())
+            subset_stats["R"]["count"] = float(stats[11].item())
 
         if valid_count > 0:
             eval_giou = iou_sum / valid_count
@@ -448,6 +538,18 @@ class LLaVATrainer(Trainer):
             f"{metric_key_prefix}_ciou": float(eval_ciou),
             f"{metric_key_prefix}_score": float(eval_score),
         }
+        for subset_name in ["B", "R"]:
+            cnt = subset_stats[subset_name]["count"]
+            if cnt > 0:
+                sub_giou = subset_stats[subset_name]["iou_sum"] / cnt
+                sub_ciou = subset_stats[subset_name]["inter"] / (subset_stats[subset_name]["union"] + eps)
+            else:
+                sub_giou = 0.0
+                sub_ciou = 0.0
+            sub_score = 0.5 * sub_giou + 0.5 * sub_ciou
+            metrics[f"{metric_key_prefix}_giou_{subset_name}"] = float(sub_giou)
+            metrics[f"{metric_key_prefix}_ciou_{subset_name}"] = float(sub_ciou)
+            metrics[f"{metric_key_prefix}_score_{subset_name}"] = float(sub_score)
         self.log(metrics)
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
         self._memory_tracker.stop_and_update_metrics(metrics)
