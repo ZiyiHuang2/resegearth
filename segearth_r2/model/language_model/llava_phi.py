@@ -46,6 +46,17 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     fallback_structured_count: Optional[torch.FloatTensor] = None
     missing_precomputed_count: Optional[torch.FloatTensor] = None
     selected_attn_layers: Optional[torch.FloatTensor] = None
+    structured_effective_weight: Optional[torch.FloatTensor] = None
+    structured_loss_small: Optional[torch.FloatTensor] = None
+    structured_loss_non_small: Optional[torch.FloatTensor] = None
+    structured_small_count: Optional[torch.FloatTensor] = None
+    structured_non_small_count: Optional[torch.FloatTensor] = None
+    structured_skipped_batches: Optional[torch.FloatTensor] = None
+    structured_skip_ratio: Optional[torch.FloatTensor] = None
+    loss_attn_fg_bg_small: Optional[torch.FloatTensor] = None
+    loss_attn_fg_bg_non_small: Optional[torch.FloatTensor] = None
+    loss_attn_boundary_outer_small: Optional[torch.FloatTensor] = None
+    loss_attn_boundary_outer_non_small: Optional[torch.FloatTensor] = None
     attention_audit: Optional[dict] = None
 
 class AttentionLoss(nn.Module):
@@ -804,8 +815,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
     ):
         per_layer_head = []
         per_layer_baseline = []
+        layer_indices = []
         bs = SEG_token_embedding_indices.shape[0]
-        for layer_attention in attentions:
+        for layer_idx, layer_attention in enumerate(attentions):
             layer_head_rows = []
             layer_baseline_rows = []
             for batch_idx in range(bs):
@@ -822,7 +834,126 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 continue
             per_layer_head.append(torch.stack(layer_head_rows, dim=0))  # [bs, heads, image]
             per_layer_baseline.append(torch.cat(layer_baseline_rows, dim=0))  # [bs, image]
-        return per_layer_head, per_layer_baseline
+            layer_indices.append(layer_idx)
+        return per_layer_head, per_layer_baseline, layer_indices
+
+    def _compute_structured_loss_per_instance(
+        self,
+        attention_map: torch.Tensor,
+        fg_mask: torch.Tensor,
+        boundary_map: Optional[torch.Tensor] = None,
+        outer_ring_map: Optional[torch.Tensor] = None,
+    ):
+        device = attention_map.device
+        bs = attention_map.shape[0]
+        total = torch.zeros(bs, device=device)
+        fg_bg = torch.zeros(bs, device=device)
+        boundary_outer = torch.zeros(bs, device=device)
+        margin = float(getattr(self.structured_attention_loss, "margin", 0.0))
+        fg_bg_weight = float(getattr(self.structured_attention_loss, "fg_bg_weight", 1.0))
+        boundary_outer_weight = float(getattr(self.structured_attention_loss, "boundary_outer_weight", 1.0))
+
+        for idx in range(bs):
+            attn = attention_map[idx]
+            fg = fg_mask[idx] > 0
+            bg = ~fg
+            if fg.sum() == 0 or bg.sum() == 0:
+                continue
+            fg_mean = attn[fg].mean()
+            bg_mean = attn[bg].mean()
+            fg_bg_penalty = F.relu(torch.tensor(margin, device=device) - (fg_mean - bg_mean))
+            cur_fg_bg = fg_bg_weight * fg_bg_penalty
+
+            cur_boundary_outer = torch.tensor(0.0, device=device)
+            if boundary_map is not None and outer_ring_map is not None:
+                boundary = boundary_map[idx] > 0
+                outer = outer_ring_map[idx] > 0
+                if boundary.sum() > 0 and outer.sum() > 0:
+                    boundary_mean = attn[boundary].mean()
+                    outer_mean = attn[outer].mean()
+                    bo_penalty = F.relu(torch.tensor(margin, device=device) - (boundary_mean - outer_mean))
+                    cur_boundary_outer = boundary_outer_weight * bo_penalty
+
+            fg_bg[idx] = cur_fg_bg
+            boundary_outer[idx] = cur_boundary_outer
+            total[idx] = cur_fg_bg + cur_boundary_outer
+        return total, fg_bg, boundary_outer
+
+    def _resolve_target_heads_dict(self):
+        raw = getattr(self.config, "target_heads_dict", None)
+        if raw is None:
+            return None
+        top_k_heads = int(getattr(self.config, "top_k_heads", 0) or 0)
+        if not isinstance(raw, dict):
+            raise ValueError(f"target_heads_dict must be a dict, got {type(raw)}")
+        normalized = {}
+        for k, v in raw.items():
+            try:
+                layer_idx = int(k)
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Invalid layer key in target_heads_dict: {k}") from e
+            if not isinstance(v, (list, tuple)) or len(v) == 0:
+                raise ValueError(f"target_heads_dict[{layer_idx}] must be a non-empty list")
+            try:
+                head_indices = [int(x) for x in v]
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"Invalid head list for layer {layer_idx}: {v}") from e
+            if any(x < 0 for x in head_indices):
+                raise ValueError(f"Head indices must be non-negative for layer {layer_idx}: {head_indices}")
+            if len(set(head_indices)) != len(head_indices):
+                raise ValueError(f"Duplicated head index for layer {layer_idx}: {head_indices}")
+            if top_k_heads > 0:
+                head_indices = head_indices[:top_k_heads]
+                if len(head_indices) == 0:
+                    raise ValueError(f"Layer {layer_idx} has no valid heads after top_k_heads={top_k_heads}.")
+            normalized[layer_idx] = head_indices
+        return normalized
+
+    def _log_attention_selection_once(
+        self,
+        requested_layers,
+        selected_layer_indices,
+        layer_to_head_tensor,
+        target_heads_dict,
+    ):
+        if hasattr(self, "_printed_attention_supervision_alignment"):
+            return
+        self._printed_attention_supervision_alignment = True
+        print(f"[SEG][Attention] requested target_layers = {requested_layers}")
+        print(f"[SEG][Attention] internal supervised layer indices = {selected_layer_indices}")
+        for layer_idx in selected_layer_indices:
+            head_tensor = layer_to_head_tensor[layer_idx]
+            total_heads = int(head_tensor.shape[1])
+            selected_heads = target_heads_dict[layer_idx] if target_heads_dict is not None else list(range(total_heads))
+            print(
+                f"[SEG][Attention] layer={layer_idx}, total_heads={total_heads}, "
+                f"selected_heads={selected_heads}, tensor_shape={tuple(head_tensor.shape)}"
+            )
+
+    def _get_structured_schedule_weight(self, global_step):
+        step = int(global_step) if global_step is not None else 0
+        warmup_steps = int(getattr(self.config, "structured_warmup_steps", 0) or 0)
+        decay_start = int(getattr(self.config, "structured_decay_start_step", -1) or -1)
+        decay_end = int(getattr(self.config, "structured_decay_end_step", -1) or -1)
+
+        weight = 1.0
+        if warmup_steps > 0 and step < warmup_steps:
+            weight = float(step + 1) / float(warmup_steps)
+        if decay_start >= 0 and decay_end > decay_start:
+            if step >= decay_end:
+                weight = 0.0
+            elif step >= decay_start:
+                remain = float(decay_end - step)
+                total = float(decay_end - decay_start)
+                weight = min(weight, max(0.0, remain / max(total, 1.0)))
+        return float(max(0.0, min(1.0, weight)))
+
+    def _should_log_structured_detail(self, global_step):
+        interval = int(getattr(self.config, "structured_log_interval", 50) or 0)
+        if interval <= 0:
+            return False
+        step = int(global_step) if global_step is not None else 0
+        return (step % interval) == 0
 
     def _maybe_dump_attention_audit(
         self,
@@ -880,6 +1011,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "fallback_structured_count": zero,
                 "missing_precomputed_count": zero,
                 "selected_attn_layers": zero,
+                "structured_effective_weight": zero,
+                "structured_loss_small": zero,
+                "structured_loss_non_small": zero,
+                "structured_small_count": zero,
+                "structured_non_small_count": zero,
+                "structured_skipped_batches": zero,
+                "structured_skip_ratio": zero,
+                "loss_attn_fg_bg_small": zero,
+                "loss_attn_fg_bg_non_small": zero,
+                "loss_attn_boundary_outer_small": zero,
+                "loss_attn_boundary_outer_non_small": zero,
             }
         fg_mask, boundary_map, outer_ring_map, supervision_stats = self._prepare_attention_supervision(
             seg_info=seg_info, target_hw=(27, 27), device=self.device
@@ -893,8 +1035,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "fallback_structured_count": zero,
                 "missing_precomputed_count": zero,
                 "selected_attn_layers": zero,
+                "structured_effective_weight": zero,
+                "structured_loss_small": zero,
+                "structured_loss_non_small": zero,
+                "structured_small_count": zero,
+                "structured_non_small_count": zero,
+                "structured_skipped_batches": zero,
+                "structured_skip_ratio": zero,
+                "loss_attn_fg_bg_small": zero,
+                "loss_attn_fg_bg_non_small": zero,
+                "loss_attn_boundary_outer_small": zero,
+                "loss_attn_boundary_outer_non_small": zero,
             }
-        per_layer_head, per_layer_baseline = self._extract_seg_to_image_attentions(
+        per_layer_head, per_layer_baseline, extracted_layer_indices = self._extract_seg_to_image_attentions(
             attentions=attentions,
             SEG_token_embedding_indices=SEG_token_embedding_indices,
             image_features_indices=image_features_indices,
@@ -908,33 +1061,208 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "fallback_structured_count": zero,
                 "missing_precomputed_count": zero,
                 "selected_attn_layers": zero,
+                "structured_effective_weight": zero,
+                "structured_loss_small": zero,
+                "structured_loss_non_small": zero,
+                "structured_small_count": zero,
+                "structured_non_small_count": zero,
+                "structured_skipped_batches": zero,
+                "structured_skip_ratio": zero,
+                "loss_attn_fg_bg_small": zero,
+                "loss_attn_fg_bg_non_small": zero,
+                "loss_attn_boundary_outer_small": zero,
+                "loss_attn_boundary_outer_non_small": zero,
             }
-        last_k_layers = int(getattr(self.config, "attention_loss_last_k_layers", 0) or 0)
-        if last_k_layers > 0 and len(per_layer_baseline) > last_k_layers:
-            per_layer_head = per_layer_head[-last_k_layers:]
-            per_layer_baseline = per_layer_baseline[-last_k_layers:]
-
-        selected_attn_layers = torch.tensor(float(len(per_layer_baseline)), device=fg_mask.device)
+        total_internal_layers = len(attentions)
+        layer_to_head_tensor = {
+            layer_idx: layer_head
+            for layer_idx, layer_head in zip(extracted_layer_indices, per_layer_head)
+        }
+        layer_to_baseline_tensor = {
+            layer_idx: layer_base
+            for layer_idx, layer_base in zip(extracted_layer_indices, per_layer_baseline)
+        }
         use_structured = getattr(self.config, "use_structured_attention_loss", False)
+        requested_target_layers = getattr(self.config, "target_layers", None) if use_structured else None
+        selected_layer_indices = list(extracted_layer_indices)
+        if use_structured and requested_target_layers is not None and len(requested_target_layers) > 0:
+            explicit_layers = [int(x) for x in requested_target_layers]
+            if len(set(explicit_layers)) != len(explicit_layers):
+                raise ValueError(f"Duplicated layer index in target_layers: {explicit_layers}")
+            for layer_idx in explicit_layers:
+                if layer_idx < 0 or layer_idx >= total_internal_layers:
+                    raise ValueError(
+                        f"Requested target layer {layer_idx} out of range [0, {total_internal_layers - 1}]"
+                    )
+            selected_layer_indices = explicit_layers
+        else:
+            last_k_layers = int(getattr(self.config, "attention_loss_last_k_layers", 0) or 0)
+            if last_k_layers > 0 and len(selected_layer_indices) > last_k_layers:
+                selected_layer_indices = selected_layer_indices[-last_k_layers:]
+
+        target_heads_dict = self._resolve_target_heads_dict() if use_structured else None
+        if use_structured and target_heads_dict is not None:
+            for layer_idx in selected_layer_indices:
+                if layer_idx not in target_heads_dict:
+                    raise ValueError(
+                        f"target_heads_dict missing layer {layer_idx}; selected layers={selected_layer_indices}"
+                    )
+
+        self._log_attention_selection_once(
+            requested_layers=requested_target_layers,
+            selected_layer_indices=selected_layer_indices,
+            layer_to_head_tensor=layer_to_head_tensor,
+            target_heads_dict=target_heads_dict,
+        )
+
+        selected_attn_layers = torch.tensor(float(len(selected_layer_indices)), device=fg_mask.device)
         loss_attention = torch.tensor(0.0, device=fg_mask.device)
         loss_attn_fg_bg = torch.tensor(0.0, device=fg_mask.device)
         loss_attn_boundary_outer = torch.tensor(0.0, device=fg_mask.device)
-        for baseline_attention in per_layer_baseline:
-            if use_structured:
-                layer_total, layer_fg_bg, layer_boundary_outer = self.structured_attention_loss(
-                    baseline_attention,
-                    fg_mask,
-                    boundary_map=boundary_map,
-                    outer_ring_map=outer_ring_map,
-                    return_components=True,
-                )
-                loss_attention = loss_attention + layer_total
-                loss_attn_fg_bg = loss_attn_fg_bg + layer_fg_bg
-                loss_attn_boundary_outer = loss_attn_boundary_outer + layer_boundary_outer
+        structured_effective_weight = torch.tensor(0.0, device=fg_mask.device)
+        structured_loss_small = torch.tensor(0.0, device=fg_mask.device)
+        structured_loss_non_small = torch.tensor(0.0, device=fg_mask.device)
+        structured_small_count = torch.tensor(0.0, device=fg_mask.device)
+        structured_non_small_count = torch.tensor(0.0, device=fg_mask.device)
+        loss_attn_fg_bg_small = torch.tensor(0.0, device=fg_mask.device)
+        loss_attn_fg_bg_non_small = torch.tensor(0.0, device=fg_mask.device)
+        loss_attn_boundary_outer_small = torch.tensor(0.0, device=fg_mask.device)
+        loss_attn_boundary_outer_non_small = torch.tensor(0.0, device=fg_mask.device)
+        if not hasattr(self, "_structured_total_batches"):
+            self._structured_total_batches = 0
+        if not hasattr(self, "_structured_skipped_batches"):
+            self._structured_skipped_batches = 0
+        if use_structured:
+            small_weight = float(getattr(self.config, "small_weight", 1.5))
+            small_ratio_threshold = float(getattr(self.config, "small_area_ratio_threshold", 0.01))
+            area_ratio = fg_mask.float().mean(dim=1)
+            is_small = area_ratio < small_ratio_threshold
+            structured_small_count = is_small.float().sum()
+            structured_non_small_count = (~is_small).float().sum()
+            sample_weights = torch.ones_like(area_ratio)
+            sample_weights = sample_weights + (small_weight - 1.0) * is_small.float()
+
+            per_instance_total = torch.zeros(fg_mask.shape[0], device=fg_mask.device)
+            per_instance_fg_bg = torch.zeros(fg_mask.shape[0], device=fg_mask.device)
+            per_instance_boundary_outer = torch.zeros(fg_mask.shape[0], device=fg_mask.device)
+            num_terms = 0
+
+            layer_contrib = {}
+            layer_head_map = {}
+            layer_head_contrib = {}
+            skip_reason = None
+            for layer_idx in selected_layer_indices:
+                if layer_idx not in layer_to_head_tensor:
+                    continue
+                layer_head = layer_to_head_tensor[layer_idx]  # [bs, heads, image]
+                if target_heads_dict is not None:
+                    selected_heads = target_heads_dict[layer_idx]
+                    head_count = int(layer_head.shape[1])
+                    if any(h >= head_count for h in selected_heads):
+                        raise ValueError(
+                            f"Layer {layer_idx} head index out of range; max={head_count - 1}, requested={selected_heads}"
+                        )
+                    layer_head_map[layer_idx] = [int(h) for h in selected_heads]
+                    layer_total_contrib = torch.tensor(0.0, device=fg_mask.device)
+                    layer_head_contrib[layer_idx] = {}
+                    for head_idx in selected_heads:
+                        head_attention = layer_head[:, head_idx, :]  # [bs, image]
+                        h_total, h_fg_bg, h_boundary_outer = self._compute_structured_loss_per_instance(
+                            head_attention,
+                            fg_mask,
+                            boundary_map=boundary_map,
+                            outer_ring_map=outer_ring_map,
+                        )
+                        per_instance_total = per_instance_total + h_total
+                        per_instance_fg_bg = per_instance_fg_bg + h_fg_bg
+                        per_instance_boundary_outer = per_instance_boundary_outer + h_boundary_outer
+                        layer_total_contrib = layer_total_contrib + h_total.mean()
+                        layer_head_contrib[layer_idx][int(head_idx)] = float(h_total.mean().detach().item())
+                        num_terms += 1
+                    if len(selected_heads) > 0:
+                        layer_contrib[layer_idx] = float((layer_total_contrib / float(len(selected_heads))).detach().item())
+                else:
+                    layer_head_map[layer_idx] = list(range(int(layer_head.shape[1])))
+                    baseline_attention = layer_to_baseline_tensor[layer_idx]
+                    b_total, b_fg_bg, b_boundary_outer = self._compute_structured_loss_per_instance(
+                        baseline_attention,
+                        fg_mask,
+                        boundary_map=boundary_map,
+                        outer_ring_map=outer_ring_map,
+                    )
+                    per_instance_total = per_instance_total + b_total
+                    per_instance_fg_bg = per_instance_fg_bg + b_fg_bg
+                    per_instance_boundary_outer = per_instance_boundary_outer + b_boundary_outer
+                    layer_contrib[layer_idx] = float(b_total.mean().detach().item())
+                    layer_head_contrib[layer_idx] = {"aggregated_heads_sum": float(b_total.mean().detach().item())}
+                    num_terms += 1
+
+            if num_terms == 0:
+                if len(selected_layer_indices) == 0:
+                    skip_reason = "no_valid_selected_layers"
+                else:
+                    skip_reason = "no_valid_selected_heads_or_attention"
+                strict_attention_selection = bool(getattr(self.config, "strict_attention_selection", False))
+                self._structured_total_batches += 1
+                self._structured_skipped_batches += 1
+                if strict_attention_selection:
+                    raise ValueError(f"No valid structured attention supervision terms were selected ({skip_reason}).")
+                print(f"[StructuredAttention][warn] skip structured loss at step={global_step}, reason={skip_reason}")
+                loss_attention = torch.tensor(0.0, device=fg_mask.device)
+                loss_attn_fg_bg = torch.tensor(0.0, device=fg_mask.device)
+                loss_attn_boundary_outer = torch.tensor(0.0, device=fg_mask.device)
             else:
+                self._structured_total_batches += 1
+                per_instance_total = per_instance_total / float(num_terms)
+                per_instance_fg_bg = per_instance_fg_bg / float(num_terms)
+                per_instance_boundary_outer = per_instance_boundary_outer / float(num_terms)
+                norm = sample_weights.sum().clamp_min(1e-6)
+                raw_loss_attention = (per_instance_total * sample_weights).sum() / norm
+                raw_loss_attn_fg_bg = (per_instance_fg_bg * sample_weights).sum() / norm
+                raw_loss_attn_boundary_outer = (per_instance_boundary_outer * sample_weights).sum() / norm
+                sched_weight = self._get_structured_schedule_weight(global_step)
+                structured_effective_weight = torch.tensor(float(sched_weight), device=fg_mask.device)
+                loss_attention = raw_loss_attention * structured_effective_weight
+                loss_attn_fg_bg = raw_loss_attn_fg_bg * structured_effective_weight
+                loss_attn_boundary_outer = raw_loss_attn_boundary_outer * structured_effective_weight
+
+                small_mask = is_small
+                non_small_mask = ~is_small
+                if small_mask.any():
+                    structured_loss_small = (per_instance_total[small_mask] * sample_weights[small_mask]).mean() * structured_effective_weight
+                    loss_attn_fg_bg_small = (per_instance_fg_bg[small_mask] * sample_weights[small_mask]).mean() * structured_effective_weight
+                    loss_attn_boundary_outer_small = (
+                        per_instance_boundary_outer[small_mask] * sample_weights[small_mask]
+                    ).mean() * structured_effective_weight
+                if non_small_mask.any():
+                    structured_loss_non_small = (per_instance_total[non_small_mask] * sample_weights[non_small_mask]).mean() * structured_effective_weight
+                    loss_attn_fg_bg_non_small = (
+                        per_instance_fg_bg[non_small_mask] * sample_weights[non_small_mask]
+                    ).mean() * structured_effective_weight
+                    loss_attn_boundary_outer_non_small = (
+                        per_instance_boundary_outer[non_small_mask] * sample_weights[non_small_mask]
+                    ).mean() * structured_effective_weight
+
+                if self._should_log_structured_detail(global_step):
+                    skip_ratio = float(self._structured_skipped_batches / max(self._structured_total_batches, 1))
+                    print(
+                        f"[StructuredAttention][diag] step={global_step}, selected_layers={selected_layer_indices}, "
+                        f"layer_heads={layer_head_map}, layer_contrib={layer_contrib}, layer_head_contrib={layer_head_contrib}, "
+                        f"small={int(structured_small_count.item())}, non_small={int(structured_non_small_count.item())}, "
+                        f"small_loss={float(structured_loss_small.item()):.6f}, non_small_loss={float(structured_loss_non_small.item()):.6f}, "
+                        f"fg_bg_s={float(loss_attn_fg_bg_small.item()):.6f}, fg_bg_ns={float(loss_attn_fg_bg_non_small.item()):.6f}, "
+                        f"bo_s={float(loss_attn_boundary_outer_small.item()):.6f}, bo_ns={float(loss_attn_boundary_outer_non_small.item()):.6f}, "
+                        f"fg_bg={float(loss_attn_fg_bg.item()):.6f}, boundary_outer={float(loss_attn_boundary_outer.item()):.6f}, "
+                        f"sched_w={float(structured_effective_weight.item()):.4f}, skipped={self._structured_skipped_batches}/{self._structured_total_batches} ({skip_ratio:.4f})"
+                    )
+        else:
+            for layer_idx in selected_layer_indices:
+                baseline_attention = layer_to_baseline_tensor[layer_idx]
                 loss_attention = loss_attention + self.attention_loss(baseline_attention, fg_mask)
+
+        selected_layer_head_tensors = [layer_to_head_tensor[x] for x in selected_layer_indices]
         audit_payload = self._maybe_dump_attention_audit(
-            per_layer_head=per_layer_head,
+            per_layer_head=selected_layer_head_tensors,
             fg_mask=fg_mask,
             boundary_map=boundary_map,
             outer_ring_map=outer_ring_map,
@@ -954,6 +1282,20 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 supervision_stats["missing_precomputed_count"], device=fg_mask.device, dtype=torch.float32
             ),
             "selected_attn_layers": selected_attn_layers,
+            "structured_effective_weight": structured_effective_weight,
+            "structured_loss_small": structured_loss_small,
+            "structured_loss_non_small": structured_loss_non_small,
+            "structured_small_count": structured_small_count,
+            "structured_non_small_count": structured_non_small_count,
+            "structured_skipped_batches": torch.tensor(float(self._structured_skipped_batches), device=fg_mask.device),
+            "structured_skip_ratio": torch.tensor(
+                float(self._structured_skipped_batches / max(self._structured_total_batches, 1)),
+                device=fg_mask.device,
+            ),
+            "loss_attn_fg_bg_small": loss_attn_fg_bg_small,
+            "loss_attn_fg_bg_non_small": loss_attn_fg_bg_non_small,
+            "loss_attn_boundary_outer_small": loss_attn_boundary_outer_small,
+            "loss_attn_boundary_outer_non_small": loss_attn_boundary_outer_non_small,
         }
         return loss_attention, audit_payload, stats
            
@@ -1110,6 +1452,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
             fallback_structured_count=attention_stats["fallback_structured_count"].detach(),
             missing_precomputed_count=attention_stats["missing_precomputed_count"].detach(),
             selected_attn_layers=attention_stats["selected_attn_layers"].detach(),
+            structured_effective_weight=attention_stats["structured_effective_weight"].detach(),
+            structured_loss_small=attention_stats["structured_loss_small"].detach(),
+            structured_loss_non_small=attention_stats["structured_loss_non_small"].detach(),
+            structured_small_count=attention_stats["structured_small_count"].detach(),
+            structured_non_small_count=attention_stats["structured_non_small_count"].detach(),
+            structured_skipped_batches=attention_stats["structured_skipped_batches"].detach(),
+            structured_skip_ratio=attention_stats["structured_skip_ratio"].detach(),
+            loss_attn_fg_bg_small=attention_stats["loss_attn_fg_bg_small"].detach(),
+            loss_attn_fg_bg_non_small=attention_stats["loss_attn_fg_bg_non_small"].detach(),
+            loss_attn_boundary_outer_small=attention_stats["loss_attn_boundary_outer_small"].detach(),
+            loss_attn_boundary_outer_non_small=attention_stats["loss_attn_boundary_outer_non_small"].detach(),
             attention_audit=attention_audit,
         )
     

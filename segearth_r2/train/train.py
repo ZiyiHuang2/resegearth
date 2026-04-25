@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
@@ -109,6 +110,75 @@ class TrainingArguments(transformers.TrainingArguments):
     structured_fg_bg_weight: float = field(default=1.0)
     structured_boundary_outer_weight: float = field(default=1.0)
     structured_attention_margin: float = field(default=0.0)
+    target_layers: Optional[str] = field(default=None)
+    target_heads_config_path: Optional[str] = field(default=None)
+    top_k_heads: int = field(default=4)
+    small_weight: float = field(default=1.5)
+    small_area_ratio_threshold: float = field(default=0.01)
+    structured_warmup_steps: int = field(default=0)
+    structured_decay_start_step: int = field(default=-1)
+    structured_decay_end_step: int = field(default=-1)
+    strict_attention_selection: bool = field(default=False)
+    structured_log_interval: int = field(default=50)
+
+
+def _parse_target_layers(target_layers_raw: Optional[str]):
+    if target_layers_raw is None:
+        return None
+    text = str(target_layers_raw).strip()
+    if text == "":
+        return None
+    if text.startswith("[") and text.endswith("]"):
+        text = text[1:-1]
+    tokens = [x.strip() for x in text.split(",") if x.strip() != ""]
+    if len(tokens) == 0:
+        raise ValueError(f"Invalid --target_layers value: {target_layers_raw}")
+    try:
+        layers = [int(x) for x in tokens]
+    except ValueError as e:
+        raise ValueError(f"Invalid --target_layers value: {target_layers_raw}") from e
+    if len(set(layers)) != len(layers):
+        raise ValueError(f"Duplicated layer index in --target_layers: {layers}")
+    if min(layers) < 0:
+        raise ValueError(f"Layer indices must be non-negative: {layers}")
+    return layers
+
+
+def _load_target_heads_dict(config_path: Optional[str], top_k_heads: int):
+    if config_path is None:
+        return None
+    path = os.path.abspath(config_path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"target heads config file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict) or len(payload) == 0:
+        raise ValueError("target heads config must be a non-empty dict like {\"24\": [1,2,3,4]}")
+
+    normalized = {}
+    for k, v in payload.items():
+        try:
+            layer_idx = int(k)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid layer key in target heads config: {k}") from e
+        if layer_idx < 0:
+            raise ValueError(f"Layer index in target heads config must be non-negative: {layer_idx}")
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError(f"Heads for layer {layer_idx} must be a non-empty list")
+        try:
+            head_indices = [int(x) for x in v]
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid head index list for layer {layer_idx}: {v}") from e
+        if any(x < 0 for x in head_indices):
+            raise ValueError(f"Head indices must be non-negative for layer {layer_idx}: {head_indices}")
+        if len(set(head_indices)) != len(head_indices):
+            raise ValueError(f"Duplicated head index for layer {layer_idx}: {head_indices}")
+        if top_k_heads > 0:
+            head_indices = head_indices[:top_k_heads]
+            if len(head_indices) == 0:
+                raise ValueError(f"Layer {layer_idx} has no valid heads after top_k_heads={top_k_heads}.")
+        normalized[layer_idx] = head_indices
+    return normalized
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -256,6 +326,14 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    parsed_target_layers = None
+    parsed_target_heads_dict = None
+    if training_args.use_structured_attention_loss:
+        parsed_target_layers = _parse_target_layers(training_args.target_layers)
+        parsed_target_heads_dict = _load_target_heads_dict(
+            training_args.target_heads_config_path,
+            training_args.top_k_heads,
+        )
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
@@ -283,6 +361,17 @@ def train():
     model.config.structured_fg_bg_weight = training_args.structured_fg_bg_weight
     model.config.structured_boundary_outer_weight = training_args.structured_boundary_outer_weight
     model.config.structured_attention_margin = training_args.structured_attention_margin
+    model.config.target_layers = parsed_target_layers
+    model.config.target_heads_dict = parsed_target_heads_dict
+    model.config.target_heads_config_path = training_args.target_heads_config_path
+    model.config.top_k_heads = training_args.top_k_heads
+    model.config.small_weight = training_args.small_weight
+    model.config.small_area_ratio_threshold = training_args.small_area_ratio_threshold
+    model.config.structured_warmup_steps = training_args.structured_warmup_steps
+    model.config.structured_decay_start_step = training_args.structured_decay_start_step
+    model.config.structured_decay_end_step = training_args.structured_decay_end_step
+    model.config.strict_attention_selection = training_args.strict_attention_selection
+    model.config.structured_log_interval = training_args.structured_log_interval
     model.config.use_precomputed_structured_maps = data_args.use_precomputed_structured_maps
     model.config.structured_map_dir = data_args.structured_map_dir
 

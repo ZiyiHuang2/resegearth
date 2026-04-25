@@ -313,6 +313,17 @@ class LLaVATrainer(Trainer):
                     "fallback_structured_count",
                     "missing_precomputed_count",
                     "selected_attn_layers",
+                    "structured_effective_weight",
+                    "structured_small_count",
+                    "structured_non_small_count",
+                    "structured_skipped_batches",
+                    "structured_skip_ratio",
+                    "structured_loss_small",
+                    "structured_loss_non_small",
+                    "loss_attn_fg_bg_small",
+                    "loss_attn_fg_bg_non_small",
+                    "loss_attn_boundary_outer_small",
+                    "loss_attn_boundary_outer_non_small",
                 ]:
                     if key in outputs:
                         scalar = self._to_float_metric(outputs[key])
