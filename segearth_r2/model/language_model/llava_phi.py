@@ -78,9 +78,9 @@ class SegEarthR2Model(MiphaPhiModel):
         if hasattr(config, "mm_vision_tower"):
             swin_type = getattr(config,'swin_type','base')
             if swin_type == 'base':
-                self.vision_tower_mask = build_swin_b(None)
+                self.vision_tower_mask = build_swin_b(None, text_cond_dim=config.hidden_size)
             else:
-                self.vision_tower_mask = build_swin_l(None)
+                self.vision_tower_mask = build_swin_l(None, text_cond_dim=config.hidden_size)
 
             self.vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
 
@@ -104,10 +104,10 @@ class SegEarthR2Model(MiphaPhiModel):
         swin_type = getattr(model_args,'swin_type','base')
         self.config.swin_type = swin_type
         if swin_type == 'base':
-            vision_tower_mask = build_swin_b(vision_tower_mask)
+            vision_tower_mask = build_swin_b(vision_tower_mask, text_cond_dim=self.config.hidden_size)
         else:
             print('current visual encoder is swin large')
-            vision_tower_mask = build_swin_l(vision_tower_mask)
+            vision_tower_mask = build_swin_l(vision_tower_mask, text_cond_dim=self.config.hidden_size)
 
         if fsdp is not None and len(fsdp) > 0:
             self.vision_tower_mask = [vision_tower_mask]
@@ -185,8 +185,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print(diff_predictor_msg)
             print(diff_pixel_msg)
 
-    def get_vision_tower_feature(self, images):
-        features = self.get_model().get_vision_tower_mask()(images)
+    def get_vision_tower_feature(self, images, text_cond=None):
+        features = self.get_model().get_vision_tower_mask()(images, text_cond=text_cond)
         
         features_dict = {
             'res2': features[0], # bs, 128, 256, 256
@@ -361,6 +361,101 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return None
         embedded_refer = self.get_model().embed_tokens(refer_ids)
         return embedded_refer
+
+    def _resolve_pad_token_id(self):
+        pad_id = getattr(self.config, "pad_token_id", None)
+        if pad_id is not None:
+            return pad_id
+        model_cfg = getattr(self.get_model(), "config", None)
+        if model_cfg is not None:
+            pad_id = getattr(model_cfg, "pad_token_id", None)
+            if pad_id is not None:
+                return pad_id
+        generation_cfg = getattr(self, "generation_config", None)
+        if generation_cfg is not None:
+            pad_id = getattr(generation_cfg, "pad_token_id", None)
+            if pad_id is not None:
+                return pad_id
+        embed_tokens = self.get_model().embed_tokens
+        pad_id = getattr(embed_tokens, "padding_idx", None)
+        return pad_id
+
+    def build_text_condition(self, token_refer_id, batch_size=None, device=None):
+        if token_refer_id is None:
+            return None
+
+        embed_tokens = self.get_model().embed_tokens
+        text_dim = self.config.hidden_size
+        dtype = embed_tokens.weight.dtype
+        if device is None:
+            device = embed_tokens.weight.device
+        pad_id = self._resolve_pad_token_id()
+        zero_vec = torch.zeros(text_dim, device=device, dtype=dtype)
+
+        if torch.is_tensor(token_refer_id):
+            if token_refer_id.dim() == 0:
+                refer_items = [token_refer_id.view(1)]
+            elif token_refer_id.dim() == 1:
+                refer_items = [token_refer_id]
+            elif token_refer_id.dim() == 2:
+                refer_items = [token_refer_id[i] for i in range(token_refer_id.shape[0])]
+            else:
+                raise ValueError(f"Unsupported token_refer_id tensor dim: {token_refer_id.dim()}")
+        elif isinstance(token_refer_id, (list, tuple)):
+            refer_items = list(token_refer_id)
+        else:
+            refer_items = [None]
+
+        if batch_size is None:
+            batch_size = len(refer_items)
+
+        if len(refer_items) < batch_size:
+            refer_items.extend([None] * (batch_size - len(refer_items)))
+        elif len(refer_items) > batch_size:
+            refer_items = refer_items[:batch_size]
+
+        text_conditions = []
+        for refer_ids in refer_items:
+            if refer_ids is None:
+                text_conditions.append(zero_vec.clone())
+                continue
+
+            if isinstance(refer_ids, (list, tuple)):
+                valid_tensors = [x.view(-1) for x in refer_ids if torch.is_tensor(x) and x.numel() > 0]
+                if not valid_tensors:
+                    text_conditions.append(zero_vec.clone())
+                    continue
+                refer_ids = torch.cat(valid_tensors, dim=0)
+
+            if not torch.is_tensor(refer_ids):
+                text_conditions.append(zero_vec.clone())
+                continue
+
+            refer_ids = refer_ids.to(device=device, dtype=torch.long).view(-1)
+            if refer_ids.numel() == 0:
+                text_conditions.append(zero_vec.clone())
+                continue
+
+            if pad_id is not None:
+                refer_ids = refer_ids[refer_ids.ne(pad_id)]
+            # Fallback when pad_id is unavailable: keep all tokens to avoid dropping real refer tokens.
+
+            if refer_ids.numel() == 0:
+                text_conditions.append(zero_vec.clone())
+                continue
+
+            refer_embed = self.embed_refer_ids(refer_ids)
+            if refer_embed is None or refer_embed.numel() == 0:
+                text_conditions.append(zero_vec.clone())
+                continue
+
+            if refer_embed.dim() == 1:
+                refer_embed = refer_embed.unsqueeze(0)
+            pooled = refer_embed.mean(dim=0)
+            pooled = F.layer_norm(pooled.float(), (pooled.shape[-1],)).to(device=device, dtype=dtype)
+            text_conditions.append(pooled)
+
+        return torch.stack(text_conditions, dim=0)
 
     def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
@@ -636,7 +731,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
-                image_features = self.get_vision_tower_feature(images)
+                text_cond = self.build_text_condition(
+                    token_refer_id=token_refer_id,
+                    batch_size=input_ids.shape[0],
+                    device=images.device,
+                )
+                image_features = self.get_vision_tower_feature(images, text_cond=text_cond)
                 bs = input_ids.shape[0]
             
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
@@ -730,30 +830,38 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
 
-        loss_attention = None
-        masks = [_seg_info['mask'] for _seg_info in seg_info]
-        masks_resized = [
-            F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
-            for m in masks
-        ]
-        masks = torch.stack(masks_resized, dim=0) # [4, 1, 800, 800]
-        masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
-        masks_down = masks_down.view(masks_down.size(0), -1)
-        masks_down[masks_down > 0] = 1
-        
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
-        for full_attention_map in attentions:
-            batch_attentions_list = []
-            for batch_idx in range(bs):
-                attention_map = full_attention_map[batch_idx]
-                SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
-                image_features_mask = image_features_indices[batch_idx].bool()
-                attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
-                batch_attentions_list.append(attention)
-            batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
-            loss_attention += self.attention_loss(batch_attentions, masks_down)
-                             
-        loss = llm_loss + mask_loss + 0.01 * loss_attention
+        use_attention_loss = getattr(self.config, "use_attention_loss", True)
+        if use_attention_loss:
+            masks = [_seg_info['mask'] for _seg_info in seg_info]
+            masks_resized = [
+                F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
+                for m in masks
+            ]
+            masks = torch.stack(masks_resized, dim=0) # [4, 1, 800, 800]
+            masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
+            masks_down = masks_down.view(masks_down.size(0), -1)
+            masks_down[masks_down > 0] = 1
+            
+            loss_attention = torch.tensor(0.0, device=mask_loss.device)
+            for full_attention_map in attentions:
+                batch_attentions_list = []
+                for batch_idx in range(bs):
+                    attention_map = full_attention_map[batch_idx]
+                    SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
+                    image_features_mask = image_features_indices[batch_idx].bool()
+                    attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
+                    batch_attentions_list.append(attention)
+                batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
+                loss_attention += self.attention_loss(batch_attentions, masks_down)
+        else:
+            zero_base = llm_loss if llm_loss is not None else mask_loss
+            if zero_base is None:
+                zero_base = logits.sum() * 0.0
+            loss_attention = torch.zeros_like(zero_base)
+
+        loss = llm_loss + mask_loss
+        if use_attention_loss:
+            loss = loss + 0.01 * loss_attention
 
         return CausalOutputWithMask(
             loss=loss,
@@ -764,7 +872,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_mask=loss_mask.detach(),
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
-            loss_attention=0.01 * loss_attention.detach(),
+            loss_attention=(0.01 * loss_attention.detach()) if use_attention_loss else torch.zeros_like(loss_attention.detach()),
         )
     
     def eval_seg(
@@ -789,7 +897,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        image_features = self.get_vision_tower_feature(images)
+        text_cond = self.build_text_condition(
+            token_refer_id=token_refer_id,
+            batch_size=input_ids.shape[0],
+            device=images.device,
+        )
+        image_features = self.get_vision_tower_feature(images, text_cond=text_cond)
 
         input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,

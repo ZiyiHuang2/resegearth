@@ -443,6 +443,39 @@ class PatchEmbed(nn.Module):
         return x
 
 
+class TextGuidedResidualGate(nn.Module):
+    def __init__(self, feat_dim, text_dim, hidden_dim=None, pool_size=2):
+        super().__init__()
+        if hidden_dim is None:
+            hidden_dim = max(feat_dim, min(text_dim, feat_dim * 2))
+        self.gate_pool = nn.AvgPool2d(kernel_size=pool_size, stride=pool_size)
+        self.v_proj = nn.Conv2d(feat_dim, feat_dim, kernel_size=1, bias=True)
+        self.t_proj = nn.Sequential(
+            nn.Linear(text_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, feat_dim),
+        )
+        self.alpha = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x_feat, text_cond=None):
+        if text_cond is None:
+            return x_feat
+
+        if text_cond.dim() == 1:
+            text_cond = text_cond.unsqueeze(0)
+        if text_cond.shape[0] != x_feat.shape[0]:
+            raise ValueError(
+                f"text_cond batch {text_cond.shape[0]} does not match feature batch {x_feat.shape[0]}"
+            )
+
+        gate_feat = self.gate_pool(x_feat)
+        text_bias = self.t_proj(text_cond).to(dtype=gate_feat.dtype, device=gate_feat.device)
+        text_bias = text_bias.unsqueeze(-1).unsqueeze(-1)
+        gate_lowres = torch.sigmoid(self.v_proj(gate_feat) + text_bias)
+        gate = F.interpolate(gate_lowres, size=x_feat.shape[-2:], mode='bilinear', align_corners=False)
+        return x_feat * (1.0 + self.alpha * gate)
+
+
 class SwinTransformer(nn.Module):
     """ Swin Transformer backbone.
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -491,7 +524,8 @@ class SwinTransformer(nn.Module):
                  patch_norm=True,
                  out_indices=(0, 1, 2, 3),
                  frozen_stages=-1,
-                 use_checkpoint=False):
+                 use_checkpoint=False,
+                 text_cond_dim=2560):
         super().__init__()
 
         self.pretrain_img_size = pretrain_img_size
@@ -542,6 +576,10 @@ class SwinTransformer(nn.Module):
 
         num_features = [int(embed_dim * 2 ** i) for i in range(self.num_layers)]
         self.num_features = num_features
+        self.mid_stage_text_recalibration = TextGuidedResidualGate(
+            feat_dim=self.num_features[2],
+            text_dim=text_cond_dim
+        )
 
         # add a norm layer for each output
         for i_layer in out_indices:
@@ -598,14 +636,25 @@ class SwinTransformer(nn.Module):
             weights = get_w(ckpt['state_dict' if 'state_dict' in ckpt else 'model'],'backbone')
             if pretrained.endswith('.pkl'):
                 weights = {k:torch.tensor(v) for k,v in weights.items()}
-            self.load_state_dict(weights)
+            load_msg = self.load_state_dict(weights, strict=False)
+            missing_keys = list(getattr(load_msg, "missing_keys", []))
+            unexpected_keys = list(getattr(load_msg, "unexpected_keys", []))
+            expected_missing_prefixes = ("mid_stage_text_recalibration.",)
+            expected_missing = [k for k in missing_keys if k.startswith(expected_missing_prefixes)]
+            unexpected_missing = [k for k in missing_keys if not k.startswith(expected_missing_prefixes)]
+            if expected_missing:
+                print(f"[Swin init] expected missing keys ({len(expected_missing)}): {expected_missing}")
+            if unexpected_missing:
+                print(f"[Swin init][WARNING] unexpected missing keys ({len(unexpected_missing)}): {unexpected_missing}")
+            if unexpected_keys:
+                print(f"[Swin init][WARNING] unexpected keys ({len(unexpected_keys)}): {unexpected_keys}")
             print('load swin pretrain model successfully')
         elif pretrained is None:
             self.apply(_init_weights)
         else:
             raise TypeError('pretrained must be a str or None')
 
-    def forward(self, x):
+    def forward(self, x, text_cond=None):
         """Forward function."""
         x = self.patch_embed(x)
 
@@ -628,6 +677,8 @@ class SwinTransformer(nn.Module):
                 x_out = norm_layer(x_out)
 
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
+                if i == 2:
+                    out = self.mid_stage_text_recalibration(out, text_cond=text_cond)
                 outs.append(out)
 
         return tuple(outs)
@@ -637,7 +688,7 @@ class SwinTransformer(nn.Module):
         super(SwinTransformer, self).train(mode)
         self._freeze_stages()
 
-def build_swin_t(pretrain=None):
+def build_swin_t(pretrain=None, text_cond_dim=2560):
     model = SwinTransformer(
         embed_dim=96,
         depths=[2, 2, 6, 2],
@@ -652,12 +703,13 @@ def build_swin_t(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        text_cond_dim=text_cond_dim)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_b(pretrain=None):
+def build_swin_b(pretrain=None, text_cond_dim=2560):
     model = SwinTransformer(
         embed_dim=128,
         depths=[2, 2, 18, 2],
@@ -672,12 +724,13 @@ def build_swin_b(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        text_cond_dim=text_cond_dim)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_s(pretrain=None):
+def build_swin_s(pretrain=None, text_cond_dim=2560):
     model = SwinTransformer(
         embed_dim=96,
         depths=[2, 2, 18, 2],
@@ -692,12 +745,13 @@ def build_swin_s(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        text_cond_dim=text_cond_dim)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_l(pretrain=None):
+def build_swin_l(pretrain=None, text_cond_dim=2560):
     model = SwinTransformer(
         pretrain_img_size=384,
         embed_dim=192,
@@ -713,7 +767,8 @@ def build_swin_l(pretrain=None):
         ape=False,
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
-        use_checkpoint=False)
+        use_checkpoint=False,
+        text_cond_dim=text_cond_dim)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model

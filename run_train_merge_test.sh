@@ -7,7 +7,7 @@ set -euo pipefail
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export WANDB_PROJECT=segearth-standard
-export WANDB_NAME=base
+export WANDB_NAME=base-siglip1
 export WANDB_INIT_TIMEOUT=300
 unset CUDA_VISIBLE_DEVICES
 
@@ -25,7 +25,7 @@ cd "${REPO_DIR}"
 # Common paths
 ########################################
 MODEL_NAME_OR_PATH="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B"
-VISION_TOWER="/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip2-so400m-patch14-384"
+VISION_TOWER="/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384"
 VISION_TOWER_MASK="/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl"
 MASK_CONFIG="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
 
@@ -39,7 +39,7 @@ TEST_SPLIT="test"
 ########################################
 # Output
 ########################################
-OUTPUT_DIR="/home/wangchengjun/huangziyi/reseg/output/standard-base"
+OUTPUT_DIR="/home/wangchengjun/huangziyi/reseg/output/standard-base-siglip1"
 MERGED_DIR="${OUTPUT_DIR}/merged_model"
 TEST_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
 

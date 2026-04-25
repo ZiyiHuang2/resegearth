@@ -8,6 +8,8 @@ from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
 import copy
+import torch
+import torch.nn as nn
 from deepspeed.profiling.flops_profiler import get_model_profile
 
 from segearth_r2.datasets.dataset import *
@@ -26,6 +28,9 @@ class ModelArguments:
     freeze_backbone: bool = field(default=False)
     train_clip_backbone: bool = field(default=False)
     train_swin_backbone: bool = field(default=False)
+    use_attention_loss: bool = field(default=True)
+    train_midstage_recalibration: bool = field(default=True)
+    stage3_norm_only: bool = field(default=False)
 
     vision_tower: str = "pretrained_model/CLIP/siglip-so400m-patch14-384"
     vision_tower_mask: str = "pretrained_model/mask2former/maskformer2_swin_base_IN21k_384_bs16_50ep.pkl"
@@ -136,6 +141,89 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
             lora_module_names.add(name)
 
     return sorted(list(lora_module_names))
+
+
+def _set_module_requires_grad(module, requires_grad=True):
+    if module is None:
+        return
+    for param in module.parameters():
+        param.requires_grad = requires_grad
+
+
+def _enable_midstage_text_recalibration_trainable(model, norm_only=False):
+    vision_tower_mask = model.get_model().get_vision_tower_mask()
+    if vision_tower_mask is None:
+        return
+
+    if hasattr(vision_tower_mask, "mid_stage_text_recalibration"):
+        _set_module_requires_grad(vision_tower_mask.mid_stage_text_recalibration, True)
+
+    if not hasattr(vision_tower_mask, "layers") or len(vision_tower_mask.layers) <= 2:
+        return
+
+    stage3 = vision_tower_mask.layers[2]
+    for module in stage3.modules():
+        if isinstance(module, nn.LayerNorm):
+            _set_module_requires_grad(module, True)
+
+    if hasattr(vision_tower_mask, "norm2"):
+        _set_module_requires_grad(vision_tower_mask.norm2, True)
+
+    if not norm_only and hasattr(stage3, "blocks") and len(stage3.blocks) > 0:
+        _set_module_requires_grad(stage3.blocks[-1], True)
+
+
+def _is_rank0(local_rank_value):
+    return local_rank_value in (None, -1, 0)
+
+
+def log_midstage_recalibration_trainable_params(model, local_rank_value=0, max_show=8):
+    if not _is_rank0(local_rank_value):
+        return
+
+    raw_model = model.base_model.model if hasattr(model, "base_model") and hasattr(model.base_model, "model") else model
+    if not hasattr(raw_model, "get_model"):
+        print("[MidStage trainable] unable to inspect model wrapper")
+        return
+
+    core_model = raw_model.get_model()
+    vision_tower_mask = core_model.get_vision_tower_mask()
+    if vision_tower_mask is None or not hasattr(vision_tower_mask, "layers") or len(vision_tower_mask.layers) <= 2:
+        print("[MidStage trainable] vision_tower_mask/stage3 not available")
+        return
+
+    stage3 = vision_tower_mask.layers[2]
+    last_block_idx = len(stage3.blocks) - 1 if hasattr(stage3, "blocks") and len(stage3.blocks) > 0 else None
+
+    named_params = list(raw_model.named_parameters())
+    midstage_prefix = "model.vision_tower_mask.mid_stage_text_recalibration."
+    stage3_last_block_prefix = None if last_block_idx is None else f"model.vision_tower_mask.layers.2.blocks.{last_block_idx}."
+
+    midstage_params = [(n, p) for n, p in named_params if n.startswith(midstage_prefix)]
+    stage3_last_block_params = [] if stage3_last_block_prefix is None else [(n, p) for n, p in named_params if n.startswith(stage3_last_block_prefix)]
+    stage3_norm_params = [
+        (n, p) for n, p in named_params
+        if (n.startswith("model.vision_tower_mask.layers.2.") and ".norm" in n)
+        or n.startswith("model.vision_tower_mask.norm2.")
+    ]
+
+    def _count_trainable(param_items):
+        trainable_items = [name for name, param in param_items if param.requires_grad]
+        return len(param_items), len(trainable_items), trainable_items
+
+    mid_total, mid_trainable, mid_names = _count_trainable(midstage_params)
+    blk_total, blk_trainable, blk_names = _count_trainable(stage3_last_block_params)
+    norm_total, norm_trainable, norm_names = _count_trainable(stage3_norm_params)
+
+    print(f"[MidStage trainable] module(mid_stage_text_recalibration): total={mid_total}, trainable={mid_trainable}")
+    if mid_trainable == 0:
+        print("[MidStage trainable][WARNING] no trainable params in mid_stage_text_recalibration")
+    print(f"[MidStage trainable] stage3 last block: total={blk_total}, trainable={blk_trainable}")
+    print(f"[MidStage trainable] stage3 norm params: total={norm_total}, trainable={norm_trainable}")
+
+    sample_names = (mid_names + blk_names + norm_names)[:max_show]
+    if sample_names:
+        print(f"[MidStage trainable] sample trainable params: {sample_names}")
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -264,6 +352,7 @@ def train():
         model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.config.use_cache = False
+    model.config.use_attention_loss = model_args.use_attention_loss
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -317,6 +406,12 @@ def train():
         if not model_args.train_swin_backbone:
             model.model.vision_tower_mask.requires_grad_(False)
 
+        if model_args.train_midstage_recalibration:
+            _enable_midstage_text_recalibration_trainable(
+                model,
+                norm_only=model_args.stage3_norm_only
+            )
+
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
             for p in model.get_model().mm_projector.parameters():
@@ -325,7 +420,7 @@ def train():
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration",
     ]
 
     if model_args.train_swin_backbone:
@@ -355,6 +450,15 @@ def train():
                 ]):
 
                 p.requires_grad = True
+
+        if model_args.train_midstage_recalibration:
+            _enable_midstage_text_recalibration_trainable(
+                model,
+                norm_only=model_args.stage3_norm_only
+            )
+
+    if model_args.train_midstage_recalibration:
+        log_midstage_recalibration_trainable_params(model, local_rank_value=training_args.local_rank)
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
     
