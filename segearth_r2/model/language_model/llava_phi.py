@@ -174,10 +174,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.lgce_guidance_dim        # 256
         )
 
-        self.lgce_variant = getattr(self.config, "lgce_variant", "baseline")
+        self.lgce_variant = getattr(self.config, "lgce_variant", "rebuild_sentence")
 
         if self.use_lgce_bridge:
-            if self.lgce_variant == "baseline":
+            if self.lgce_variant == "rebuild_sentence":
                 self.lgce_bridge = LanguageGuidedCrossScaleBridge(
                     text_dim=self.lgce_guidance_dim,
                     res3_channels=input_shape["res3"].channel,
@@ -798,7 +798,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             sample_guidance = self.build_sample_guidance_from_seg(seg_embedding, mask_num)
         if self.use_lgce_bridge:
             image_features_before = image_features
-            if self.lgce_variant == "baseline":
+            if self.lgce_variant == "rebuild_sentence":
                 image_features = self.lgce_bridge(image_features, sample_guidance)
             elif self.lgce_variant == "v1_dual_concat":
                 image_features = self.lgce_v1_fuser(image_features, sample_guidance)

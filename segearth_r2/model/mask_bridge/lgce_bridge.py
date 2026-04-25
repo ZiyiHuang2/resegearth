@@ -6,7 +6,10 @@ import torch.nn.functional as F
 
 
 class LanguageGuidedCrossScaleBridge(nn.Module):
-    """Lightweight sentence-guided dual-scale bridge for res3/res4."""
+    """Lightweight sentence-guided dual-scale bridge for res3/res4 (lgce_variant=rebuild_sentence).
+
+    Reconstructs the sentence_mean guidance path from current code; not asserted to match any historical checkpoint.
+    """
 
     def __init__(
         self,
@@ -83,6 +86,8 @@ class LightweightDualScaleLGCE(nn.Module):
             nn.GELU(),
             nn.Conv2d(res4_channels, res4_channels, kernel_size=1, bias=False),
         )
+        self.gamma3 = nn.Parameter(torch.zeros(1))
+        self.gamma4 = nn.Parameter(torch.zeros(1))
 
     def forward(self, image_features, sample_guidance):
         res3 = image_features["res3"]
@@ -92,7 +97,10 @@ class LightweightDualScaleLGCE(nn.Module):
         text3 = self.text_proj_res3(sample_guidance).view(B, -1, 1, 1).expand_as(res3)
         text4 = self.text_proj_res4(sample_guidance).view(B, -1, 1, 1).expand_as(res4)
 
+        fused_res3 = self.fuse_res3(torch.cat([res3, text3], dim=1))
+        fused_res4 = self.fuse_res4(torch.cat([res4, text4], dim=1))
+
         out = dict(image_features)
-        out["res3"] = self.fuse_res3(torch.cat([res3, text3], dim=1))
-        out["res4"] = self.fuse_res4(torch.cat([res4, text4], dim=1))
+        out["res3"] = res3 + self.gamma3 * fused_res3
+        out["res4"] = res4 + self.gamma4 * fused_res4
         return out

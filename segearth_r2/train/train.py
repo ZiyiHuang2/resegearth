@@ -43,7 +43,13 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
-    lgce_variant: Optional[str] = field(default="baseline")
+    lgce_variant: str = field(
+        default="rebuild_sentence",
+        metadata={
+            "help": "训练分支强制二选一：rebuild_sentence 或 v1_dual_concat",
+            "choices": ["rebuild_sentence", "v1_dual_concat"],
+        },
+    )
 
 @dataclass
 class DataArguments:
