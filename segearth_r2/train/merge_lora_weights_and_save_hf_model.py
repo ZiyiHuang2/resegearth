@@ -37,6 +37,11 @@ def parse_args(args):
     parser.add_argument(
         "--mask_config", default="./segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
     )
+    parser.add_argument("--use_mstva", default=False, type=bool)
+    parser.add_argument("--mstva_align_dim", default=256, type=int)
+    parser.add_argument("--use_mstva_loss", default=False, type=bool)
+    parser.add_argument("--mstva_loss_weight", default=0.0, type=float)
+    parser.add_argument("--mstva_scale_weights", default="0.5,0.3,0.2", type=str)
 
     parser.add_argument("--lora_enable", default=True, type=bool)
     parser.add_argument("--lora_r", default=8, type=int)
@@ -92,6 +97,15 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    model.config.use_mstva = bool(getattr(model_args, "use_mstva", False))
+    model.config.mstva_align_dim = int(getattr(model_args, "mstva_align_dim", 256))
+    model.config.use_mstva_loss = bool(getattr(model_args, "use_mstva_loss", False))
+    model.config.mstva_loss_weight = float(getattr(model_args, "mstva_loss_weight", 0.0))
+    model.config.mstva_scale_weights = str(getattr(model_args, "mstva_scale_weights", "0.5,0.3,0.2"))
+    if hasattr(model_args, "mstva_max_spatial_tokens"):
+        model.config.mstva_max_spatial_tokens = int(getattr(model_args, "mstva_max_spatial_tokens"))
+    if hasattr(model_args, "mstva_pool_large_scale"):
+        model.config.mstva_pool_large_scale = bool(getattr(model_args, "mstva_pool_large_scale"))
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
@@ -107,7 +121,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     vision_tower.to(device=device)
 
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration", "mstva",
     ]
 
     if model_args.lora_enable:

@@ -39,6 +39,12 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_midstage_gate: Optional[torch.FloatTensor] = None
+    midstage_gate_alpha: Optional[torch.FloatTensor] = None
+    loss_mstva_align: Optional[torch.FloatTensor] = None
+    mstva_alpha3: Optional[torch.FloatTensor] = None
+    mstva_alpha4: Optional[torch.FloatTensor] = None
+    mstva_alpha5: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -76,11 +82,30 @@ class SegEarthR2Model(MiphaPhiModel):
         self.projector_outdim = config.hidden_size
 
         if hasattr(config, "mm_vision_tower"):
+            use_mstva = getattr(config, "use_mstva", False)
+            mstva_align_dim = getattr(config, "mstva_align_dim", 256)
+            mstva_scale_weights = getattr(config, "mstva_scale_weights", "0.5,0.3,0.2")
+            if isinstance(mstva_scale_weights, str):
+                mstva_scale_weights = tuple(float(x.strip()) for x in mstva_scale_weights.split(",") if x.strip() != "")
+            if len(mstva_scale_weights) != 3:
+                mstva_scale_weights = (0.5, 0.3, 0.2)
             swin_type = getattr(config,'swin_type','base')
             if swin_type == 'base':
-                self.vision_tower_mask = build_swin_b(None, text_cond_dim=config.hidden_size)
+                self.vision_tower_mask = build_swin_b(
+                    None,
+                    text_cond_dim=config.hidden_size,
+                    use_mstva=use_mstva,
+                    mstva_align_dim=mstva_align_dim,
+                    mstva_scale_weights=mstva_scale_weights,
+                )
             else:
-                self.vision_tower_mask = build_swin_l(None, text_cond_dim=config.hidden_size)
+                self.vision_tower_mask = build_swin_l(
+                    None,
+                    text_cond_dim=config.hidden_size,
+                    use_mstva=use_mstva,
+                    mstva_align_dim=mstva_align_dim,
+                    mstva_scale_weights=mstva_scale_weights,
+                )
 
             self.vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
 
@@ -101,13 +126,33 @@ class SegEarthR2Model(MiphaPhiModel):
         vision_tower_mask = model_args.vision_tower_mask if hasattr(model_args, 'vision_tower_mask') else model_args.mm_vision_tower_mask
 
         self.config.mm_vision_tower = vision_tower
+        self.config.use_mstva = getattr(model_args, "use_mstva", False)
+        self.config.mstva_align_dim = getattr(model_args, "mstva_align_dim", 256)
+        self.config.mstva_scale_weights = getattr(model_args, "mstva_scale_weights", "0.5,0.3,0.2")
+        mstva_scale_weights = self.config.mstva_scale_weights
+        if isinstance(mstva_scale_weights, str):
+            mstva_scale_weights = tuple(float(x.strip()) for x in mstva_scale_weights.split(",") if x.strip() != "")
+        if len(mstva_scale_weights) != 3:
+            mstva_scale_weights = (0.5, 0.3, 0.2)
         swin_type = getattr(model_args,'swin_type','base')
         self.config.swin_type = swin_type
         if swin_type == 'base':
-            vision_tower_mask = build_swin_b(vision_tower_mask, text_cond_dim=self.config.hidden_size)
+            vision_tower_mask = build_swin_b(
+                vision_tower_mask,
+                text_cond_dim=self.config.hidden_size,
+                use_mstva=self.config.use_mstva,
+                mstva_align_dim=self.config.mstva_align_dim,
+                mstva_scale_weights=mstva_scale_weights,
+            )
         else:
             print('current visual encoder is swin large')
-            vision_tower_mask = build_swin_l(vision_tower_mask, text_cond_dim=self.config.hidden_size)
+            vision_tower_mask = build_swin_l(
+                vision_tower_mask,
+                text_cond_dim=self.config.hidden_size,
+                use_mstva=self.config.use_mstva,
+                mstva_align_dim=self.config.mstva_align_dim,
+                mstva_scale_weights=mstva_scale_weights,
+            )
 
         if fsdp is not None and len(fsdp) > 0:
             self.vision_tower_mask = [vision_tower_mask]
@@ -185,15 +230,41 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print(diff_predictor_msg)
             print(diff_pixel_msg)
 
-    def get_vision_tower_feature(self, images, text_cond=None):
-        features = self.get_model().get_vision_tower_mask()(images, text_cond=text_cond)
-        
+    def get_vision_tower_feature(
+        self,
+        images,
+        text_cond=None,
+        text_tokens=None,
+        text_mask=None,
+        return_midstage_gate=False,
+        return_mstva_maps=False,
+    ):
+        if return_midstage_gate or return_mstva_maps:
+            features, gate_info = self.get_model().get_vision_tower_mask()(
+                images,
+                text_cond=text_cond,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+                return_midstage_gate=return_midstage_gate,
+                return_mstva_maps=return_mstva_maps,
+            )
+        else:
+            features = self.get_model().get_vision_tower_mask()(
+                images,
+                text_cond=text_cond,
+                text_tokens=text_tokens,
+                text_mask=text_mask,
+            )
+            gate_info = None
+
         features_dict = {
             'res2': features[0], # bs, 128, 256, 256
             'res3': features[1], # bs, 256, 128, 128
             'res4': features[2], # bs, 512, 64, 64
             'res5': features[3], # bs, 1024, 32, 32
         }
+        if return_midstage_gate or return_mstva_maps:
+            return features_dict, gate_info
         return features_dict
     def mask_decoder_training_init(self, cfg):
         # Loss parameters:
@@ -456,6 +527,183 @@ class SegEarthR2(MiphaPhiForCausalLM):
             text_conditions.append(pooled)
 
         return torch.stack(text_conditions, dim=0)
+
+    def build_text_tokens(self, token_refer_id, batch_size=None, device=None):
+        if token_refer_id is None:
+            return None, None
+        embed_tokens = self.get_model().embed_tokens
+        if device is None:
+            device = embed_tokens.weight.device
+        pad_id = self._resolve_pad_token_id()
+
+        if torch.is_tensor(token_refer_id):
+            if token_refer_id.dim() == 0:
+                refer_items = [token_refer_id.view(1)]
+            elif token_refer_id.dim() == 1:
+                refer_items = [token_refer_id]
+            elif token_refer_id.dim() == 2:
+                token_refer_id = token_refer_id.to(device=device, dtype=torch.long)
+                if batch_size is None:
+                    batch_size = token_refer_id.shape[0]
+                if token_refer_id.shape[0] != batch_size:
+                    token_refer_id = token_refer_id[:batch_size]
+                if pad_id is not None:
+                    mask = token_refer_id.ne(pad_id)
+                else:
+                    mask = torch.ones_like(token_refer_id, dtype=torch.bool, device=token_refer_id.device)
+                text_tokens = self.embed_refer_ids(token_refer_id)
+                if text_tokens is None:
+                    return None, None
+                return text_tokens, mask
+            else:
+                raise ValueError(f"Unsupported token_refer_id tensor dim: {token_refer_id.dim()}")
+        elif isinstance(token_refer_id, (list, tuple)):
+            refer_items = list(token_refer_id)
+        else:
+            refer_items = [None]
+
+        if batch_size is None:
+            batch_size = len(refer_items)
+        if len(refer_items) < batch_size:
+            refer_items.extend([None] * (batch_size - len(refer_items)))
+        elif len(refer_items) > batch_size:
+            refer_items = refer_items[:batch_size]
+
+        normalized = []
+        max_len = 0
+        for refer_ids in refer_items:
+            if isinstance(refer_ids, (list, tuple)):
+                valid_tensors = [x.view(-1) for x in refer_ids if torch.is_tensor(x) and x.numel() > 0]
+                refer_ids = torch.cat(valid_tensors, dim=0) if valid_tensors else None
+            if refer_ids is None or (torch.is_tensor(refer_ids) and refer_ids.numel() == 0):
+                t = torch.empty(0, dtype=torch.long, device=device)
+            elif torch.is_tensor(refer_ids):
+                t = refer_ids.to(device=device, dtype=torch.long).view(-1)
+            else:
+                t = torch.empty(0, dtype=torch.long, device=device)
+            max_len = max(max_len, int(t.numel()))
+            normalized.append(t)
+
+        if max_len == 0:
+            return None, None
+
+        if pad_id is None:
+            pad_id = 0
+        token_ids = torch.full((batch_size, max_len), fill_value=int(pad_id), dtype=torch.long, device=device)
+        text_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
+        for i, t in enumerate(normalized):
+            if t.numel() == 0:
+                continue
+            token_ids[i, : t.numel()] = t
+            text_mask[i, : t.numel()] = True
+
+        text_tokens = self.embed_refer_ids(token_ids)
+        if text_tokens is None:
+            return None, None
+        return text_tokens, text_mask
+
+    def _build_midstage_gate_targets(self, seg_info, gate_spatial):
+        if seg_info is None or len(seg_info) == 0:
+            return None
+        target_masks = []
+        if 'mask' in seg_info[0]:
+            for item in seg_info:
+                mask_item = item.get('mask', None)
+                if mask_item is None or not torch.is_tensor(mask_item):
+                    return None
+                mask_item = mask_item.float().to(gate_spatial.device)
+                if mask_item.ndim == 2:
+                    mask_item = mask_item.unsqueeze(0)
+                elif mask_item.ndim == 3 and mask_item.shape[0] != 1:
+                    mask_item = mask_item[:1]
+                target_masks.append(mask_item)
+            gt = torch.stack(target_masks, dim=0)
+        elif 'padding_mask' in seg_info[0]:
+            for item in seg_info:
+                instances = item.get("instances", None)
+                if isinstance(instances, list):
+                    instances = instances[0] if len(instances) > 0 else None
+                if instances is None or not hasattr(instances, "gt_masks"):
+                    return None
+                gt_masks = instances.gt_masks
+                if hasattr(gt_masks, "tensor"):
+                    gt_masks = gt_masks.tensor
+                if not torch.is_tensor(gt_masks) or gt_masks.numel() == 0:
+                    return None
+                gt_masks = gt_masks.float().to(gate_spatial.device)
+                if gt_masks.ndim == 3:
+                    gt_mask = gt_masks.any(dim=0, keepdim=True).float()
+                elif gt_masks.ndim == 2:
+                    gt_mask = gt_masks.unsqueeze(0).float()
+                else:
+                    return None
+                target_masks.append(gt_mask)
+            gt = torch.stack(target_masks, dim=0)
+        else:
+            return None
+
+        if gt.ndim == 3:
+            gt = gt.unsqueeze(1)
+        gt_small = F.interpolate(gt, size=gate_spatial.shape[-2:], mode="nearest")
+        return gt_small
+
+    def _parse_mstva_scale_weights(self):
+        weights = getattr(self.config, "mstva_scale_weights", "0.5,0.3,0.2")
+        if isinstance(weights, str):
+            try:
+                parsed = [float(x.strip()) for x in weights.split(",") if x.strip() != ""]
+            except ValueError:
+                parsed = [0.5, 0.3, 0.2]
+        elif isinstance(weights, (list, tuple)):
+            parsed = [float(x) for x in weights]
+        else:
+            parsed = [0.5, 0.3, 0.2]
+        if len(parsed) != 3:
+            parsed = [0.5, 0.3, 0.2]
+        return parsed
+
+    def _build_binary_gt_mask(self, seg_info, ref_tensor):
+        if seg_info is None or len(seg_info) == 0:
+            return None
+        target_masks = []
+        if 'mask' in seg_info[0]:
+            for item in seg_info:
+                mask_item = item.get('mask', None)
+                if mask_item is None or not torch.is_tensor(mask_item):
+                    return None
+                mask_item = mask_item.float().to(ref_tensor.device)
+                if mask_item.ndim == 2:
+                    mask_item = mask_item.unsqueeze(0)
+                elif mask_item.ndim == 3 and mask_item.shape[0] != 1:
+                    mask_item = mask_item[:1]
+                target_masks.append(mask_item)
+        elif 'padding_mask' in seg_info[0]:
+            for item in seg_info:
+                instances = item.get("instances", None)
+                if isinstance(instances, list):
+                    instances = instances[0] if len(instances) > 0 else None
+                if instances is None or not hasattr(instances, "gt_masks"):
+                    return None
+                gt_masks = instances.gt_masks
+                if hasattr(gt_masks, "tensor"):
+                    gt_masks = gt_masks.tensor
+                if not torch.is_tensor(gt_masks) or gt_masks.numel() == 0:
+                    return None
+                gt_masks = gt_masks.float().to(ref_tensor.device)
+                if gt_masks.ndim == 3:
+                    gt_mask = gt_masks.any(dim=0, keepdim=True).float()
+                elif gt_masks.ndim == 2:
+                    gt_mask = gt_masks.unsqueeze(0).float()
+                else:
+                    return None
+                target_masks.append(gt_mask)
+        else:
+            return None
+
+        gt = torch.stack(target_masks, dim=0)
+        if gt.ndim == 3:
+            gt = gt.unsqueeze(1)
+        return gt
 
     def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
@@ -731,12 +979,39 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
+                use_midstage_gate_loss = getattr(self.config, "use_midstage_gate_loss", False)
+                use_mstva = getattr(self.config, "use_mstva", False)
+                use_mstva_loss = getattr(self.config, "use_mstva_loss", False)
                 text_cond = self.build_text_condition(
                     token_refer_id=token_refer_id,
                     batch_size=input_ids.shape[0],
                     device=images.device,
                 )
-                image_features = self.get_vision_tower_feature(images, text_cond=text_cond)
+                text_tokens = None
+                text_mask = None
+                if use_mstva or use_mstva_loss:
+                    text_tokens, text_mask = self.build_text_tokens(
+                        token_refer_id=token_refer_id,
+                        batch_size=input_ids.shape[0],
+                        device=images.device,
+                    )
+                if use_midstage_gate_loss or use_mstva_loss:
+                    image_features, extra_info = self.get_vision_tower_feature(
+                        images,
+                        text_cond=text_cond,
+                        text_tokens=text_tokens,
+                        text_mask=text_mask,
+                        return_midstage_gate=use_midstage_gate_loss,
+                        return_mstva_maps=use_mstva_loss,
+                    )
+                else:
+                    image_features = self.get_vision_tower_feature(
+                        images,
+                        text_cond=text_cond,
+                        text_tokens=text_tokens,
+                        text_mask=text_mask,
+                    )
+                    extra_info = None
                 bs = input_ids.shape[0]
             
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
@@ -831,6 +1106,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_loss = loss_mask + loss_dice
 
         use_attention_loss = getattr(self.config, "use_attention_loss", True)
+        use_midstage_gate_loss = getattr(self.config, "use_midstage_gate_loss", False)
+        midstage_gate_loss_weight = getattr(self.config, "midstage_gate_loss_weight", 0.0)
+        use_mstva_loss = getattr(self.config, "use_mstva_loss", False)
+        mstva_loss_weight = float(getattr(self.config, "mstva_loss_weight", 0.0))
+        zero_base = llm_loss if llm_loss is not None else mask_loss
+        if zero_base is None:
+            zero_base = logits.sum() * 0.0
+        loss_midstage_gate = torch.zeros_like(zero_base)
+        midstage_gate_alpha = torch.zeros_like(zero_base)
+        loss_mstva_align = torch.zeros_like(zero_base)
+        mstva_alpha3 = torch.zeros_like(zero_base)
+        mstva_alpha4 = torch.zeros_like(zero_base)
+        mstva_alpha5 = torch.zeros_like(zero_base)
         if use_attention_loss:
             masks = [_seg_info['mask'] for _seg_info in seg_info]
             masks_resized = [
@@ -854,14 +1142,95 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
                 loss_attention += self.attention_loss(batch_attentions, masks_down)
         else:
-            zero_base = llm_loss if llm_loss is not None else mask_loss
-            if zero_base is None:
-                zero_base = logits.sum() * 0.0
             loss_attention = torch.zeros_like(zero_base)
+
+        if use_midstage_gate_loss and seg_info is not None:
+            current_gate_info = locals().get("extra_info", None)
+            mid_stage_gate = None
+            if isinstance(current_gate_info, dict):
+                mid_stage_gate = current_gate_info.get("mid_stage_gate", None)
+                alpha_item = current_gate_info.get("mid_stage_alpha", None)
+                if alpha_item is not None:
+                    midstage_gate_alpha = alpha_item.detach().float().view(-1)[0].to(zero_base.device)
+            if mid_stage_gate is None:
+                print("[WARNING] use_midstage_gate_loss=True but mid_stage_gate is None, set gate loss to 0.")
+            else:
+                gate_spatial = mid_stage_gate.mean(dim=1, keepdim=True)
+                gt_small = self._build_midstage_gate_targets(seg_info=seg_info, gate_spatial=gate_spatial)
+                if gt_small is None or gt_small.shape != gate_spatial.shape:
+                    print("[WARNING] midstage gate supervision target unavailable or shape mismatch, set gate loss to 0.")
+                elif gt_small.max().item() <= 0:
+                    print("[WARNING] midstage gate supervision GT is all-zero, set gate loss to 0.")
+                else:
+                    loss_midstage_gate = F.binary_cross_entropy(
+                        gate_spatial.float().clamp(1e-4, 1 - 1e-4),
+                        gt_small.float(),
+                    )
+
+        if use_mstva_loss and seg_info is not None:
+            mstva_info = None
+            current_extra_info = locals().get("extra_info", None)
+            if isinstance(current_extra_info, dict):
+                mstva_info = current_extra_info.get("mstva", None)
+            if not isinstance(mstva_info, dict):
+                print("[WARNING] use_mstva_loss=True but mstva info is missing, set MSTVA loss to 0.")
+            else:
+                r3 = mstva_info.get("R3", None)
+                r4 = mstva_info.get("R4", None)
+                r5 = mstva_info.get("R5", None)
+                if r3 is None or r4 is None or r5 is None:
+                    print("[WARNING] MSTVA maps incomplete (R3/R4/R5 missing), set MSTVA loss to 0.")
+                else:
+                    gt_mask = self._build_binary_gt_mask(seg_info=seg_info, ref_tensor=r3)
+                    if gt_mask is None:
+                        print("[WARNING] MSTVA GT target unavailable, set MSTVA loss to 0.")
+                    elif gt_mask.max().item() <= 0:
+                        print("[WARNING] MSTVA GT is all-zero, skip MSTVA loss.")
+                    else:
+                        scale_weights = self._parse_mstva_scale_weights()
+                        loss_items = []
+                        skipped_scales = []
+                        for ridx, r_map in enumerate([r3, r4, r5]):
+                            if r_map is None:
+                                continue
+                            if r_map.shape[0] != gt_mask.shape[0]:
+                                print(f"[WARNING] MSTVA batch mismatch at scale {ridx+3}, skip this scale.")
+                                skipped_scales.append(f"R{ridx+3}:batch_mismatch")
+                                continue
+                            gt_s = F.interpolate(gt_mask.float(), size=r_map.shape[-2:], mode="nearest")
+                            if gt_s.sum().item() <= 0:
+                                print(f"[WARNING] MSTVA scale R{ridx+3} gt_s.sum()==0 after resize, skip this scale.")
+                                skipped_scales.append(f"R{ridx+3}:gt_disappear")
+                                continue
+                            loss_s = F.binary_cross_entropy(
+                                r_map.float().clamp(1e-4, 1 - 1e-4),
+                                gt_s.float(),
+                            )
+                            loss_items.append(scale_weights[ridx] * loss_s)
+                        if loss_items:
+                            loss_mstva_align = sum(loss_items)
+                        else:
+                            if skipped_scales:
+                                print(f"[WARNING] MSTVA all scales skipped: {skipped_scales}")
+                            print("[WARNING] No valid MSTVA scale loss computed, set MSTVA loss to 0.")
+
+                alpha3_item = mstva_info.get("alpha3", None)
+                alpha4_item = mstva_info.get("alpha4", None)
+                alpha5_item = mstva_info.get("alpha5", None)
+                if alpha3_item is not None:
+                    mstva_alpha3 = alpha3_item.detach().float().view(-1)[0].to(zero_base.device)
+                if alpha4_item is not None:
+                    mstva_alpha4 = alpha4_item.detach().float().view(-1)[0].to(zero_base.device)
+                if alpha5_item is not None:
+                    mstva_alpha5 = alpha5_item.detach().float().view(-1)[0].to(zero_base.device)
 
         loss = llm_loss + mask_loss
         if use_attention_loss:
             loss = loss + 0.01 * loss_attention
+        if use_midstage_gate_loss and midstage_gate_loss_weight > 0:
+            loss = loss + midstage_gate_loss_weight * loss_midstage_gate
+        if use_mstva_loss and mstva_loss_weight > 0:
+            loss = loss + mstva_loss_weight * loss_mstva_align
 
         return CausalOutputWithMask(
             loss=loss,
@@ -873,6 +1242,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=(0.01 * loss_attention.detach()) if use_attention_loss else torch.zeros_like(loss_attention.detach()),
+            loss_midstage_gate=(midstage_gate_loss_weight * loss_midstage_gate.detach()) if use_midstage_gate_loss else torch.zeros_like(loss_midstage_gate.detach()),
+            midstage_gate_alpha=midstage_gate_alpha.detach(),
+            loss_mstva_align=(mstva_loss_weight * loss_mstva_align.detach()) if use_mstva_loss else torch.zeros_like(loss_mstva_align.detach()),
+            mstva_alpha3=mstva_alpha3.detach(),
+            mstva_alpha4=mstva_alpha4.detach(),
+            mstva_alpha5=mstva_alpha5.detach(),
         )
     
     def eval_seg(

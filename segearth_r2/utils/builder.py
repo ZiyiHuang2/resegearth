@@ -43,6 +43,16 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    if not hasattr(model.config, "use_mstva"):
+        model.config.use_mstva = False
+    if not hasattr(model.config, "mstva_align_dim"):
+        model.config.mstva_align_dim = 256
+    if not hasattr(model.config, "use_mstva_loss"):
+        model.config.use_mstva_loss = False
+    if not hasattr(model.config, "mstva_loss_weight"):
+        model.config.mstva_loss_weight = 0.0
+    if not hasattr(model.config, "mstva_scale_weights"):
+        model.config.mstva_scale_weights = "0.5,0.3,0.2"
     
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)

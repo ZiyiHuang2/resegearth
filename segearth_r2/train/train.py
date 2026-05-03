@@ -29,6 +29,13 @@ class ModelArguments:
     train_clip_backbone: bool = field(default=False)
     train_swin_backbone: bool = field(default=False)
     use_attention_loss: bool = field(default=True)
+    use_midstage_gate_loss: bool = field(default=False)
+    midstage_gate_loss_weight: float = field(default=0.0)
+    use_mstva: bool = field(default=False)
+    mstva_align_dim: int = field(default=256)
+    use_mstva_loss: bool = field(default=False)
+    mstva_loss_weight: float = field(default=0.0)
+    mstva_scale_weights: str = field(default="0.5,0.3,0.2")
     train_midstage_recalibration: bool = field(default=True)
     stage3_norm_only: bool = field(default=False)
 
@@ -157,6 +164,8 @@ def _enable_midstage_text_recalibration_trainable(model, norm_only=False):
 
     if hasattr(vision_tower_mask, "mid_stage_text_recalibration"):
         _set_module_requires_grad(vision_tower_mask.mid_stage_text_recalibration, True)
+    if hasattr(vision_tower_mask, "mstva") and vision_tower_mask.mstva is not None:
+        _set_module_requires_grad(vision_tower_mask.mstva, True)
 
     if not hasattr(vision_tower_mask, "layers") or len(vision_tower_mask.layers) <= 2:
         return
@@ -353,6 +362,13 @@ def train():
 
     model.config.use_cache = False
     model.config.use_attention_loss = model_args.use_attention_loss
+    model.config.use_midstage_gate_loss = model_args.use_midstage_gate_loss
+    model.config.midstage_gate_loss_weight = model_args.midstage_gate_loss_weight
+    model.config.use_mstva = model_args.use_mstva
+    model.config.mstva_align_dim = model_args.mstva_align_dim
+    model.config.use_mstva_loss = model_args.use_mstva_loss
+    model.config.mstva_loss_weight = model_args.mstva_loss_weight
+    model.config.mstva_scale_weights = model_args.mstva_scale_weights
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -420,7 +436,7 @@ def train():
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration", "mstva",
     ]
 
     if model_args.train_swin_backbone:

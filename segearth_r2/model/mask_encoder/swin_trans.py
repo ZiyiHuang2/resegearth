@@ -12,6 +12,7 @@ import torch.utils.checkpoint as checkpoint
 import numpy as np
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 import pickle
+from segearth_r2.model.mask_encoder.multiscale_text_visual_aligner import MultiScaleTextVisualAligner
 
 class Mlp(nn.Module):
     """ Multilayer perceptron."""
@@ -457,8 +458,10 @@ class TextGuidedResidualGate(nn.Module):
         )
         self.alpha = nn.Parameter(torch.zeros(1))
 
-    def forward(self, x_feat, text_cond=None):
+    def forward(self, x_feat, text_cond=None, return_gate=False):
         if text_cond is None:
+            if return_gate:
+                return x_feat, None
             return x_feat
 
         if text_cond.dim() == 1:
@@ -473,7 +476,10 @@ class TextGuidedResidualGate(nn.Module):
         text_bias = text_bias.unsqueeze(-1).unsqueeze(-1)
         gate_lowres = torch.sigmoid(self.v_proj(gate_feat) + text_bias)
         gate = F.interpolate(gate_lowres, size=x_feat.shape[-2:], mode='bilinear', align_corners=False)
-        return x_feat * (1.0 + self.alpha * gate)
+        y = x_feat * (1.0 + self.alpha * gate)
+        if return_gate:
+            return y, gate
+        return y
 
 
 class SwinTransformer(nn.Module):
@@ -525,7 +531,10 @@ class SwinTransformer(nn.Module):
                  out_indices=(0, 1, 2, 3),
                  frozen_stages=-1,
                  use_checkpoint=False,
-                 text_cond_dim=2560):
+                 text_cond_dim=2560,
+                 use_mstva=False,
+                 mstva_align_dim=256,
+                 mstva_scale_weights=(0.5, 0.3, 0.2)):
         super().__init__()
 
         self.pretrain_img_size = pretrain_img_size
@@ -580,6 +589,16 @@ class SwinTransformer(nn.Module):
             feat_dim=self.num_features[2],
             text_dim=text_cond_dim
         )
+        self.use_mstva = use_mstva
+        if self.use_mstva:
+            self.mstva = MultiScaleTextVisualAligner(
+                in_channels=(self.num_features[1], self.num_features[2], self.num_features[3]),
+                text_dim=text_cond_dim,
+                align_dim=mstva_align_dim,
+                scale_weights=mstva_scale_weights,
+            )
+        else:
+            self.mstva = None
 
         # add a norm layer for each output
         for i_layer in out_indices:
@@ -639,7 +658,7 @@ class SwinTransformer(nn.Module):
             load_msg = self.load_state_dict(weights, strict=False)
             missing_keys = list(getattr(load_msg, "missing_keys", []))
             unexpected_keys = list(getattr(load_msg, "unexpected_keys", []))
-            expected_missing_prefixes = ("mid_stage_text_recalibration.",)
+            expected_missing_prefixes = ("mid_stage_text_recalibration.", "mstva.")
             expected_missing = [k for k in missing_keys if k.startswith(expected_missing_prefixes)]
             unexpected_missing = [k for k in missing_keys if not k.startswith(expected_missing_prefixes)]
             if expected_missing:
@@ -654,7 +673,15 @@ class SwinTransformer(nn.Module):
         else:
             raise TypeError('pretrained must be a str or None')
 
-    def forward(self, x, text_cond=None):
+    def forward(
+        self,
+        x,
+        text_cond=None,
+        text_tokens=None,
+        text_mask=None,
+        return_midstage_gate=False,
+        return_mstva_maps=False,
+    ):
         """Forward function."""
         x = self.patch_embed(x)
 
@@ -668,6 +695,7 @@ class SwinTransformer(nn.Module):
         x = self.pos_drop(x)
 
         outs = []
+        mid_stage_gate = None
         for i in range(self.num_layers):
             layer = self.layers[i]
             x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
@@ -678,9 +706,40 @@ class SwinTransformer(nn.Module):
 
                 out = x_out.view(-1, H, W, self.num_features[i]).permute(0, 3, 1, 2).contiguous()
                 if i == 2:
-                    out = self.mid_stage_text_recalibration(out, text_cond=text_cond)
+                    if return_midstage_gate:
+                        out, mid_stage_gate = self.mid_stage_text_recalibration(
+                            out,
+                            text_cond=text_cond,
+                            return_gate=True,
+                        )
+                    else:
+                        out = self.mid_stage_text_recalibration(out, text_cond=text_cond)
                 outs.append(out)
 
+        mstva_info = None
+        if self.use_mstva and self.mstva is not None:
+            if return_mstva_maps:
+                outs, mstva_info = self.mstva(
+                    tuple(outs),
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    return_maps=True,
+                )
+            else:
+                outs = self.mstva(
+                    tuple(outs),
+                    text_tokens=text_tokens,
+                    text_mask=text_mask,
+                    return_maps=False,
+                )
+
+        if return_midstage_gate or return_mstva_maps:
+            extra_info = {
+                "mid_stage_gate": mid_stage_gate,
+                "mid_stage_alpha": self.mid_stage_text_recalibration.alpha.detach().clone(),
+                "mstva": mstva_info,
+            }
+            return tuple(outs), extra_info
         return tuple(outs)
 
     def train(self, mode=True):
@@ -688,7 +747,7 @@ class SwinTransformer(nn.Module):
         super(SwinTransformer, self).train(mode)
         self._freeze_stages()
 
-def build_swin_t(pretrain=None, text_cond_dim=2560):
+def build_swin_t(pretrain=None, text_cond_dim=2560, use_mstva=False, mstva_align_dim=256, mstva_scale_weights=(0.5, 0.3, 0.2)):
     model = SwinTransformer(
         embed_dim=96,
         depths=[2, 2, 6, 2],
@@ -704,12 +763,15 @@ def build_swin_t(pretrain=None, text_cond_dim=2560):
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
         use_checkpoint=False,
-        text_cond_dim=text_cond_dim)
+        text_cond_dim=text_cond_dim,
+        use_mstva=use_mstva,
+        mstva_align_dim=mstva_align_dim,
+        mstva_scale_weights=mstva_scale_weights)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_b(pretrain=None, text_cond_dim=2560):
+def build_swin_b(pretrain=None, text_cond_dim=2560, use_mstva=False, mstva_align_dim=256, mstva_scale_weights=(0.5, 0.3, 0.2)):
     model = SwinTransformer(
         embed_dim=128,
         depths=[2, 2, 18, 2],
@@ -725,12 +787,15 @@ def build_swin_b(pretrain=None, text_cond_dim=2560):
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
         use_checkpoint=False,
-        text_cond_dim=text_cond_dim)
+        text_cond_dim=text_cond_dim,
+        use_mstva=use_mstva,
+        mstva_align_dim=mstva_align_dim,
+        mstva_scale_weights=mstva_scale_weights)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_s(pretrain=None, text_cond_dim=2560):
+def build_swin_s(pretrain=None, text_cond_dim=2560, use_mstva=False, mstva_align_dim=256, mstva_scale_weights=(0.5, 0.3, 0.2)):
     model = SwinTransformer(
         embed_dim=96,
         depths=[2, 2, 18, 2],
@@ -746,12 +811,15 @@ def build_swin_s(pretrain=None, text_cond_dim=2560):
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
         use_checkpoint=False,
-        text_cond_dim=text_cond_dim)
+        text_cond_dim=text_cond_dim,
+        use_mstva=use_mstva,
+        mstva_align_dim=mstva_align_dim,
+        mstva_scale_weights=mstva_scale_weights)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
 
-def build_swin_l(pretrain=None, text_cond_dim=2560):
+def build_swin_l(pretrain=None, text_cond_dim=2560, use_mstva=False, mstva_align_dim=256, mstva_scale_weights=(0.5, 0.3, 0.2)):
     model = SwinTransformer(
         pretrain_img_size=384,
         embed_dim=192,
@@ -768,7 +836,10 @@ def build_swin_l(pretrain=None, text_cond_dim=2560):
         patch_norm=True,
         out_indices=(0, 1, 2, 3),
         use_checkpoint=False,
-        text_cond_dim=text_cond_dim)
+        text_cond_dim=text_cond_dim,
+        use_mstva=use_mstva,
+        mstva_align_dim=mstva_align_dim,
+        mstva_scale_weights=mstva_scale_weights)
     if pretrain is not None:
         model.init_weights(pretrain)
     return model
