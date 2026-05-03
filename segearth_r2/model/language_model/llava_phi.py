@@ -57,6 +57,10 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_attn_fg_bg_non_small: Optional[torch.FloatTensor] = None
     loss_attn_boundary_outer_small: Optional[torch.FloatTensor] = None
     loss_attn_boundary_outer_non_small: Optional[torch.FloatTensor] = None
+    selected_attn_heads_total: Optional[torch.FloatTensor] = None
+    selected_attn_heads_per_layer: Optional[torch.FloatTensor] = None
+    structured_schedule_phase_id: Optional[torch.FloatTensor] = None
+    structured_skip_reason_code: Optional[torch.FloatTensor] = None
     attention_audit: Optional[dict] = None
 
 class AttentionLoss(nn.Module):
@@ -948,6 +952,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 weight = min(weight, max(0.0, remain / max(total, 1.0)))
         return float(max(0.0, min(1.0, weight)))
 
+    def _get_structured_schedule_phase_id(self, global_step):
+        # 0: off_or_constant, 1: warmup, 2: full, 3: decay, 4: finished
+        step = int(global_step) if global_step is not None else 0
+        warmup_steps = int(getattr(self.config, "structured_warmup_steps", 0) or 0)
+        decay_start = int(getattr(self.config, "structured_decay_start_step", -1) or -1)
+        decay_end = int(getattr(self.config, "structured_decay_end_step", -1) or -1)
+        if warmup_steps > 0 and step < warmup_steps:
+            return 1
+        if decay_start >= 0 and decay_end > decay_start:
+            if step >= decay_end:
+                return 4
+            if step >= decay_start:
+                return 3
+            return 2
+        if warmup_steps > 0:
+            return 2
+        return 0
+
     def _should_log_structured_detail(self, global_step):
         interval = int(getattr(self.config, "structured_log_interval", 50) or 0)
         if interval <= 0:
@@ -1022,6 +1044,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "loss_attn_fg_bg_non_small": zero,
                 "loss_attn_boundary_outer_small": zero,
                 "loss_attn_boundary_outer_non_small": zero,
+                "selected_attn_heads_total": zero,
+                "selected_attn_heads_per_layer": zero,
+                "structured_schedule_phase_id": zero,
+                "structured_skip_reason_code": zero,
             }
         fg_mask, boundary_map, outer_ring_map, supervision_stats = self._prepare_attention_supervision(
             seg_info=seg_info, target_hw=(27, 27), device=self.device
@@ -1046,6 +1072,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "loss_attn_fg_bg_non_small": zero,
                 "loss_attn_boundary_outer_small": zero,
                 "loss_attn_boundary_outer_non_small": zero,
+                "selected_attn_heads_total": zero,
+                "selected_attn_heads_per_layer": zero,
+                "structured_schedule_phase_id": zero,
+                "structured_skip_reason_code": zero,
             }
         per_layer_head, per_layer_baseline, extracted_layer_indices = self._extract_seg_to_image_attentions(
             attentions=attentions,
@@ -1072,6 +1102,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "loss_attn_fg_bg_non_small": zero,
                 "loss_attn_boundary_outer_small": zero,
                 "loss_attn_boundary_outer_non_small": zero,
+                "selected_attn_heads_total": zero,
+                "selected_attn_heads_per_layer": zero,
+                "structured_schedule_phase_id": zero,
+                "structured_skip_reason_code": zero,
             }
         total_internal_layers = len(attentions)
         layer_to_head_tensor = {
@@ -1116,6 +1150,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
 
         selected_attn_layers = torch.tensor(float(len(selected_layer_indices)), device=fg_mask.device)
+        selected_attn_heads_total = torch.tensor(0.0, device=fg_mask.device)
+        selected_attn_heads_per_layer = torch.tensor(0.0, device=fg_mask.device)
         loss_attention = torch.tensor(0.0, device=fg_mask.device)
         loss_attn_fg_bg = torch.tensor(0.0, device=fg_mask.device)
         loss_attn_boundary_outer = torch.tensor(0.0, device=fg_mask.device)
@@ -1128,6 +1164,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         loss_attn_fg_bg_non_small = torch.tensor(0.0, device=fg_mask.device)
         loss_attn_boundary_outer_small = torch.tensor(0.0, device=fg_mask.device)
         loss_attn_boundary_outer_non_small = torch.tensor(0.0, device=fg_mask.device)
+        structured_schedule_phase_id = torch.tensor(0.0, device=fg_mask.device)
+        structured_skip_reason_code = torch.tensor(0.0, device=fg_mask.device)
         if not hasattr(self, "_structured_total_batches"):
             self._structured_total_batches = 0
         if not hasattr(self, "_structured_skipped_batches"):
@@ -1151,6 +1189,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             layer_head_map = {}
             layer_head_contrib = {}
             skip_reason = None
+            requested_top_k = int(getattr(self.config, "top_k_heads", 0) or 0)
+            capped_layers = {}
             for layer_idx in selected_layer_indices:
                 if layer_idx not in layer_to_head_tensor:
                     continue
@@ -1163,6 +1203,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
                             f"Layer {layer_idx} head index out of range; max={head_count - 1}, requested={selected_heads}"
                         )
                     layer_head_map[layer_idx] = [int(h) for h in selected_heads]
+                    if requested_top_k > 0 and len(selected_heads) < requested_top_k:
+                        capped_layers[layer_idx] = {
+                            "requested_top_k": requested_top_k,
+                            "available_from_config": len(selected_heads),
+                        }
                     layer_total_contrib = torch.tensor(0.0, device=fg_mask.device)
                     layer_head_contrib[layer_idx] = {}
                     for head_idx in selected_heads:
@@ -1197,11 +1242,25 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     layer_head_contrib[layer_idx] = {"aggregated_heads_sum": float(b_total.mean().detach().item())}
                     num_terms += 1
 
+            if len(layer_head_map) > 0:
+                total_heads = float(sum(len(v) for v in layer_head_map.values()))
+                selected_attn_heads_total = torch.tensor(total_heads, device=fg_mask.device)
+                selected_attn_heads_per_layer = torch.tensor(
+                    total_heads / float(max(len(layer_head_map), 1)),
+                    device=fg_mask.device,
+                )
+            structured_schedule_phase_id = torch.tensor(
+                float(self._get_structured_schedule_phase_id(global_step)),
+                device=fg_mask.device,
+            )
+
             if num_terms == 0:
                 if len(selected_layer_indices) == 0:
                     skip_reason = "no_valid_selected_layers"
+                    structured_skip_reason_code = torch.tensor(1.0, device=fg_mask.device)
                 else:
                     skip_reason = "no_valid_selected_heads_or_attention"
+                    structured_skip_reason_code = torch.tensor(2.0, device=fg_mask.device)
                 strict_attention_selection = bool(getattr(self.config, "strict_attention_selection", False))
                 self._structured_total_batches += 1
                 self._structured_skipped_batches += 1
@@ -1253,7 +1312,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         f"fg_bg_s={float(loss_attn_fg_bg_small.item()):.6f}, fg_bg_ns={float(loss_attn_fg_bg_non_small.item()):.6f}, "
                         f"bo_s={float(loss_attn_boundary_outer_small.item()):.6f}, bo_ns={float(loss_attn_boundary_outer_non_small.item()):.6f}, "
                         f"fg_bg={float(loss_attn_fg_bg.item()):.6f}, boundary_outer={float(loss_attn_boundary_outer.item()):.6f}, "
-                        f"sched_w={float(structured_effective_weight.item()):.4f}, skipped={self._structured_skipped_batches}/{self._structured_total_batches} ({skip_ratio:.4f})"
+                        f"sched_w={float(structured_effective_weight.item()):.4f}, sched_phase={int(structured_schedule_phase_id.item())}, "
+                        f"selected_heads_total={float(selected_attn_heads_total.item()):.1f}, "
+                        f"selected_heads_per_layer={float(selected_attn_heads_per_layer.item()):.2f}, "
+                        f"skip_reason_code={int(structured_skip_reason_code.item())}, "
+                        f"capped_layers={capped_layers}, "
+                        f"skipped={self._structured_skipped_batches}/{self._structured_total_batches} ({skip_ratio:.4f})"
                     )
         else:
             for layer_idx in selected_layer_indices:
@@ -1296,6 +1360,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             "loss_attn_fg_bg_non_small": loss_attn_fg_bg_non_small,
             "loss_attn_boundary_outer_small": loss_attn_boundary_outer_small,
             "loss_attn_boundary_outer_non_small": loss_attn_boundary_outer_non_small,
+            "selected_attn_heads_total": selected_attn_heads_total,
+            "selected_attn_heads_per_layer": selected_attn_heads_per_layer,
+            "structured_schedule_phase_id": structured_schedule_phase_id,
+            "structured_skip_reason_code": structured_skip_reason_code,
         }
         return loss_attention, audit_payload, stats
            
@@ -1463,6 +1531,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_attn_fg_bg_non_small=attention_stats["loss_attn_fg_bg_non_small"].detach(),
             loss_attn_boundary_outer_small=attention_stats["loss_attn_boundary_outer_small"].detach(),
             loss_attn_boundary_outer_non_small=attention_stats["loss_attn_boundary_outer_non_small"].detach(),
+            selected_attn_heads_total=attention_stats["selected_attn_heads_total"].detach(),
+            selected_attn_heads_per_layer=attention_stats["selected_attn_heads_per_layer"].detach(),
+            structured_schedule_phase_id=attention_stats["structured_schedule_phase_id"].detach(),
+            structured_skip_reason_code=attention_stats["structured_skip_reason_code"].detach(),
             attention_audit=attention_audit,
         )
     
