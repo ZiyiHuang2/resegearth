@@ -54,13 +54,18 @@ class DataArguments:
 
 
 def init_distributed_mode(args):
-    args.distributed = True
-    if torch.cuda.device_count() <= 1:
+    # 多卡机器上直接 `python eval.py` 时不会设置 RANK/WORLD_SIZE；若仅按 device_count>1
+    # 就 init_process_group，会触发 “RANK expected, but not set”。仅在 torchrun / 显式分布式环境下启用。
+    world_size_env = int(os.environ.get("WORLD_SIZE", "1"))
+    distributed_job = "RANK" in os.environ and world_size_env > 1
+
+    if torch.cuda.device_count() <= 1 or not distributed_job:
         args.distributed = False
         args.local_rank = 0
         args.world_size = 1
         return
 
+    args.distributed = True
     distributed.init_process_group(backend="nccl")
     local_rank = distributed.get_rank()
     world_size = distributed.get_world_size()

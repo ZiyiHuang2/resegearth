@@ -1,5 +1,7 @@
 import os
 import sys
+from typing import Optional
+
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
@@ -65,6 +67,12 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
+    concept_public_semantic_library: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional path to concept_public_semantic_library_v2.json; RRSIS-D train prompts inject matched grounding priors in the user message (raw text first, then priors, then image)."
+        },
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

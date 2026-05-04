@@ -1277,7 +1277,44 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_size=input_ids.shape[0],
             device=images.device,
         )
-        image_features = self.get_vision_tower_feature(images, text_cond=text_cond)
+
+        use_mstva = getattr(self.config, "use_mstva", False)
+        text_tokens = None
+        text_mask = None
+        if use_mstva:
+            text_tokens, text_mask = self.build_text_tokens(
+                token_refer_id,
+                batch_size=input_ids.shape[0] if input_ids is not None else None,
+                device=images.device if images is not None else None,
+            )
+            if text_tokens is None:
+                if not getattr(self, "_eval_seg_mstva_bypass_warned", False):
+                    self._eval_seg_mstva_bypass_warned = True
+                    print(
+                        "[WARNING][eval_seg] use_mstva=True but text_tokens is None "
+                        "(token_refer_id is None or yielded no valid tokens); MSTVA bypassed in eval."
+                    )
+            elif not getattr(self, "_eval_seg_mstva_debug_logged", False):
+                self._eval_seg_mstva_debug_logged = True
+                print("[DEBUG][eval_seg] use_mstva=True")
+                print(f"[DEBUG][eval_seg] text_tokens shape={tuple(text_tokens.shape)}")
+                if text_mask is not None:
+                    valid_per_sample = text_mask.sum(dim=-1).float()
+                    print(
+                        "[DEBUG][eval_seg] text_mask valid count "
+                        f"mean={valid_per_sample.mean().item():.2f} "
+                        f"min={int(valid_per_sample.min().item())} "
+                        f"max={int(valid_per_sample.max().item())}"
+                    )
+                else:
+                    print("[DEBUG][eval_seg] text_mask is None")
+
+        image_features = self.get_vision_tower_feature(
+            images,
+            text_cond=text_cond,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+        )
 
         input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
