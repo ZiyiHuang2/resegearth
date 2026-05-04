@@ -120,6 +120,11 @@ class TrainingArguments(transformers.TrainingArguments):
     structured_decay_end_step: int = field(default=-1)
     strict_attention_selection: bool = field(default=False)
     structured_log_interval: int = field(default=50)
+    diagnose_structured_effect: bool = field(default=False)
+    diagnose_structured_effect_interval: int = field(default=0)
+    diagnose_structured_effect_threshold: float = field(default=0.0)
+    diagnose_structured_effect_mean_abs_threshold: float = field(default=1e-3)
+    diagnose_structured_effect_eps: float = field(default=1e-6)
 
 
 def _parse_target_layers(target_layers_raw: Optional[str]):
@@ -374,6 +379,13 @@ def train():
     model.config.structured_log_interval = training_args.structured_log_interval
     model.config.use_precomputed_structured_maps = data_args.use_precomputed_structured_maps
     model.config.structured_map_dir = data_args.structured_map_dir
+    model.config.diagnose_structured_effect = training_args.diagnose_structured_effect
+    model.config.diagnose_structured_effect_interval = training_args.diagnose_structured_effect_interval
+    model.config.diagnose_structured_effect_threshold = training_args.diagnose_structured_effect_threshold
+    model.config.diagnose_structured_effect_mean_abs_threshold = (
+        training_args.diagnose_structured_effect_mean_abs_threshold
+    )
+    model.config.diagnose_structured_effect_eps = training_args.diagnose_structured_effect_eps
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None

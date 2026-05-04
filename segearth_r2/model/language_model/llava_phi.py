@@ -62,6 +62,23 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     structured_schedule_phase_id: Optional[torch.FloatTensor] = None
     structured_skip_reason_code: Optional[torch.FloatTensor] = None
     attention_audit: Optional[dict] = None
+    # --- structured output-effect diagnostics (optional; see diagnose_structured_effect) ---
+    structured_output_effect_mean: Optional[torch.FloatTensor] = None
+    structured_output_effect_nonzero_ratio: Optional[torch.FloatTensor] = None
+    structured_output_effect_gt_threshold_ratio: Optional[torch.FloatTensor] = None
+    structured_output_effect_mean_small: Optional[torch.FloatTensor] = None
+    structured_output_effect_mean_non_small: Optional[torch.FloatTensor] = None
+    structured_output_effect_nonzero_ratio_small: Optional[torch.FloatTensor] = None
+    structured_output_effect_nonzero_ratio_non_small: Optional[torch.FloatTensor] = None
+    diag_mask_logits_mean_abs_diff: Optional[torch.FloatTensor] = None
+    diag_binary_mask_disagree_ratio: Optional[torch.FloatTensor] = None
+    diag_pred_mask_iou_between_runs: Optional[torch.FloatTensor] = None
+    diag_pred_area_change_ratio: Optional[torch.FloatTensor] = None
+    diag_iou_with_gt_run_a: Optional[torch.FloatTensor] = None
+    diag_iou_with_gt_run_b: Optional[torch.FloatTensor] = None
+    diag_delta_iou_vs_gt: Optional[torch.FloatTensor] = None
+    diag_attention_sup_default_minus_unstructured: Optional[torch.FloatTensor] = None
+    diag_structured_supervision_alters_mask_forward_path: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -1023,6 +1040,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         image_features_indices,
         seg_info,
         global_step=None,
+        supervision_branch: Optional[str] = None,
+        skip_side_effects: bool = False,
     ):
         if not getattr(self.config, "use_attention_loss", True):
             zero = torch.tensor(0.0, device=self.device)
@@ -1117,6 +1136,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for layer_idx, layer_base in zip(extracted_layer_indices, per_layer_baseline)
         }
         use_structured = getattr(self.config, "use_structured_attention_loss", False)
+        effective_use_structured = use_structured
+        if supervision_branch == "unstructured_baseline":
+            effective_use_structured = False
         requested_target_layers = getattr(self.config, "target_layers", None) if use_structured else None
         selected_layer_indices = list(extracted_layer_indices)
         if use_structured and requested_target_layers is not None and len(requested_target_layers) > 0:
@@ -1170,7 +1192,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self._structured_total_batches = 0
         if not hasattr(self, "_structured_skipped_batches"):
             self._structured_skipped_batches = 0
-        if use_structured:
+        if effective_use_structured:
             small_weight = float(getattr(self.config, "small_weight", 1.5))
             small_ratio_threshold = float(getattr(self.config, "small_area_ratio_threshold", 0.01))
             area_ratio = fg_mask.float().mean(dim=1)
@@ -1262,16 +1284,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     skip_reason = "no_valid_selected_heads_or_attention"
                     structured_skip_reason_code = torch.tensor(2.0, device=fg_mask.device)
                 strict_attention_selection = bool(getattr(self.config, "strict_attention_selection", False))
-                self._structured_total_batches += 1
-                self._structured_skipped_batches += 1
+                if not skip_side_effects:
+                    self._structured_total_batches += 1
+                    self._structured_skipped_batches += 1
                 if strict_attention_selection:
                     raise ValueError(f"No valid structured attention supervision terms were selected ({skip_reason}).")
-                print(f"[StructuredAttention][warn] skip structured loss at step={global_step}, reason={skip_reason}")
+                if not skip_side_effects:
+                    print(f"[StructuredAttention][warn] skip structured loss at step={global_step}, reason={skip_reason}")
                 loss_attention = torch.tensor(0.0, device=fg_mask.device)
                 loss_attn_fg_bg = torch.tensor(0.0, device=fg_mask.device)
                 loss_attn_boundary_outer = torch.tensor(0.0, device=fg_mask.device)
             else:
-                self._structured_total_batches += 1
+                if not skip_side_effects:
+                    self._structured_total_batches += 1
                 per_instance_total = per_instance_total / float(num_terms)
                 per_instance_fg_bg = per_instance_fg_bg / float(num_terms)
                 per_instance_boundary_outer = per_instance_boundary_outer / float(num_terms)
@@ -1302,7 +1327,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         per_instance_boundary_outer[non_small_mask] * sample_weights[non_small_mask]
                     ).mean() * structured_effective_weight
 
-                if self._should_log_structured_detail(global_step):
+                if self._should_log_structured_detail(global_step) and not skip_side_effects:
                     skip_ratio = float(self._structured_skipped_batches / max(self._structured_total_batches, 1))
                     print(
                         f"[StructuredAttention][diag] step={global_step}, selected_layers={selected_layer_indices}, "
@@ -1325,14 +1350,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 loss_attention = loss_attention + self.attention_loss(baseline_attention, fg_mask)
 
         selected_layer_head_tensors = [layer_to_head_tensor[x] for x in selected_layer_indices]
-        audit_payload = self._maybe_dump_attention_audit(
-            per_layer_head=selected_layer_head_tensors,
-            fg_mask=fg_mask,
-            boundary_map=boundary_map,
-            outer_ring_map=outer_ring_map,
-            seg_info=seg_info,
-            global_step=global_step,
-        )
+        audit_payload = None
+        if not skip_side_effects:
+            audit_payload = self._maybe_dump_attention_audit(
+                per_layer_head=selected_layer_head_tensors,
+                fg_mask=fg_mask,
+                boundary_map=boundary_map,
+                outer_ring_map=outer_ring_map,
+                seg_info=seg_info,
+                global_step=global_step,
+            )
         stats = {
             "loss_attn_fg_bg": loss_attn_fg_bg,
             "loss_attn_boundary_outer": loss_attn_boundary_outer,
@@ -1366,7 +1393,289 @@ class SegEarthR2(MiphaPhiForCausalLM):
             "structured_skip_reason_code": structured_skip_reason_code,
         }
         return loss_attention, audit_payload, stats
-           
+
+    def _should_run_structured_effect_diagnose(self, global_step, seg_info) -> bool:
+        if not bool(getattr(self.config, "diagnose_structured_effect", False)):
+            return False
+        if seg_info is None:
+            return False
+        interval = int(getattr(self.config, "diagnose_structured_effect_interval", 0) or 0)
+        if interval <= 0:
+            return False
+        if global_step is None:
+            return False
+        if int(global_step) % interval != 0:
+            return False
+        if len(seg_info) == 0:
+            return False
+        first = seg_info[0]
+        if "padding_mask" not in first and "mask" not in first:
+            return False
+        return True
+
+    def _forward_llm_and_mask_no_prepare(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor],
+        past_key_values: Optional[List[torch.FloatTensor]],
+        inputs_embeds: Optional[torch.FloatTensor],
+        labels: Optional[torch.LongTensor],
+        image_features,
+        mask_num,
+        SEG_token_embedding_indices: torch.Tensor,
+        use_cache: Optional[bool],
+        return_dict: bool,
+        output_attentions: bool,
+    ):
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=False,
+            return_dict=return_dict,
+        )
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        mask_features, _transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+            image_features
+        )
+        mask_num_t = torch.tensor(mask_num, device=mask_features.device)
+        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num_t, dim=0)
+        multi_scale_features = [
+            torch.repeat_interleave(feat, repeats=mask_num_t, dim=0) for feat in multi_scale_features
+        ]
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        return logits, mask_outputs, outputs
+
+    @staticmethod
+    def _structured_diag_subset_key(seg_item) -> str:
+        subset = seg_item.get("subset", None)
+        if subset is None:
+            subset = seg_item.get("subset_name", None)
+        if subset is None:
+            subset = seg_item.get("eval_subset", None)
+        if subset is None:
+            return "ALL"
+        text = str(subset).strip().upper()
+        if text.startswith("B"):
+            return "B"
+        if text.startswith("R"):
+            return "R"
+        return "OTHER"
+
+    def _structured_diag_best_query_flat(self, pred_logits_qhw: torch.Tensor, gt_hw: torch.Tensor, logit_thresh: float):
+        """pred_logits_qhw [Q,Hp,Wp], gt_hw [H,W] bool or float mask."""
+        q = int(pred_logits_qhw.shape[0])
+        gt_bin = (gt_hw > 0.5).float()
+        h, w = int(gt_bin.shape[-2]), int(gt_bin.shape[-1])
+        best_iou = torch.tensor(-1.0, device=pred_logits_qhw.device, dtype=torch.float32)
+        best_flat = pred_logits_qhw[0]
+        for qi in range(q):
+            up = F.interpolate(
+                pred_logits_qhw[qi : qi + 1].unsqueeze(0),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0).squeeze(0)
+            pbin = (up > logit_thresh).float()
+            inter = (pbin * gt_bin).sum()
+            union = pbin.sum() + gt_bin.sum() - inter
+            iou = inter / union.clamp_min(1e-6)
+            if float(iou.item()) > float(best_iou.item()):
+                best_iou = iou
+                best_flat = up
+        return best_flat, best_iou
+
+    def _run_structured_effect_diagnostics(
+        self,
+        *,
+        outputs,
+        seg_info,
+        targets,
+        input_ids,
+        attention_mask,
+        past_key_values,
+        inputs_embeds,
+        labels,
+        image_features,
+        mask_num,
+        SEG_token_embedding_indices,
+        image_features_indices,
+        use_cache,
+        return_dict,
+        global_step,
+    ):
+        device = self.device
+
+        def _z(v):
+            return torch.tensor(float(v), device=device, dtype=torch.float32)
+
+        thresh = float(getattr(self.config, "diagnose_structured_effect_threshold", 0.0))
+        small_ratio_threshold = float(getattr(self.config, "small_area_ratio_threshold", 0.01))
+        effect_eps = float(getattr(self.config, "diagnose_structured_effect_eps", 1e-6))
+        mean_abs_thr = float(getattr(self.config, "diagnose_structured_effect_mean_abs_threshold", 1e-3))
+
+        loss_default, _, _ = self._compute_attention_loss(
+            attentions=outputs.attentions,
+            SEG_token_embedding_indices=SEG_token_embedding_indices,
+            image_features_indices=image_features_indices,
+            seg_info=seg_info,
+            global_step=global_step,
+            supervision_branch=None,
+            skip_side_effects=True,
+        )
+        loss_unstructured, _, _ = self._compute_attention_loss(
+            attentions=outputs.attentions,
+            SEG_token_embedding_indices=SEG_token_embedding_indices,
+            image_features_indices=image_features_indices,
+            seg_info=seg_info,
+            global_step=global_step,
+            supervision_branch="unstructured_baseline",
+            skip_side_effects=True,
+        )
+        diag_loss_delta = loss_default.detach().float() - loss_unstructured.detach().float()
+
+        was_training = self.training
+        self.eval()
+        mean_abs_list = []
+        disagree_list = []
+        area_ratio_list = []
+        iou_a_list = []
+        iou_b_list = []
+        is_small_list = []
+        pred_a_list = []
+        pred_b_list = []
+
+        with torch.inference_mode():
+            _logits_a, mo_a, _ = self._forward_llm_and_mask_no_prepare(
+                input_ids,
+                attention_mask,
+                past_key_values,
+                inputs_embeds,
+                labels,
+                image_features,
+                mask_num,
+                SEG_token_embedding_indices,
+                use_cache,
+                return_dict,
+                output_attentions=False,
+            )
+            _logits_b, mo_b, _ = self._forward_llm_and_mask_no_prepare(
+                input_ids,
+                attention_mask,
+                past_key_values,
+                inputs_embeds,
+                labels,
+                image_features,
+                mask_num,
+                SEG_token_embedding_indices,
+                use_cache,
+                return_dict,
+                output_attentions=False,
+            )
+
+        self.train(was_training)
+
+        pred_a = mo_a["pred_masks"].detach().float()
+        pred_b = mo_b["pred_masks"].detach().float()
+        bs = int(pred_a.shape[0])
+
+        for b in range(bs):
+            gt_masks = targets[b]["masks"]
+            if gt_masks.dim() != 3 or gt_masks.shape[0] == 0:
+                continue
+            gt0 = gt_masks[0].detach().float()
+            pa, iou_a = self._structured_diag_best_query_flat(pred_a[b], gt0, thresh)
+            pb, iou_b = self._structured_diag_best_query_flat(pred_b[b], gt0, thresh)
+            pred_a_list.append(pa)
+            pred_b_list.append(pb)
+            iou_a_list.append(iou_a)
+            iou_b_list.append(iou_b)
+            diff = (pa - pb).abs()
+            mean_abs_list.append(diff.mean())
+            pa_bin = (pa > thresh).float()
+            pb_bin = (pb > thresh).float()
+            disagree_list.append((pa_bin != pb_bin).float().mean())
+            denom = pb_bin.sum().clamp_min(torch.tensor(1.0, device=device, dtype=pb_bin.dtype))
+            area_ratio_list.append((pa_bin.sum() - pb_bin.sum()).abs() / denom)
+            gt_area_ratio = float(gt0.float().mean().item())
+            is_small_list.append(gt_area_ratio < small_ratio_threshold)
+
+        if len(mean_abs_list) == 0:
+            return {
+                "structured_output_effect_mean": _z(0.0),
+                "structured_output_effect_nonzero_ratio": _z(0.0),
+                "structured_output_effect_gt_threshold_ratio": _z(0.0),
+                "structured_output_effect_mean_small": _z(0.0),
+                "structured_output_effect_mean_non_small": _z(0.0),
+                "structured_output_effect_nonzero_ratio_small": _z(0.0),
+                "structured_output_effect_nonzero_ratio_non_small": _z(0.0),
+                "diag_mask_logits_mean_abs_diff": _z(0.0),
+                "diag_binary_mask_disagree_ratio": _z(0.0),
+                "diag_pred_mask_iou_between_runs": _z(1.0),
+                "diag_pred_area_change_ratio": _z(0.0),
+                "diag_iou_with_gt_run_a": _z(0.0),
+                "diag_iou_with_gt_run_b": _z(0.0),
+                "diag_delta_iou_vs_gt": _z(0.0),
+                "diag_attention_sup_default_minus_unstructured": diag_loss_delta.detach(),
+                "diag_structured_supervision_alters_mask_forward_path": _z(0.0),
+            }
+
+        mean_abs = torch.stack(mean_abs_list)
+        disagree = torch.stack(disagree_list)
+        iou_a_t = torch.stack([x.view(()) for x in iou_a_list])
+        iou_b_t = torch.stack([x.view(()) for x in iou_b_list])
+        is_small_t = torch.tensor(is_small_list, device=device, dtype=torch.bool)
+
+        nonzero_ratio = (mean_abs > effect_eps).float().mean()
+        gt_ratio = (mean_abs > mean_abs_thr).float().mean()
+
+        def _bucket_mean(mask_t, vals):
+            if not mask_t.any():
+                return _z(0.0)
+            return vals[mask_t].mean()
+
+        def _bucket_ratio(mask_t, vals):
+            if not mask_t.any():
+                return _z(0.0)
+            return (vals[mask_t] > effect_eps).float().mean()
+
+        inter_ab = []
+        union_ab = []
+        for pa, pb in zip(pred_a_list, pred_b_list):
+            a_bin = (pa > thresh).float()
+            b_bin = (pb > thresh).float()
+            inter_ab.append((a_bin * b_bin).sum())
+            union_ab.append(a_bin.sum() + b_bin.sum() - (a_bin * b_bin).sum())
+        inter_t = torch.stack(inter_ab)
+        union_t = torch.stack(union_ab).clamp_min(1e-6)
+        iou_between = (inter_t / union_t).mean()
+        area_change = torch.stack(area_ratio_list).mean()
+
+        out = {
+            "structured_output_effect_mean": mean_abs.mean(),
+            "structured_output_effect_nonzero_ratio": nonzero_ratio,
+            "structured_output_effect_gt_threshold_ratio": gt_ratio,
+            "structured_output_effect_mean_small": _bucket_mean(is_small_t, mean_abs),
+            "structured_output_effect_mean_non_small": _bucket_mean(~is_small_t, mean_abs),
+            "structured_output_effect_nonzero_ratio_small": _bucket_ratio(is_small_t, mean_abs),
+            "structured_output_effect_nonzero_ratio_non_small": _bucket_ratio(~is_small_t, mean_abs),
+            "diag_mask_logits_mean_abs_diff": mean_abs.mean(),
+            "diag_binary_mask_disagree_ratio": disagree.mean(),
+            "diag_pred_mask_iou_between_runs": iou_between,
+            "diag_pred_area_change_ratio": area_change,
+            "diag_iou_with_gt_run_a": iou_a_t.mean(),
+            "diag_iou_with_gt_run_b": iou_b_t.mean(),
+            "diag_delta_iou_vs_gt": (iou_a_t - iou_b_t).mean(),
+            "diag_attention_sup_default_minus_unstructured": diag_loss_delta.detach().float(),
+            "diag_structured_supervision_alters_mask_forward_path": _z(0.0),
+        }
+        return out
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -1453,6 +1762,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             llm_loss = loss_fct(shift_logits, shift_labels)
             
         mask_loss = None
+        targets = None
+        structured_effect_diag_pack = None
         if seg_info is not None:
             if 'padding_mask' in seg_info[0]:
                 if isinstance(seg_info[0]["instances"], list):
@@ -1493,6 +1804,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 else:
                     mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
+            if targets is not None and self._should_run_structured_effect_diagnose(global_step, seg_info):
+                structured_effect_diag_pack = self._run_structured_effect_diagnostics(
+                    outputs=outputs,
+                    seg_info=seg_info,
+                    targets=targets,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds,
+                    labels=labels,
+                    image_features=image_features,
+                    mask_num=mask_num,
+                    SEG_token_embedding_indices=SEG_token_embedding_indices,
+                    image_features_indices=image_features_indices,
+                    use_cache=use_cache,
+                    return_dict=return_dict,
+                    global_step=global_step,
+                )
 
         loss_attention, attention_audit, attention_stats = self._compute_attention_loss(
             attentions=outputs.attentions,
@@ -1536,6 +1865,86 @@ class SegEarthR2(MiphaPhiForCausalLM):
             structured_schedule_phase_id=attention_stats["structured_schedule_phase_id"].detach(),
             structured_skip_reason_code=attention_stats["structured_skip_reason_code"].detach(),
             attention_audit=attention_audit,
+            structured_output_effect_mean=(
+                structured_effect_diag_pack["structured_output_effect_mean"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            structured_output_effect_nonzero_ratio=(
+                structured_effect_diag_pack["structured_output_effect_nonzero_ratio"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            structured_output_effect_gt_threshold_ratio=(
+                structured_effect_diag_pack["structured_output_effect_gt_threshold_ratio"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            structured_output_effect_mean_small=(
+                structured_effect_diag_pack["structured_output_effect_mean_small"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            structured_output_effect_mean_non_small=(
+                structured_effect_diag_pack["structured_output_effect_mean_non_small"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            structured_output_effect_nonzero_ratio_small=(
+                structured_effect_diag_pack["structured_output_effect_nonzero_ratio_small"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            structured_output_effect_nonzero_ratio_non_small=(
+                structured_effect_diag_pack["structured_output_effect_nonzero_ratio_non_small"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_mask_logits_mean_abs_diff=(
+                structured_effect_diag_pack["diag_mask_logits_mean_abs_diff"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_binary_mask_disagree_ratio=(
+                structured_effect_diag_pack["diag_binary_mask_disagree_ratio"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_pred_mask_iou_between_runs=(
+                structured_effect_diag_pack["diag_pred_mask_iou_between_runs"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_pred_area_change_ratio=(
+                structured_effect_diag_pack["diag_pred_area_change_ratio"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_iou_with_gt_run_a=(
+                structured_effect_diag_pack["diag_iou_with_gt_run_a"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_iou_with_gt_run_b=(
+                structured_effect_diag_pack["diag_iou_with_gt_run_b"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_delta_iou_vs_gt=(
+                structured_effect_diag_pack["diag_delta_iou_vs_gt"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_attention_sup_default_minus_unstructured=(
+                structured_effect_diag_pack["diag_attention_sup_default_minus_unstructured"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
+            diag_structured_supervision_alters_mask_forward_path=(
+                structured_effect_diag_pack["diag_structured_supervision_alters_mask_forward_path"].detach()
+                if structured_effect_diag_pack
+                else None
+            ),
         )
     
     def eval_seg(
@@ -1554,8 +1963,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
-            mask_num = None):
-        
+            mask_num=None,
+            return_mask_logits_all: bool = False):
+        """
+        return_mask_logits_all: if True, each output dict includes float32 'pred_logits_all' [Q,H,W]
+        (after interpolate to image size). Default False preserves legacy eval behavior.
+        """
         output_attentions = False
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1613,5 +2026,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 'id': _seg_info['data_id'],
                 'mask_id': _seg_info['mask_id'],
             }
+            if return_mask_logits_all:
+                instance_r['pred_logits_all'] = mask_pred_result.detach().float().cpu().numpy()
             processed_results.append(instance_r)
         return processed_results

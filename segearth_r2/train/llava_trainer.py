@@ -328,6 +328,22 @@ class LLaVATrainer(Trainer):
                     "loss_attn_fg_bg_non_small",
                     "loss_attn_boundary_outer_small",
                     "loss_attn_boundary_outer_non_small",
+                    "structured_output_effect_mean",
+                    "structured_output_effect_nonzero_ratio",
+                    "structured_output_effect_gt_threshold_ratio",
+                    "structured_output_effect_mean_small",
+                    "structured_output_effect_mean_non_small",
+                    "structured_output_effect_nonzero_ratio_small",
+                    "structured_output_effect_nonzero_ratio_non_small",
+                    "diag_mask_logits_mean_abs_diff",
+                    "diag_binary_mask_disagree_ratio",
+                    "diag_pred_mask_iou_between_runs",
+                    "diag_pred_area_change_ratio",
+                    "diag_iou_with_gt_run_a",
+                    "diag_iou_with_gt_run_b",
+                    "diag_delta_iou_vs_gt",
+                    "diag_attention_sup_default_minus_unstructured",
+                    "diag_structured_supervision_alters_mask_forward_path",
                 ]:
                     if key in outputs:
                         scalar = self._to_float_metric(outputs[key])
