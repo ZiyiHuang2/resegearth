@@ -1,0 +1,914 @@
+{
+  "version": "seed_next_v1",
+  "dataset": "RRSIS-D",
+  "global_constraints": [],
+  "concepts": {
+    "vegetation": {
+      "aliases": [
+        "vegetation",
+        "vegetated area",
+        "vegetation cover"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'vegetation' as 'tree', 'trees', 'grass', 'crop', 'farmland', 'forest', or 'green' unless explicitly stated in the raw referring expression.",
+        "Do not infer structural, taxonomic, or land-use specificity (e.g., 'forest' or 'crop') from generic vegetation descriptors."
+      ],
+      "canonical_name": "vegetation",
+      "concept_key": "vegetation",
+      "concept_semantics": [
+        "A surface-covering biotic material class observable in remote sensing imagery via spectral, textural, and spatial signatures.",
+        "Manifests variably across sensors and seasons; may appear spectrally distinct from bare soil, water, or built surfaces but lacks intrinsic uniformity in form, density, or composition.",
+        "No single spectral signature or geometric pattern is diagnostic; interpretation depends on context, resolution, and sensor band configuration."
+      ],
+      "definition": "Surface-occurring photosynthetic plant life detectable in remote sensing imagery through reflectance, texture, and spatial configuration — without commitment to taxonomic, structural, or land-use specificity.",
+      "forbidden_auto_infer_tokens": [
+        "tree",
+        "trees",
+        "grass",
+        "crop",
+        "farmland",
+        "forest",
+        "green",
+        "dense",
+        "sparse",
+        "canopy",
+        "linear",
+        "belt",
+        "mixed",
+        "region"
+      ],
+      "notes": "Vegetation is a broad functional class in remote sensing; visual forms describe observable spatial-spectral patterns, not biological or land-use categories. Avoid conflating spectral response (e.g., NDVI-based greenness) with semantic labels like 'green' or 'forest'.",
+      "remote_sensing_understanding": [
+        "Spectral response varies by species, health, moisture, phenology, and sensor band selection (e.g., NIR reflectance is commonly used but not definitive).",
+        "Texture and spatial arrangement (e.g., clumping, linearity, patchiness) are often more discriminative than color alone at medium-to-coarse resolutions.",
+        "Presence cannot be confirmed solely from high NDVI; false positives occur over wet soils, algae, or certain artificial surfaces."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "vegetation",
+          "condition": "when raw text says 'vegetation', 'vegetated area', or 'vegetation cover' — retain as generic definite noun phrase",
+          "not_allowed": "rewrite as 'forest', 'crop', 'grass', or 'tree cover' unless explicitly named"
+        },
+        {
+          "allowed_rewrite": "a vegetated area",
+          "condition": "for indefinite or vague references (e.g., 'some green stuff') — use only the canonical name or aliases in neutral phrasing",
+          "not_allowed": "introduce 'dense', 'sparse', 'linear', or 'canopy' unless present in raw text"
+        }
+      ],
+      "segmentation_relevance": [
+        "Critical for land cover mapping, change detection, and ecological monitoring.",
+        "Often serves as a primary class in multi-class segmentation models, but requires careful handling of intra-class variability.",
+        "Boundary ambiguity is common at ecotones, urban fringes, and low-density vegetation where spectral similarity with soil or shadow occurs."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "vegetation_density",
+          "spatial_pattern",
+          "seasonal_state"
+        ],
+        "allowed_slot_hints": [
+          "density",
+          "pattern",
+          "season"
+        ],
+        "do_not_emit_as_text": [
+          "vegetation_density",
+          "spatial_pattern",
+          "seasonal_state",
+          "density",
+          "pattern",
+          "season"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No vegetation signal is discernible; may indicate bare soil, built surface, water, or cloud/shadow masking.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_context_or_annotation",
+          "meaning": "A contiguous region exhibiting high near-infrared reflectance and fine-grained texture consistent with closed vertical structure, but without taxonomic or land-use attribution.",
+          "option": "dense canopy region"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_context_or_annotation",
+          "meaning": "A heterogeneous, low-to-moderate coverage area showing variable reflectance and fragmented texture — insufficient to support inference of specific vegetation type or management.",
+          "option": "sparse mixed vegetation"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_context_or_annotation",
+          "meaning": "A narrow, elongated zone of elevated vegetation signal aligned with linear features (e.g., roadsides, canals, property boundaries), without implication of species or function.",
+          "option": "linear vegetated belt"
+        }
+      ]
+    },
+    "farmland": {
+      "aliases": [
+        "farmland",
+        "farmlands",
+        "agricultural land"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'farmland' as 'crop field', 'irrigated field', 'greenhouse complex', or any subtype unless the raw text explicitly names that subtype."
+      ],
+      "canonical_name": "farmland",
+      "concept_key": "farmland",
+      "concept_semantics": [
+        "land used for agricultural production",
+        "anthropogenic land cover modified for cultivation or livestock grazing",
+        "typically exhibits spatial patterns distinguishable from natural vegetation or urban land cover in remote sensing imagery"
+      ],
+      "definition": "Land managed for agricultural purposes, including cultivation of crops, pasture for livestock, or other farming activities; identifiable in remote sensing imagery by spatial structure, texture, spectral response, and context.",
+      "forbidden_auto_infer_tokens": [
+        "crop",
+        "crops",
+        "field",
+        "fields",
+        "irrigation",
+        "greenhouse",
+        "rectangular",
+        "mosaic",
+        "cultivated",
+        "strip",
+        "parcels",
+        "irregular",
+        "patches"
+      ],
+      "notes": "Farmland is a functional land-use class, not a spectral or morphological category. Visual forms reflect common management patterns but are not diagnostic: same visual form may occur in non-agricultural contexts (e.g., solar farms), and same land-use may exhibit variable forms (e.g., terraced vs. flat cultivated land). Avoid inferring crop type, irrigation status, or infrastructure without explicit textual support.",
+      "remote_sensing_understanding": [
+        "Often exhibits high spectral contrast with adjacent land covers (e.g., forests, urban areas)",
+        "May show seasonal phenological variation in multispectral time series",
+        "Texture and geometry (e.g., parcel boundaries) often more discriminative than spectral signature alone",
+        "Spectral response depends on crop type, growth stage, soil moisture, and management practices — not fixed"
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the farmland",
+          "condition": "when referring to a specific instance previously introduced or visually grounded in the image",
+          "not_allowed": "crop field, irrigated farmland, greenhouse area, or any subtype unless explicitly stated in raw text"
+        },
+        {
+          "allowed_rewrite": "farmland",
+          "condition": "as a generic unmodified noun phrase",
+          "not_allowed": "rectangular farmland, cultivated farmland, strip farmland, or any modifier derived from visual_form_options unless present in raw text"
+        }
+      ],
+      "segmentation_relevance": [
+        "Farmland segmentation supports land-use mapping, agricultural monitoring, and change detection",
+        "Boundary delineation is often challenging due to intra-class spectral variability and adjacency to similar land covers (e.g., bare soil, fallow land)"
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "land_use",
+          "management_pattern",
+          "parcel_geometry"
+        ],
+        "allowed_slot_hints": [
+          "land_use=agricultural",
+          "management_pattern=strip_cultivation",
+          "parcel_geometry=irregular"
+        ],
+        "do_not_emit_as_text": [
+          "land_use",
+          "management_pattern",
+          "parcel_geometry",
+          "land_use=agricultural",
+          "management_pattern=strip_cultivation",
+          "parcel_geometry=irregular"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "no distinctive visual pattern attributable to farmland is discernible in the imagery patch or description",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_visually_unambiguous",
+          "meaning": "arrangement of contiguous rectangular parcels forming a tessellated or grid-like pattern",
+          "option": "rectangular field mosaic"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_visually_unambiguous",
+          "meaning": "long, narrow, parallel cultivation strips aligned along terrain contours or field boundaries",
+          "option": "strip cultivated parcels"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_visually_unambiguous",
+          "meaning": "non-uniform, fragmented, or organic-shaped cultivated areas without regular geometry",
+          "option": "irregular cultivated patches"
+        }
+      ]
+    },
+    "grassland": {
+      "aliases": [
+        "grassland",
+        "grasslands",
+        "grass area"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'grassland' as 'pasture', 'meadow', 'lawn', 'farmland', or 'forest' unless the raw text explicitly uses that term.",
+        "Do not infer shrub presence or dominance from 'grassland' alone; 'mixed grass shrub zone' requires explicit mention of shrub or shrubby vegetation in the raw text."
+      ],
+      "canonical_name": "grassland",
+      "concept_key": "grassland",
+      "concept_semantics": [
+        "A land cover type dominated by herbaceous vegetation, typically perennial grasses and forbs, with minimal woody plant cover.",
+        "In remote sensing, often distinguished by moderate near-infrared reflectance, low shortwave infrared response, and relatively uniform spectral texture at medium to coarse spatial resolutions.",
+        "May occur in natural, semi-natural, or anthropogenic contexts (e.g., rangeland, managed pasture), but class label 'grassland' does not imply management status or origin without supporting evidence."
+      ],
+      "definition": "A terrestrial ecosystem or land cover class characterized by a continuous or discontinuous layer of grasses and non-woody herbaceous plants, with limited or no closed-canopy tree cover and low to moderate structural complexity.",
+      "forbidden_auto_infer_tokens": [
+        "pasture",
+        "meadow",
+        "lawn",
+        "shrub",
+        "forest",
+        "farmland",
+        "continuous",
+        "patchy",
+        "grassy",
+        "region",
+        "coverage",
+        "zone",
+        "mixed"
+      ],
+      "notes": "Grassland is a broad land cover category; visual form options describe observable spatial patterns in imagery—not ecological classification. Avoid conflating with agricultural or successional states unless explicitly stated.",
+      "remote_sensing_understanding": [
+        "Spectral signature varies with moisture, phenology, species composition, and soil background; often overlaps with cropland or sparse shrubland in broadband indices.",
+        "Texture and spatial arrangement (e.g., patchiness, edge density) may aid discrimination from adjacent land covers such as bare soil or forest.",
+        "Seasonal composites or time-series analysis improve robustness over single-date identification."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "grassland",
+          "condition": "when raw text says 'grassland', 'grasslands', or 'grass area' verbatim",
+          "not_allowed": "any subtype or contextual modifier unless present in raw text"
+        },
+        {
+          "allowed_rewrite": "grassland area",
+          "condition": "as a generic definite noun phrase replacing imperative or vague phrasing (e.g., 'find the grassland' → 'the grassland area')",
+          "not_allowed": "adding adjectives like 'continuous', 'patchy', or 'mixed' unless present in raw text"
+        }
+      ],
+      "segmentation_relevance": [
+        "High relevance for land cover mapping, rangeland monitoring, and habitat assessment.",
+        "Segmentation performance depends on distinguishing grassland from spectrally similar classes (e.g., senescent cropland, low-density shrubland, or green herbaceous wetland)."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "grassland_type",
+          "spatial_pattern"
+        ],
+        "allowed_slot_hints": [
+          "pattern:continuous",
+          "pattern:patchy",
+          "composition:mixed_grass_shrub"
+        ],
+        "do_not_emit_as_text": [
+          "grassland_type",
+          "spatial_pattern",
+          "pattern:continuous",
+          "pattern:patchy",
+          "composition:mixed_grass_shrub"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visually discriminable grassland pattern is evident in the imagery patch; insufficient evidence to assign a specific form.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_high_confidence_visual_evidence",
+          "meaning": "A spatially contiguous, spectrally homogeneous expanse of herbaceous vegetation with consistent texture and reflectance, suggesting uniform cover.",
+          "option": "continuous grassy region"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_high_confidence_visual_evidence",
+          "meaning": "Discrete, non-contiguous patches of grassy vegetation interspersed with non-grass surfaces (e.g., bare soil, rock, or low-reflectance shadow), visible at sensor resolution.",
+          "option": "patchy grass coverage"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_high_confidence_visual_evidence",
+          "meaning": "An area where grasses and low-stature woody shrubs co-occur at comparable densities, producing mixed spectral and textural signatures in the imagery.",
+          "option": "mixed grass shrub zone"
+        }
+      ]
+    },
+    "forest": {
+      "aliases": [
+        "forest",
+        "forests",
+        "woodland"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'forest' as 'tree', 'trees', 'shrub', 'grassland', or 'farmland' unless explicitly stated in the raw referring expression.",
+        "Do not infer 'canopy' structure (e.g., 'dense', 'open', 'closed', 'fragmented') unless explicitly present in the raw text.",
+        "Do not specialize to 'woodland' unless the raw text uses that term or a direct synonym with equivalent semantic scope in remote sensing context."
+      ],
+      "canonical_name": "forest",
+      "concept_key": "forest",
+      "concept_semantics": [
+        "A land cover class characterized by persistent, vertically structured vegetation, typically dominated by trees or woody perennials, and distinguishable from non-forested land covers (e.g., bare soil, water, built-up, grassland, farmland) in medium- to high-resolution optical or SAR imagery.",
+        "In remote sensing, forest is commonly interpreted at the pixel or object level using spectral, textural, structural, or phenological cues — but definitive identification requires supporting evidence beyond isolated visual form descriptors.",
+        "Forest boundaries and internal heterogeneity (e.g., canopy continuity, height variation, species composition) are often ambiguous at coarser resolutions and may require ancillary data or multi-temporal analysis for robust segmentation."
+      ],
+      "definition": "A natural or semi-natural area dominated by trees or other woody vegetation, forming a distinct land cover class identifiable in remote sensing imagery based on spectral response, spatial texture, and structural coherence — though precise delineation depends on sensor characteristics, resolution, seasonality, and local ecological context.",
+      "forbidden_auto_infer_tokens": [
+        "tree",
+        "trees",
+        "canopy",
+        "shrub",
+        "grassland",
+        "farmland",
+        "dense",
+        "open",
+        "fragmented",
+        "patches",
+        "closed"
+      ],
+      "notes": "This concept represents a broad land cover category; its visual manifestation varies widely across biomes, management regimes, and sensor modalities. Segmentation performance is highly sensitive to canopy closure, understory density, shadowing, and seasonal leaf-on/leaf-off conditions.",
+      "remote_sensing_understanding": [
+        "Forest is rarely spectrally unique in isolation; discrimination often relies on contextual cues (e.g., adjacency to roads, field boundaries), temporal stability, and multi-spectral indices (e.g., NDVI, EVI, MSAVI2).",
+        "SAR-based forest mapping leverages volume scattering and double-bounce interactions, but is confounded by topography, moisture, and stand density.",
+        "High-resolution optical segmentation benefits from textural features (e.g., GLCM contrast, entropy) and object-based image analysis (OBIA), yet remains challenged by mixed pixels and edge effects."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "a forest",
+          "condition": "when raw text refers to a single contiguous instance without specifying structure or density",
+          "not_allowed": "a dense closed canopy forest"
+        },
+        {
+          "allowed_rewrite": "the forest",
+          "condition": "when raw text uses definite reference and no qualifying visual form is provided",
+          "not_allowed": "the open canopy forest"
+        },
+        {
+          "allowed_rewrite": "forests",
+          "condition": "when raw text explicitly pluralizes or implies multiple discrete units",
+          "not_allowed": "fragmented woodland patches"
+        }
+      ],
+      "segmentation_relevance": [
+        "Forest is a primary target for land cover/land use (LULC) mapping, carbon stock estimation, deforestation monitoring, and biodiversity habitat modeling.",
+        "Accurate forest segmentation underpins REDD+ reporting, national forest inventories, and ecosystem service assessments.",
+        "Ambiguity between forest, woodland, shrubland, and savanna is common in arid and semi-arid regions — requiring integration of height, cover, and phenology data."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "canopy_closure",
+          "spatial_continuity",
+          "structural_complexity"
+        ],
+        "allowed_slot_hints": [
+          "canopy_closure: dense",
+          "canopy_closure: open",
+          "spatial_continuity: fragmented",
+          "spatial_continuity: continuous"
+        ],
+        "do_not_emit_as_text": [
+          "canopy_closure",
+          "spatial_continuity",
+          "structural_complexity",
+          "canopy_closure: dense",
+          "canopy_closure: open",
+          "spatial_continuity: fragmented",
+          "spatial_continuity: continuous"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No specific visual form is indicated in the raw referring expression; segmentation should rely on general forest spectral/textural priors without structural assumptions.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "The raw expression specifies both high canopy density and full vertical closure, implying minimal understory visibility and strong spectral uniformity in optical bands.",
+          "option": "dense closed canopy"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "The raw expression indicates partial canopy coverage with visible gaps, permitting detection of understory or ground surface in optical imagery; common in secondary growth or drought-stressed stands.",
+          "option": "open canopy forest"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "The raw expression describes forest as discontinuous, isolated, or irregularly distributed at the scene scale — often indicating edge effects, fragmentation due to anthropogenic activity, or ecotonal transition zones.",
+          "option": "fragmented woodland patches"
+        }
+      ]
+    },
+    "bare land": {
+      "aliases": [
+        "bare land",
+        "bareland",
+        "exposed soil"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'bare land' as a specific land cover type (e.g., 'sand', 'rock', 'soil', 'farmland', 'construction', or 'vegetation') unless the raw referring expression explicitly names it.",
+        "Do not infer surface composition (e.g., sandy, rocky, barren) from context alone; only emit if present in the input text."
+      ],
+      "canonical_name": "bare land",
+      "concept_key": "bare land",
+      "concept_semantics": [
+        "A land surface with minimal or no persistent vegetation cover and no built infrastructure.",
+        "Typically appears as spectrally uniform, low-texture, and low-contrast relative to surrounding land covers in multispectral or panchromatic remote sensing imagery.",
+        "May correspond to transitional, disturbed, or naturally unvegetated terrain — but spectral or spatial signature alone does not determine composition."
+      ],
+      "definition": "A terrestrial surface lacking significant vegetation canopy or anthropogenic construction, often appearing spectrally homogeneous and texture-poor in remote sensing imagery. Its interpretation requires caution: absence of vegetation or structures does not imply a specific substrate (e.g., sand, soil, rock) without corroborating evidence.",
+      "forbidden_auto_infer_tokens": [
+        "sand",
+        "soil",
+        "rock",
+        "vegetation",
+        "farmland",
+        "construction",
+        "rocky",
+        "barren",
+        "sandy",
+        "region",
+        "patch",
+        "surface",
+        "open",
+        "exposed"
+      ],
+      "notes": "Bare land is a functional, observational category—not a geologic or pedologic class. Visual form options describe plausible appearances in imagery, not definitive ground truth. 'None' serves as the default for vague, underspecified, or non-informative inputs.",
+      "remote_sensing_understanding": [
+        "Often exhibits high reflectance in visible bands and low near-infrared (NIR) response compared to vegetated areas.",
+        "Spectral separability from other classes (e.g., dry vegetation, shadow, urban rubble) may be low; contextual cues (e.g., adjacency to roads, field boundaries, topography) aid discrimination.",
+        "Temporal change detection (e.g., appearance/disappearance between acquisitions) is more reliable than single-scene classification for identifying bare land dynamics."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "bare land",
+          "condition": "when input is generic (e.g., 'find the bare area', 'locate the open ground')",
+          "not_allowed": "do not introduce substrate (e.g., 'sandy bare land'), structure (e.g., 'barren patch'), or scale (e.g., 'region') unless present in raw text"
+        },
+        {
+          "allowed_rewrite": "exposed soil",
+          "condition": "only when raw text explicitly contains 'soil' or 'exposed soil'",
+          "not_allowed": "do not infer 'soil' from color, texture, or location"
+        },
+        {
+          "allowed_rewrite": "bareland",
+          "condition": "as a direct orthographic variant; treat identically to 'bare land'",
+          "not_allowed": "do not use as a compound modifier (e.g., 'bareland field') unless verbatim in input"
+        }
+      ],
+      "segmentation_relevance": [
+        "Critical for monitoring land degradation, post-harvest residue management, construction site activity, and wildfire burn scar delineation.",
+        "High false-positive risk when adjacent to shadows, dry vegetation, saline crusts, or low-albedo urban materials.",
+        "Best supported by multi-temporal analysis rather than single-image segmentation."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "substrate_unspecified",
+          "no_vegetation",
+          "no_construction"
+        ],
+        "allowed_slot_hints": [
+          "substrate_unspecified",
+          "no_vegetation",
+          "no_construction"
+        ],
+        "do_not_emit_as_text": [
+          "substrate_unspecified",
+          "no_vegetation",
+          "no_construction"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visual form is specified or inferable from the input; fallback for underspecified, ambiguous, or non-descriptive expressions.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "Input explicitly references soil and its exposure (e.g., 'exposed soil', 'area of exposed soil').",
+          "option": "exposed soil region"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "Input explicitly references rock and barrenness (e.g., 'rocky barren', 'barren rocky area').",
+          "option": "rocky barren patch"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "Input explicitly references sand and openness (e.g., 'sandy open', 'open sandy area').",
+          "option": "sandy open surface"
+        }
+      ]
+    },
+    "parking lot": {
+      "aliases": [
+        "parking lot",
+        "parking lots",
+        "car park"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'parking lot' as 'multi-level parking garage', 'underground parking', 'surface lot', or any architectural or functional subtype unless explicitly stated in the raw referring expression.",
+        "Do not infer presence of vehicles, markings, pavement type, or spatial density from context alone."
+      ],
+      "canonical_name": "parking lot",
+      "concept_key": "parking lot",
+      "concept_semantics": [
+        "A designated ground area intended for temporary vehicle停放 (stopping and waiting), typically adjacent to or associated with a building, road, or transit node.",
+        "In remote sensing imagery, it is identified by spatial configuration, surface reflectance, texture, and geometric regularity — not by semantic labels or textual metadata."
+      ],
+      "definition": "A contiguous, generally planar land surface area designated and arranged for the short-term parking of motor vehicles, commonly distinguished in remote sensing by uniform texture, rectilinear layout, low spectral variability, and adjacency to transport infrastructure or built environments.",
+      "forbidden_auto_infer_tokens": [
+        "vehicle",
+        "vehicles",
+        "car",
+        "cars",
+        "building",
+        "road",
+        "lane",
+        "marked",
+        "parked",
+        "paved",
+        "regular",
+        "area",
+        "dense",
+        "cluster",
+        "open",
+        "surface"
+      ],
+      "notes": "Remote sensing segmentation targets the physical footprint and surface characteristics of the parking area itself; vehicle presence, marking condition, or pavement material are not inherent attributes but optional visual form modifiers requiring explicit evidence.",
+      "remote_sensing_understanding": [
+        "Often exhibits high albedo and low textural heterogeneity relative to surrounding surfaces.",
+        "May be co-located with buildings, roads, or access lanes — but adjacency does not imply functional dependency or automatic inference of those objects.",
+        "Geometric regularity (e.g., parallel line patterns, repeated rectangular units) may support detection but is not required for definition."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "a parking lot",
+          "condition": "When original expression is vague or non-specific (e.g., 'the lot', 'that area', 'the open space near the building').",
+          "not_allowed": "a marked parking lot, a paved parking lot, a lot full of cars, a parking area for vehicles"
+        },
+        {
+          "allowed_rewrite": "the parking lot",
+          "condition": "When original expression uses definite reference without specifying visual form (e.g., 'the lot shown', 'that parking area').",
+          "not_allowed": "the regular marked parking area, the dense parked vehicle cluster, the open paved parking surface"
+        }
+      ],
+      "segmentation_relevance": [
+        "Segmentation should delineate the full contiguous surface area used for parking, including unmarked or partially obscured zones, provided they exhibit consistent functional and spectral coherence.",
+        "Partial occlusion (e.g., by shadows, trees, or adjacent structures) does not invalidate inclusion if spatial continuity and contextual plausibility hold."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "is_marked",
+          "has_vehicle_density",
+          "surface_material"
+        ],
+        "allowed_slot_hints": [
+          "is_marked",
+          "has_vehicle_density",
+          "surface_material"
+        ],
+        "do_not_emit_as_text": [
+          "is_marked",
+          "has_vehicle_density",
+          "surface_material"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No distinctive visual form is discernible or specified; fallback for ambiguous, low-resolution, or contextually underspecified references.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_visually_unambiguous",
+          "meaning": "Implies visible painted lines, symbols, or other surface treatments indicating formalized parking bays.",
+          "option": "regular marked parking area"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_visually_unambiguous",
+          "meaning": "Indicates high-density aggregation of vehicles occupying the area, often obscuring underlying surface features.",
+          "option": "dense parked vehicle cluster"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_visually_unambiguous",
+          "meaning": "Refers to an unobstructed, uniformly textured paved surface lacking visible vehicles or markings.",
+          "option": "open paved parking surface"
+        }
+      ]
+    },
+    "playground": {
+      "aliases": [
+        "playground",
+        "playgrounds",
+        "sports ground"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'playground' as 'court', 'track', 'field', 'school', 'building', or 'parking lot' unless explicitly stated in the raw referring expression.",
+        "Do not infer subtype relationships (e.g., 'playground is a sports field') from visual form alone."
+      ],
+      "canonical_name": "playground",
+      "concept_key": "playground",
+      "concept_semantics": [
+        "A designated open area intended for recreational use by children or community members, typically located in urban, suburban, or institutional settings.",
+        "In remote sensing imagery, it may appear as an anthropogenic surface feature with variable texture, contrast, and spatial configuration relative to surrounding land cover.",
+        "No assumption is made about presence, absence, or type of equipment (e.g., swings, slides), surfacing material (e.g., rubber, grass, asphalt), or functional specialization unless explicitly indicated in the referring expression."
+      ],
+      "definition": "A human-made outdoor space designed for informal recreation, commonly found in residential neighborhoods, schools, parks, or public facilities. In remote sensing, it is interpreted as a distinct land-use/land-cover unit distinguishable by context, shape, texture, and adjacency patterns — but not reliably identifiable by spectral signature alone.",
+      "forbidden_auto_infer_tokens": [
+        "court",
+        "track",
+        "field",
+        "school",
+        "building",
+        "parking lot",
+        "rectangular",
+        "sports",
+        "multi",
+        "zone",
+        "associated",
+        "play",
+        "area",
+        "ground"
+      ],
+      "notes": "Playground boundaries are often ambiguous in coarse-resolution imagery; segmentation should rely on contextual cues (e.g., proximity to residential blocks or schools) only when supported by explicit linguistic grounding. Visual form options reflect descriptive possibilities—not diagnostic criteria.",
+      "remote_sensing_understanding": [
+        "May exhibit moderate-to-high spectral variability depending on surfacing (e.g., synthetic turf vs. gravel vs. grass).",
+        "Often exhibits geometric regularity (e.g., rectilinear outlines) but not exclusively; irregular or fragmented forms occur.",
+        "Frequently adjacent to roads, sidewalks, or buildings—but adjacency is not sufficient for identification without textual support."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the playground",
+          "condition": "when original expression uses definite reference (e.g., 'find the playground')",
+          "not_allowed": "a playground with swings and a slide"
+        },
+        {
+          "allowed_rewrite": "a playground",
+          "condition": "when original expression uses indefinite reference (e.g., 'locate a playground')",
+          "not_allowed": "a rectangular sports field"
+        },
+        {
+          "allowed_rewrite": "playground",
+          "condition": "when original expression is bare noun or label (e.g., 'playground segment')",
+          "not_allowed": "multi zone play area"
+        }
+      ],
+      "segmentation_relevance": [
+        "High relevance for urban land-use mapping, accessibility analysis, and community infrastructure assessment.",
+        "Low reliability for automated detection using spectral-only models due to high intra-class variability and inter-class similarity (e.g., with parking lots or vacant lots).",
+        "Requires multimodal grounding: textual referring expressions must constrain interpretation beyond generic shape or texture cues."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "playground_type",
+          "adjacent_feature",
+          "surface_material"
+        ],
+        "allowed_slot_hints": [
+          "type",
+          "adjacent",
+          "surface"
+        ],
+        "do_not_emit_as_text": [
+          "playground_type",
+          "adjacent_feature",
+          "surface_material",
+          "type",
+          "adjacent",
+          "surface"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No specific visual form is indicated or inferable from the referring expression.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "Referring expression specifies a rectangular outline and association with organized sports activity.",
+          "option": "rectangular sports field"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "Referring expression links the playground to a running track or athletic circuit, suggesting shared infrastructure or co-location.",
+          "option": "track associated ground"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "Referring expression indicates functional partitioning into distinct activity zones (e.g., for climbing, swinging, sand play).",
+          "option": "multi zone play area"
+        }
+      ]
+    },
+    "lake": {
+      "aliases": [
+        "lake",
+        "lakes",
+        "lake area"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'lake' as 'reservoir', 'pond', 'river', 'island', or 'shore' unless the raw text explicitly states that term.",
+        "Do not infer presence of 'shore', 'island', or 'shoreline' unless explicitly mentioned in the raw referring expression."
+      ],
+      "canonical_name": "lake",
+      "concept_key": "lake",
+      "concept_semantics": [
+        "A naturally or artificially formed inland body of standing water, typically larger than a pond and smaller than a sea, observable in remote sensing imagery as a contiguous region with distinct spectral and textural properties relative to surrounding land cover.",
+        "In remote sensing context, lakes are commonly distinguished by relatively uniform reflectance in visible and near-infrared bands, low backscatter in SAR, and stable spatial extent over seasonal time scales — though these properties vary with water turbidity, depth, and sensor modality."
+      ],
+      "definition": "A standing inland water body, typically surrounded by land, distinguishable in remote sensing imagery by spectral, textural, and geometric characteristics consistent with quiescent water surfaces.",
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "reservoir",
+        "pond",
+        "shore",
+        "island",
+        "closed",
+        "shoreline",
+        "open",
+        "water",
+        "body",
+        "irregular",
+        "large",
+        "region"
+      ],
+      "notes": "Lake identification in remote sensing is highly dependent on sensor resolution, acquisition conditions (e.g., cloud cover, sun glint), and hydrological state (e.g., seasonal shrinkage, dry lake beds). Visual form options describe plausible appearance patterns—not definitive diagnostic criteria.",
+      "remote_sensing_understanding": [
+        "Lakes often exhibit low NDVI and high MNDWI values under clear-sky optical conditions.",
+        "In SAR imagery, calm lake surfaces typically appear dark due to specular reflection away from the sensor, but wind-roughened areas may show increased backscatter.",
+        "Lake boundaries may be ambiguous in low-resolution imagery or where vegetation fringes or shallow turbid margins reduce contrast."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "find the lake",
+          "condition": "raw text contains imperative verb + 'lake'",
+          "not_allowed": "find the reservoir / find the pond / find the river"
+        },
+        {
+          "allowed_rewrite": "the lake",
+          "condition": "raw text contains definite noun phrase with 'lake'",
+          "not_allowed": "the closed water body / the irregular shoreline lake / the large open lake region"
+        },
+        {
+          "allowed_rewrite": "a lake",
+          "condition": "raw text contains indefinite noun phrase with 'lake'",
+          "not_allowed": "a reservoir / a pond / an island"
+        }
+      ],
+      "segmentation_relevance": [
+        "Lake segmentation supports hydrological monitoring, water resource management, and climate change impact assessment.",
+        "Accurate lake boundary delineation is sensitive to spectral thresholding choices, edge detection parameters, and contextual post-processing (e.g., morphological closing, removal of small false positives)."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "water_body_type",
+          "shoreline_complexity",
+          "surface_openness"
+        ],
+        "allowed_slot_hints": [
+          "water_body_type=standing",
+          "shoreline_complexity=irregular",
+          "surface_openness=open"
+        ],
+        "do_not_emit_as_text": [
+          "water_body_type",
+          "shoreline_complexity",
+          "surface_openness",
+          "water_body_type=standing",
+          "shoreline_complexity=irregular",
+          "surface_openness=open"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No specific visual form is indicated; fallback for underspecified or ambiguous raw expressions.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "Implies containment within a continuous perimeter with no direct connection to flowing water networks; may suggest limited exchange with adjacent hydrologic features.",
+          "option": "closed water body"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "Suggests a non-smooth, fragmented, or highly indented boundary—often associated with glacial, tectonic, or karst origins—and may correlate with heterogeneous shoreline land cover.",
+          "option": "irregular shoreline lake"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "Indicates a broad, contiguous expanse of water surface with minimal internal structure or obstruction; does not imply absence of islands or emergent vegetation, only dominant open-water character.",
+          "option": "large open lake region"
+        }
+      ]
+    },
+    "harbor": {
+      "aliases": [
+        "harbor",
+        "harbors",
+        "port area"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'harbor' as 'dock', 'pier', 'breakwater', 'ship', or 'water' unless the raw text explicitly names that specific element.",
+        "Do not infer presence of ships, docks, piers, breakwaters, basins, waterfronts, or enclosure unless stated in the input expression."
+      ],
+      "canonical_name": "harbor",
+      "concept_key": "harbor",
+      "concept_semantics": [
+        "A coastal or inland location where vessels may moor, load/unload, and shelter from weather.",
+        "Typically includes infrastructure for maritime access and operations, but visual form varies widely across geographies and scales.",
+        "May be natural or artificial; no single shape, size, color, or spectral signature is diagnostic."
+      ],
+      "definition": "A designated area on a coastline or navigable waterbody providing safe anchorage, berthing, and logistical support for vessels.",
+      "forbidden_auto_infer_tokens": [
+        "ship",
+        "ships",
+        "dock",
+        "pier",
+        "breakwater",
+        "water",
+        "basin",
+        "waterfront",
+        "enclosed",
+        "dense",
+        "aligned",
+        "port",
+        "region",
+        "harbor basin",
+        "breakwater port"
+      ],
+      "notes": "Harbor is a functional land-use concept; its remote sensing appearance depends on infrastructure, vessel activity, and surrounding geography. Visual forms are descriptive hypotheses—not guaranteed detections.",
+      "remote_sensing_understanding": [
+        "Harbors may appear as irregularly shaped water bodies adjacent to linear or angular built structures.",
+        "Spectral and textural cues vary: calm water surfaces, high-contrast quay edges, vessel shadows, or clustered bright pixels (vessels) may be present—but none are required.",
+        "No spectral band or index reliably isolates 'harbor' independent of context and scale."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the harbor",
+          "condition": "when referring to a previously identified or contextually anchored harbor instance.",
+          "not_allowed": "a ship-filled harbor basin with enclosed breakwaters"
+        },
+        {
+          "allowed_rewrite": "the port area",
+          "condition": "when preserving original phrasing or matching an alias.",
+          "not_allowed": "the dock-aligned waterfront"
+        },
+        {
+          "allowed_rewrite": "the harbor",
+          "condition": "as a generic definite noun phrase for referential clarity.",
+          "not_allowed": "the dense ship harbor basin"
+        }
+      ],
+      "segmentation_relevance": [
+        "Harbor boundaries often align with transitions between water, built infrastructure, and land—making them amenable to multi-modal segmentation (e.g., SAR + optical fusion).",
+        "Segmentation performance depends more on local infrastructure definition than on vessel presence or water body extent."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "harbor_type",
+          "infrastructure_density",
+          "vessel_activity_level"
+        ],
+        "allowed_slot_hints": [
+          "harbor_type",
+          "infrastructure_density",
+          "vessel_activity_level"
+        ],
+        "do_not_emit_as_text": [
+          "harbor_type",
+          "infrastructure_density",
+          "vessel_activity_level"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No distinctive visual configuration is indicated; treat as generic harbor class without inferred substructure or activity.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicit_or_high_confidence",
+          "meaning": "Implies high vessel density within a defined water basin, typically bounded by quays or jetties; 'basin' suggests enclosed or semi-enclosed water geometry.",
+          "option": "dense ship harbor basin"
+        },
+        {
+          "emit_policy": "emit_if_explicit_or_high_confidence",
+          "meaning": "Suggests linear docking infrastructure aligned parallel to shoreline; 'waterfront' denotes land-water interface with built features.",
+          "option": "dock aligned waterfront"
+        },
+        {
+          "emit_policy": "emit_if_explicit_or_high_confidence",
+          "meaning": "Indicates a port region partially or fully surrounded by breakwater structures; 'enclosed' refers to physical barrier configuration, not absolute isolation.",
+          "option": "enclosed breakwater port region"
+        }
+      ]
+    }
+  }
+}

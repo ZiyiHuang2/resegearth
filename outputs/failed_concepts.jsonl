@@ -1,0 +1,2 @@
+{"timestamp": "2026-05-01T06:57:48+00:00", "concept_key": "water", "failure_reason": "slot_guidance.allowed_slot_hints entry 'surface_water' not listed in do_not_emit_as_text", "error_type": "ValueError"}
+{"timestamp": "2026-05-01T07:27:50+00:00", "concept_key": "bridge", "failure_reason": "visual_form_options[1] content word 'simple' missing from forbidden_auto_infer_tokens", "error_type": "ValueError", "attempts": 3}

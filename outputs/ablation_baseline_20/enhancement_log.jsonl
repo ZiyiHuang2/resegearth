@@ -1,0 +1,22 @@
+{"timestamp": "2026-05-04T09:46:39Z", "event": "start_processing_units_jsonl", "input_jsonl": "outputs/rrsisd_canonical_units/canonical_raw_units.jsonl", "total_input_units": 17402, "total_units": 20, "limit": 20, "already_processed": 0, "duplicate_input_expr_id_count": 0}
+{"timestamp": "2026-05-04T09:46:45Z", "event": "processed", "expr_id": "ref_2934__ann_2934__sent_2934", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:46:51Z", "event": "processed", "expr_id": "ref_3995__ann_3995__sent_3995", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:46:57Z", "event": "processed", "expr_id": "ref_8394__ann_8394__sent_8394", "status": "success"}
+{"timestamp": "2026-05-04T09:47:02Z", "event": "processed", "expr_id": "ref_6000__ann_6000__sent_6000", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:08Z", "event": "processed", "expr_id": "ref_7278__ann_7278__sent_7278", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:13Z", "event": "processed", "expr_id": "ref_3600__ann_3600__sent_3600", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:19Z", "event": "processed", "expr_id": "ref_1836__ann_1836__sent_1836", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:24Z", "event": "processed", "expr_id": "ref_110__ann_110__sent_110", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:29Z", "event": "processed", "expr_id": "ref_3890__ann_3890__sent_3890", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:36Z", "event": "processed", "expr_id": "ref_20960__ann_20960__sent_20960", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:41Z", "event": "processed", "expr_id": "ref_16104__ann_16104__sent_16104", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:47Z", "event": "processed", "expr_id": "ref_4482__ann_4482__sent_4482", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:53Z", "event": "processed", "expr_id": "ref_11348__ann_11348__sent_11348", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:47:59Z", "event": "processed", "expr_id": "ref_14636__ann_14636__sent_14636", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:06Z", "event": "processed", "expr_id": "ref_3697__ann_3697__sent_3697", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:11Z", "event": "processed", "expr_id": "ref_8614__ann_8614__sent_8614", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:16Z", "event": "processed", "expr_id": "ref_16086__ann_16086__sent_16086", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:21Z", "event": "processed", "expr_id": "ref_18573__ann_18573__sent_18573", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:27Z", "event": "processed", "expr_id": "ref_12702__ann_12702__sent_12702", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:33Z", "event": "processed", "expr_id": "ref_9872__ann_9872__sent_9872", "status": "unchanged"}
+{"timestamp": "2026-05-04T09:48:33Z", "event": "finished", "summary_report": "outputs/ablation_baseline_20/summary_report.json"}

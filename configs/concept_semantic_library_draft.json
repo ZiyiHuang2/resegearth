@@ -1,0 +1,235 @@
+{
+  "version": "seed_v1",
+  "dataset": "RRSIS-D",
+  "global_constraints": [],
+  "concepts": {
+    "water": {
+      "aliases": [
+        "water",
+        "water body",
+        "water bodies"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'water' as 'river', 'lake', 'pond', 'reservoir', or 'canal' unless the raw text explicitly names that subtype.",
+        "Do not infer 'blue' or 'green' color unless explicitly stated in the raw text.",
+        "Do not infer presence of 'bridge', 'boat', or 'road' unless explicitly stated in the raw text."
+      ],
+      "canonical_name": "water",
+      "concept_key": "water",
+      "concept_semantics": [
+        "A surface feature in remote sensing imagery characterized by low reflectance in near-infrared (NIR) and variable reflectance in visible bands, often exhibiting high contrast against surrounding land cover.",
+        "Typically appears dark in NIR and medium-to-dark in red/green bands; spectral signature is highly dependent on depth, turbidity, and sun glint conditions.",
+        "May be contiguous or fragmented, static or dynamic, and may exhibit texture indicative of wind-driven roughness or calmness."
+      ],
+      "definition": "A naturally or artificially occurring expanse of liquid surface observable in remote sensing imagery, distinguished primarily by its spectral, textural, and contextual properties rather than explicit naming.",
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "rivers",
+        "pond",
+        "ponds",
+        "lake",
+        "lakes",
+        "reservoir",
+        "canal",
+        "blue",
+        "green",
+        "bridge",
+        "boat",
+        "road",
+        "linear",
+        "closed",
+        "circular",
+        "irregular",
+        "elongated",
+        "shallow",
+        "deep",
+        "calm",
+        "rough",
+        "glint",
+        "turbid",
+        "clear"
+      ],
+      "notes": "Water detection in remote sensing relies on spectral indices (e.g., NDWI, MNDWI), texture analysis, and spatial context; visual form options describe common morphological patterns but are not exhaustive or deterministic.",
+      "remote_sensing_understanding": [
+        "Water is spectrally distinct from most land covers due to strong absorption in NIR and SWIR bands.",
+        "Spectral response varies with depth, suspended sediment, chlorophyll content, and viewing geometry.",
+        "Shape and continuity (e.g., linear vs. closed) are contextual cues—not intrinsic properties—and require supporting evidence from spatial configuration or ancillary data."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the water",
+          "condition": "when referring to a previously established water instance in context.",
+          "not_allowed": "the river, the lake, the pond, the reservoir, the canal, the blue water, the green water, the calm water, the rough water"
+        },
+        {
+          "allowed_rewrite": "a water body",
+          "condition": "as a generic, non-committal noun phrase for an unspecified water instance.",
+          "not_allowed": "a river, a lake, a pond, a reservoir, a canal, a blue water body, a green water body, a linear water body, a closed water body"
+        }
+      ],
+      "segmentation_relevance": [
+        "Water segmentation supports hydrological mapping, flood monitoring, coastal change detection, and water resource management.",
+        "Performance depends on sensor resolution, atmospheric conditions, and co-located land-cover heterogeneity."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "linear",
+          "closed",
+          "circular",
+          "irregular",
+          "elongated"
+        ],
+        "allowed_slot_hints": [
+          "linear",
+          "closed",
+          "circular",
+          "irregular",
+          "elongated"
+        ],
+        "do_not_emit_as_text": [
+          "linear",
+          "closed",
+          "circular",
+          "irregular",
+          "elongated"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "emit_if_confirmed_by_spatial_context_and_spectral_signature",
+          "meaning": "A water body exhibiting a long, narrow, and relatively straight or gently curved shape — commonly associated with rivers or canals, but not diagnostic without corroborating evidence.",
+          "option": "linear water"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_spatial_context_and_spectral_signature",
+          "meaning": "A water body forming a fully enclosed perimeter with no apparent outlet — commonly associated with lakes, ponds, or reservoirs, but not diagnostic without corroborating evidence.",
+          "option": "closed water"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_spatial_context_and_spectral_signature",
+          "meaning": "A water body with a roughly round or oval outline — often observed in small natural ponds or constructed basins, but shape alone is insufficient for classification.",
+          "option": "circular water"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_spatial_context_and_spectral_signature",
+          "meaning": "A water body with a complex, non-repeating boundary — typical of natural shorelines, wetlands, or fragmented inundation, but requires multi-scale analysis to distinguish from noise.",
+          "option": "irregular water"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_spatial_context_and_spectral_signature",
+          "meaning": "A water body significantly longer than it is wide, with moderate curvature — often seen in meandering rivers or elongated reservoirs, but not uniquely identifying.",
+          "option": "elongated water"
+        },
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visually distinctive morphological pattern is discernible or reliably inferred from the available imagery or raw description.",
+          "option": "none"
+        }
+      ]
+    },
+    "bridge": {
+      "aliases": [
+        "bridge",
+        "bridges"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'bridge' as 'river bridge', 'road bridge', 'railway bridge', 'footbridge', 'suspension bridge', 'arch bridge', or any other subtype unless the raw text explicitly names that subtype."
+      ],
+      "canonical_name": "bridge",
+      "concept_key": "bridge",
+      "concept_semantics": [
+        "A man-made elevated structure designed to span a physical obstacle (e.g., water body, valley, road) and support passage over it.",
+        "In remote sensing imagery, typically appears as a linear or curvilinear feature connecting two landmasses or crossing a gap, often aligned with transport corridors or topographic breaks.",
+        "May be distinguishable from adjacent roads or rivers by relative width, elevation signature, continuity across gaps, and contextual separation from surface water or ground-level transport features."
+      ],
+      "definition": "A constructed linear infrastructure element enabling passage over an obstacle such as a water body, depression, or another transport route.",
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "rivers",
+        "road",
+        "roads",
+        "water",
+        "vehicle",
+        "vehicles",
+        "single",
+        "multi",
+        "span",
+        "piers",
+        "linear",
+        "crossing",
+        "structure"
+      ],
+      "notes": "Bridge detection in remote sensing relies on spatial context (e.g., alignment across gaps), geometric continuity, and contrast with background terrain or water; visual form is highly variable and must not be assumed from co-occurring features like rivers or roads.",
+      "remote_sensing_understanding": [
+        "Bridges may exhibit higher reflectance or thermal signature than surrounding water or vegetation depending on material and season.",
+        "Shadow patterns, parallax displacement in stereo imagery, and height-from-stereo or LiDAR can aid discrimination from ground-level roads or water bodies.",
+        "Spectral signature alone is rarely sufficient for reliable identification; spatial configuration and topographic context are primary discriminants."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the bridge",
+          "condition": "when referring to a previously identified or uniquely locatable instance in the scene.",
+          "not_allowed": "a bridge that crosses a river"
+        },
+        {
+          "allowed_rewrite": "a bridge",
+          "condition": "when introducing a non-specific instance without attributing unobserved properties.",
+          "not_allowed": "a multi-span bridge with piers"
+        },
+        {
+          "allowed_rewrite": "bridge",
+          "condition": "in slot-filling or structured output contexts where definite/indefinite article use is suppressed.",
+          "not_allowed": "the linear crossing structure"
+        }
+      ],
+      "segmentation_relevance": [
+        "Critical for infrastructure mapping, change detection, and transportation network analysis.",
+        "Often confused with roads, rivers, or shorelines due to similar spectral and shape characteristics; segmentation models require explicit contextual cues to disambiguate."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "span_count",
+          "support_type",
+          "crossing_type"
+        ],
+        "allowed_slot_hints": [
+          "span_count: single",
+          "span_count: multi",
+          "support_type: piers",
+          "crossing_type: linear"
+        ],
+        "do_not_emit_as_text": [
+          "span_count",
+          "support_type",
+          "crossing_type",
+          "span_count: single",
+          "span_count: multi",
+          "support_type: piers",
+          "crossing_type: linear"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visually discriminable bridge form is evident in the imagery; may indicate absence, occlusion, resolution limit, or ambiguity.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_geometry_and_context",
+          "meaning": "A single continuous structural segment spanning the obstacle without intermediate supports visible at sensor resolution.",
+          "option": "single-span structure"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_geometry_and_context",
+          "meaning": "A bridge composed of multiple segments separated by visible vertical supports (e.g., piers) aligned along the crossing axis.",
+          "option": "multi-span structure with piers"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_geometry_and_context",
+          "meaning": "A bridge exhibiting clear linear morphology and directional continuity while traversing a gap, independent of span count or support visibility.",
+          "option": "linear crossing structure"
+        }
+      ]
+    }
+  }
+}

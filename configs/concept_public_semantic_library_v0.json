@@ -1,0 +1,92 @@
+{
+  "dataset": "RRSIS-D",
+  "version": "public_semantic_v0",
+  "library_kind": "public_minimal",
+  "concepts": {
+    "water": {
+      "concept": "water",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'water' as river, lake, pond, reservoir, canal, harbor, or wetland unless the raw text explicitly names it."
+    },
+    "vegetation": {
+      "concept": "vegetation",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'vegetation' as forest, farmland, crop, grassland, bare land, or tree row unless the raw text explicitly names it."
+    },
+    "farmland": {
+      "concept": "farmland",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'farmland' as grassland, forest, vegetation, pasture, orchard, or bare field unless the raw text explicitly names it."
+    },
+    "grassland": {
+      "concept": "grassland",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'grassland' as farmland, forest, vegetation, lawn, meadow, or shrub belt unless the raw text explicitly names it."
+    },
+    "forest": {
+      "concept": "forest",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'forest' as farmland, grassland, vegetation, orchard, shrubland, or clearing unless the raw text explicitly names it."
+    },
+    "bare land": {
+      "concept": "bare land",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'bare land' as water, vegetation, farmland, construction site, or paved yard unless the raw text explicitly names it."
+    },
+    "river": {
+      "concept": "river",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'river' as lake, canal, pond, reservoir, stream, ditch, or shoreline unless the raw text explicitly names it."
+    },
+    "lake": {
+      "concept": "lake",
+      "type": "stuff",
+      "boundary": "Do not rewrite 'lake' as river, pond, reservoir, canal, wetland, sea, or harbor unless the raw text explicitly names it."
+    },
+    "bridge": {
+      "concept": "bridge",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'bridge' as road, building, tunnel, pier, dock, or dam unless the raw text explicitly names it."
+    },
+    "road": {
+      "concept": "road",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'road' as runway, railway, bridge, path, trail, or driveway unless the raw text explicitly names it."
+    },
+    "building": {
+      "concept": "building",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'building' as shed, warehouse, hangar, greenhouse, garage, or barn unless the raw text explicitly names it."
+    },
+    "vehicle": {
+      "concept": "vehicle",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'vehicle' as car, truck, bus, van, ship, airplane, or train unless the raw text explicitly names it."
+    },
+    "ship": {
+      "concept": "ship",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'ship' as boat, barge, ferry, dock, buoy, or raft unless the raw text explicitly names it."
+    },
+    "airport": {
+      "concept": "airport",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'airport' as runway, terminal, hangar, apron, heliport, or office block unless the raw text explicitly names it."
+    },
+    "parking lot": {
+      "concept": "parking lot",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'parking lot' as road, driveway, plaza, playground, yard, or staging area unless the raw text explicitly names it."
+    },
+    "playground": {
+      "concept": "playground",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'playground' as parking lot, stadium, farmland, court, schoolyard, or sports park unless the raw text explicitly names it."
+    },
+    "harbor": {
+      "concept": "harbor",
+      "type": "thing_or_facility",
+      "boundary": "Do not rewrite 'harbor' as pier, dock, marina, port, breakwater, or open sea unless the raw text explicitly names it."
+    }
+  }
+}

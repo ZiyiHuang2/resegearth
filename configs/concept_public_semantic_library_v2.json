@@ -1,0 +1,150 @@
+{
+  "library_kind": "public_grounding_prior",
+  "version": "public_semantic_v2",
+  "match_policy": {
+    "matching": "word_boundary",
+    "multi_word": "continuous_phrase",
+    "selection": "longest_first_non_overlapping",
+    "hierarchy": "child_suppresses_parent",
+    "multi_concept": "inject_all_non_overlapping_matches",
+    "fallback": "empty"
+  },
+  "concepts": {
+    "water": {
+      "concept": "water",
+      "type": "stuff",
+      "parent": null,
+      "visual_evidence": "Use spectral or texture contrast, surface continuity, and separation from surrounding land to identify water-covered regions.",
+      "mask_scope": "Segment the visible water surface corresponding to the expression.",
+      "exclusion_rule": "Exclude bridges, ships, roads, banks, docks, shore objects, and shadows unless they are explicitly the target."
+    },
+    "vegetation": {
+      "concept": "vegetation",
+      "type": "stuff",
+      "parent": null,
+      "visual_evidence": "Use green-tone canopy texture, patchy or continuous plant cover, and contrast with bare soil, pavement, or open water as supporting cues.",
+      "mask_scope": "Cover the vegetation area corresponding to the expression's referent.",
+      "exclusion_rule": "Exclude roads, buildings, shadows, water, cropland row patterns, and sports turf unless the expression names them as the target."
+    },
+    "farmland": {
+      "concept": "farmland",
+      "type": "stuff",
+      "parent": null,
+      "visual_evidence": "Look for geometric field parcels, tillage or crop-row texture, and tonal contrast with forest, grass, or built surfaces.",
+      "mask_scope": "Segment the farmland region corresponding to the expression.",
+      "exclusion_rule": "Exclude farm buildings, tree lines, irrigation channels, roads, storage yards, and neighboring natural vegetation unless named as the target."
+    },
+    "grassland": {
+      "concept": "grassland",
+      "type": "stuff",
+      "parent": null,
+      "visual_evidence": "Use uniform low-to-mid vegetation texture, gentle terrain context, and separation from dense forest, crops, or paved surfaces.",
+      "mask_scope": "Cover the grassland area corresponding to the expression's referent.",
+      "exclusion_rule": "Exclude scattered trees, trails, waterlogged patches, livestock pens, and adjacent cropland unless the expression specifies them."
+    },
+    "forest": {
+      "concept": "forest",
+      "type": "stuff",
+      "parent": null,
+      "visual_evidence": "Use dense canopy texture, irregular crown shadows, and high vertical structure relative to grass, crops, or bare ground.",
+      "mask_scope": "Segment the forest canopy and enclosed understory region corresponding to the expression.",
+      "exclusion_rule": "Exclude roads, clearings, buildings, power-line corridors, water, and isolated tree rows unless the expression marks them as the target."
+    },
+    "bare land": {
+      "concept": "bare land",
+      "type": "stuff",
+      "parent": null,
+      "visual_evidence": "Use low vegetation cover, bright or dark soil tones, sparse texture, and contrast with green vegetation or smooth pavement.",
+      "mask_scope": "Segment the bare land region corresponding to the expression.",
+      "exclusion_rule": "Exclude thin roads, building footprints, shadows, seasonal water, and mixed transitional strips unless explicitly part of the referent."
+    },
+    "river": {
+      "concept": "river",
+      "type": "stuff",
+      "parent": "water",
+      "visual_evidence": "Use water continuity, channel context, and flow-like spatial layout as supporting evidence for river localization.",
+      "mask_scope": "Segment the river water area corresponding to the expression.",
+      "exclusion_rule": "Exclude bridges, banks, roads, boats, vegetation, docks, and nearby land objects from the river mask."
+    },
+    "lake": {
+      "concept": "lake",
+      "type": "stuff",
+      "parent": "water",
+      "visual_evidence": "Use enclosed or semi-enclosed water bodies, shoreline loops, and relatively homogeneous interior water tone as supporting cues.",
+      "mask_scope": "Segment the lake water surface corresponding to the expression.",
+      "exclusion_rule": "Exclude piers, boats, islands, dams, surrounding roads, and shoreline vegetation unless the expression targets them explicitly."
+    },
+    "bridge": {
+      "concept": "bridge",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Look for a constructed crossing connecting separated transport or land regions across water, roads, railways, or gaps.",
+      "mask_scope": "Segment the bridge structure corresponding to the expression.",
+      "exclusion_rule": "Exclude connected roads, rivers, vehicles, shadows, piers outside the bridge body, and surrounding terrain."
+    },
+    "road": {
+      "concept": "road",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use elongated paved or compacted surfaces, lane-like parallelism, intersections, and contrast with adjacent soil or vegetation.",
+      "mask_scope": "Segment the road surface corresponding to the expression.",
+      "exclusion_rule": "Exclude vehicles, sidewalks, parking stalls, bridges, runway strips, and building shadows unless named as the target referent."
+    },
+    "building": {
+      "concept": "building",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use rectangular footprints, roof tone and material cues, cast shadows, and separation from roads, bare soil, or canopy cover.",
+      "mask_scope": "Segment the building footprint and roof area corresponding to the expression.",
+      "exclusion_rule": "Exclude attached parking, yards, trees, adjacent roads, and rooftop clutter unless the expression includes them as the target."
+    },
+    "vehicle": {
+      "concept": "vehicle",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use small bright or dark blobs on roads and lots, size cues versus lane width, and spacing patterns consistent with traffic objects.",
+      "mask_scope": "Segment each vehicle instance or the stated vehicle group corresponding to the expression.",
+      "exclusion_rule": "Exclude road paint, lane gaps, shadows, roof objects, and nearby pedestrians or structures unless the expression names them."
+    },
+    "ship": {
+      "concept": "ship",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use elongated hull shapes on water, deck contrast, wake or mooring context, and separation from piers and small boats if visible.",
+      "mask_scope": "Segment the ship hull and superstructure corresponding to the expression.",
+      "exclusion_rule": "Exclude wharves, buoys, waves, dock equipment, adjacent water outside the hull, and harbor infrastructure unless explicitly targeted."
+    },
+    "airport": {
+      "concept": "airport",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use large-scale paved areas, runway-like linear structures, apron zones, and aircraft-related infrastructure as grounding cues.",
+      "mask_scope": "Segment the airport region corresponding to the expression, whether it refers to the whole facility or a named sub-area.",
+      "exclusion_rule": "Exclude individual airplanes, adjacent highways, unrelated buildings, and surrounding terrain outside the airport extent."
+    },
+    "parking lot": {
+      "concept": "parking lot",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use flat paved panels, stall or bay markings, vehicle clusters, and adjacency to buildings or roads as supporting layout cues.",
+      "mask_scope": "Segment the parking lot paved area corresponding to the expression.",
+      "exclusion_rule": "Exclude drive aisles named as roads, sidewalks, building footprints, landscaped islands, and rooftop decks unless specified in the text."
+    },
+    "playground": {
+      "concept": "playground",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use bright synthetic turf or court paint, compact geometric layouts, and enclosure by fences or school blocks when visible.",
+      "mask_scope": "Segment the playground facility area corresponding to the expression.",
+      "exclusion_rule": "Exclude surrounding parking, roads, tree shade, sports stadiums, and building roofs unless the wording includes them as targets."
+    },
+    "harbor": {
+      "concept": "harbor",
+      "type": "thing_or_facility",
+      "parent": null,
+      "visual_evidence": "Use basin-shaped water, pier alignments, breakwaters, moored vessels, and port structures contrasting with open sea tone.",
+      "mask_scope": "Segment the harbor facility and sheltered water corresponding to the expression.",
+      "exclusion_rule": "Exclude open ocean, unrelated coastal roads, distant ships, and upstream river channels unless the expression names those parts."
+    }
+  }
+}

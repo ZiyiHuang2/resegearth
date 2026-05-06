@@ -1,0 +1,2463 @@
+{
+  "dataset": "RRSIS-D",
+  "enhancement_version": "v1.0_explicitization_only",
+  "num_records": 20,
+  "records": [
+    {
+      "expr_id": "ref_2934__ann_2934__sent_2934",
+      "ref_id": 2934,
+      "ann_id": 2934,
+      "image_id": 2934,
+      "file_name": "02934.jpg",
+      "split": "train",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "bbox": [
+        411,
+        53,
+        642,
+        279
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 2934
+      },
+      "raw": "The baseball field on the top",
+      "enhanced": "The baseball field on the top",
+      "compressed": "The baseball field on the top",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "top"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "baseballfield"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed. 'The baseball field on the top' is grammatically complete and contains no missing articles, prepositions, or relation verbs that require completion. 'Top' is a spatial phrase already present; no normalization is required as synonym normalization is disabled and no matched spatial phrase pattern triggers phrase_normalization. All visual tokens are preserved. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 2934,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_3995__ann_3995__sent_3995",
+      "ref_id": 3995,
+      "ann_id": 3995,
+      "image_id": 3995,
+      "file_name": "03995.jpg",
+      "split": "train",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "bbox": [
+        475,
+        299,
+        689,
+        492
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3995
+      },
+      "raw": "A baseball field on the right",
+      "enhanced": "A baseball field on the right",
+      "compressed": "A baseball field on the right",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "right"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "baseballfield"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'A baseball field on the right' is grammatically complete, contains no missing articles requiring correction beyond 'A', has no incomplete prepositional phrase needing completion (e.g., 'on the right' is fully formed), no relation verb is implied or required (e.g., no need to insert 'is' or 'lies'), and no phrase normalization is needed (e.g., 'on the right' is standard phrasing; no synonym or variant in raw requires alignment). All visual tokens ('baseball field', 'on the right') are preserved. No concept tag or internal tag appears in raw, so none is introduced. | normalized invalid quantity `a` to `unknown`; moved absolute position labels from spatial_relations: ['right']",
+      "expression_index": 0,
+      "sent_id": 3995,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_8394__ann_8394__sent_8394",
+      "ref_id": 8394,
+      "ann_id": 8394,
+      "image_id": 8394,
+      "file_name": "08394.jpg",
+      "split": "train",
+      "category_id": 2,
+      "category_name": "airplane",
+      "bbox": [
+        471,
+        323,
+        753,
+        594
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 8394
+      },
+      "raw": "A airplane on the right",
+      "enhanced": "An airplane on the right",
+      "compressed": "An airplane on the right",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [
+          "right"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "airplane"
+      },
+      "explicitization": {
+        "added_token_justification": [
+          {
+            "reason": "grammar_only",
+            "token": "An"
+          }
+        ],
+        "added_tokens": [
+          "An"
+        ],
+        "operations": [
+          {
+            "after": "An",
+            "before": "A",
+            "type": "article_completion"
+          }
+        ]
+      },
+      "notes": "No spatial phrase normalization or relation verb insertion is applicable; 'on the right' is retained as-is. No concept tags or internal tags appear in raw, so none are added. | normalized invalid quantity `One` to `unknown`; normalized added_token_justification.reason `article_completion: 'A' before singular count noun 'airplane' requires grammatical correction to 'An' before vowel sound` -> `grammar_only`",
+      "expression_index": 0,
+      "sent_id": 8394,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_6000__ann_6000__sent_6000",
+      "ref_id": 6000,
+      "ann_id": 6000,
+      "image_id": 6000,
+      "file_name": "06000.jpg",
+      "split": "train",
+      "category_id": 18,
+      "category_name": "vehicle",
+      "bbox": [
+        588,
+        592,
+        633,
+        623
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 6000
+      },
+      "raw": "A vehicle on the lower right",
+      "enhanced": "A vehicle on the lower right",
+      "compressed": "A vehicle on the lower right",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "lower_right",
+          "bottom",
+          "right"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [
+          "on"
+        ],
+        "target_category": "vehicle"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: 'A vehicle on the lower right' is grammatically complete, contains no missing articles requiring correction (A is appropriate for indefinite singular count noun), no preposition requires completion (on is complete), no relation verb is implied or required (e.g., no verb like 'located' or 'situated' is necessary per guidelines), and 'on the lower right' is a valid spatial phrase that does not require normalization since no matched spatial phrases were found and synonym normalization is disabled. The category 'vehicle' must not be replaced with any specific type per concept constraint. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 6000,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_7278__ann_7278__sent_7278",
+      "ref_id": 7278,
+      "ann_id": 7278,
+      "image_id": 7278,
+      "file_name": "07278.jpg",
+      "split": "train",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "bbox": [
+        459,
+        575,
+        626,
+        746
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 7278
+      },
+      "raw": "A baseball field at the bottom",
+      "enhanced": "A baseball field at the bottom",
+      "compressed": "A baseball field at the bottom",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "bottom"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "baseballfield"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: 'A baseball field at the bottom' is grammatically complete, contains no missing articles requiring correction (A is appropriate for singular countable noun), no incomplete prepositional phrases requiring completion, no missing relation verbs, and no phrase normalization required per constraints. Synonym normalization is disabled. All visual tokens are preserved. No concept tags or internal tags appear in raw, so none are introduced. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 7278,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_3600__ann_3600__sent_3600",
+      "ref_id": 3600,
+      "ann_id": 3600,
+      "image_id": 3600,
+      "file_name": "03600.jpg",
+      "split": "test",
+      "category_id": 19,
+      "category_name": "windmill",
+      "bbox": [
+        348,
+        272,
+        389,
+        389
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3600
+      },
+      "raw": "The gray small windmill",
+      "enhanced": "The gray small windmill",
+      "compressed": "The gray small windmill",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [
+          "gray",
+          "small"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "windmill"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: the raw expression is grammatically complete, contains no missing articles requiring correction (definite article 'The' is appropriate), no prepositions to complete, no relation verbs to insert, and no phrase normalization required (e.g., 'gray small' order is acceptable and matches common English attributive ordering; no synonym or category aliasing needed beyond identity). All visual tokens ('gray', 'small', 'windmill') are preserved as observed. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 3600,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_1836__ann_1836__sent_1836",
+      "ref_id": 1836,
+      "ann_id": 1836,
+      "image_id": 1836,
+      "file_name": "01836.jpg",
+      "split": "train",
+      "category_id": 10,
+      "category_name": "groundtrackfield",
+      "bbox": [
+        55,
+        1,
+        319,
+        631
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 1836
+      },
+      "raw": "The yellow and orange ground track field on the left",
+      "enhanced": "The yellow and orange ground track field on the left",
+      "compressed": "The yellow and orange ground track field on the left",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "left"
+        ],
+        "attributes": [
+          "yellow",
+          "orange"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "groundtrackfield"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'The' is already definite, 'on the left' is a complete spatial phrase with preposition, no relation verb is missing (e.g., 'is' or 'lies' is not required in nominal referring expressions), and 'ground track field' matches the canonical category name without need for alias normalization. All visual tokens (yellow, orange, on the left) are preserved. No inference or addition is justified. | normalized invalid quantity `One` to `unknown`; moved absolute position labels from spatial_relations: ['left']",
+      "expression_index": 0,
+      "sent_id": 1836,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_110__ann_110__sent_110",
+      "ref_id": 110,
+      "ann_id": 110,
+      "image_id": 110,
+      "file_name": "00110.jpg",
+      "split": "val",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "bbox": [
+        328,
+        532,
+        465,
+        668
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 110
+      },
+      "raw": "The green and brown baseball field",
+      "enhanced": "The green and brown baseball field",
+      "compressed": "The green and brown baseball field",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [
+          "green",
+          "brown"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "baseballfield"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No explicitization operations are needed. The raw expression is grammatically complete, contains no missing articles or prepositions, and has no ambiguous spatial or relational phrasing requiring normalization. All visual tokens (green, brown, baseball field) are preserved as-is. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 110,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_3890__ann_3890__sent_3890",
+      "ref_id": 3890,
+      "ann_id": 3890,
+      "image_id": 3890,
+      "file_name": "03890.jpg",
+      "split": "val",
+      "category_id": 8,
+      "category_name": "dam",
+      "bbox": [
+        224,
+        279,
+        496,
+        484
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3890
+      },
+      "raw": "The large dam",
+      "enhanced": "The large dam",
+      "compressed": "The large dam",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [
+          "large"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "dam"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies. 'The large dam' is grammatically complete and contains no missing articles, prepositions, relation verbs, or phrase normalization opportunities. 'Large' is an observed attribute from the raw expression and must be preserved. No spatial or relational phrasing is present to normalize. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 3890,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_20960__ann_20960__sent_20960",
+      "ref_id": 20960,
+      "ann_id": 20960,
+      "image_id": 20960,
+      "file_name": "20960.jpg",
+      "split": "test",
+      "category_id": 16,
+      "category_name": "tenniscourt",
+      "bbox": [
+        176,
+        549,
+        221,
+        643
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 20960
+      },
+      "raw": "A tennis court on the lower left",
+      "enhanced": "A tennis court on the lower left",
+      "compressed": "A tennis court on the lower left",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "lower_left",
+          "bottom",
+          "left"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "tenniscourt"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'A tennis court on the lower left' already has correct article ('A'), preposition ('on'), and spatial phrase ('on the lower left') as given; no relation verb is missing (e.g., 'located' or 'situated' is not required by grammar); phrase normalization is unnecessary since 'on the lower left' is standard and no synonym normalization is enabled. All visual tokens are preserved. No concept tag or internal tag appears in raw, so none is added. | normalized invalid quantity `a` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 20960,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_16104__ann_16104__sent_16104",
+      "ref_id": 16104,
+      "ann_id": 16104,
+      "image_id": 16104,
+      "file_name": "16104.jpg",
+      "split": "train",
+      "category_id": 8,
+      "category_name": "dam",
+      "bbox": [
+        520,
+        777,
+        562,
+        800
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 16104
+      },
+      "raw": "The tiny dam at the bottom",
+      "enhanced": "The tiny dam at the bottom",
+      "compressed": "The tiny dam at the bottom",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "bottom"
+        ],
+        "attributes": [
+          "tiny"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "dam"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'The' is already definite article, 'tiny' is an observed attribute, 'dam' matches canonical category, 'at the bottom' is a complete spatial phrase with preposition and noun phrase; no missing relation verb, no incomplete prepositional phrase requiring completion, no article or preposition omission to correct, and no phrase normalization needed per constraints. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 16104,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_4482__ann_4482__sent_4482",
+      "ref_id": 4482,
+      "ann_id": 4482,
+      "image_id": 4482,
+      "file_name": "04482.jpg",
+      "split": "val",
+      "category_id": 17,
+      "category_name": "trainstation",
+      "bbox": [
+        308,
+        336,
+        564,
+        418
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 4482
+      },
+      "raw": "A small slender train station in the middle",
+      "enhanced": "A small slender train station in the middle",
+      "compressed": "A small slender train station in the middle",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "center"
+        ],
+        "attributes": [
+          "small",
+          "slender"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "trainstation"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: 'A' is grammatically correct for indefinite singular countable noun 'train station'; 'in the middle' is a complete spatial phrase; no preposition, article, relation verb, or phrase normalization is required without introducing unsupported information. All visual tokens (small, slender, train station, in the middle) are preserved as-is. | normalized invalid quantity `1` to `unknown`; moved absolute position labels from spatial_relations: ['center']",
+      "expression_index": 0,
+      "sent_id": 4482,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_11348__ann_11348__sent_11348",
+      "ref_id": 11348,
+      "ann_id": 11348,
+      "image_id": 11348,
+      "file_name": "11348.jpg",
+      "split": "test",
+      "category_id": 7,
+      "category_name": "chimney",
+      "bbox": [
+        239,
+        304,
+        509,
+        649
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 11348
+      },
+      "raw": "A large frustum of a cone chimney",
+      "enhanced": "A large frustum of a cone chimney",
+      "compressed": "A large frustum of a cone chimney",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [
+          "large",
+          "frustum of a cone"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "chimney"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'A large frustum of a cone chimney' is grammatically complete, contains no missing articles requiring correction (article_completion not needed), no incomplete prepositional phrases (preposition_completion not needed), no relational verb missing (relation_verb_insertion not needed), and 'frustum of a cone' is a standard geometric descriptor — phrase_normalization is not triggered as no synonymous spatial or category variant is both present in raw and mapped to a normalized form. Synonym normalization is disabled per instruction. All visual tokens ('large', 'frustum of a cone', 'chimney') are preserved. No concept tag or internal tag appears in raw, so none is introduced. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 11348,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_14636__ann_14636__sent_14636",
+      "ref_id": 14636,
+      "ann_id": 14636,
+      "image_id": 14636,
+      "file_name": "14636.jpg",
+      "split": "val",
+      "category_id": 18,
+      "category_name": "vehicle",
+      "bbox": [
+        499,
+        34,
+        510,
+        61
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 14636
+      },
+      "raw": "The vehicle is above the chimney at the bottom",
+      "enhanced": "The vehicle is above the chimney at the bottom",
+      "compressed": "The vehicle is above the chimney at the bottom",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "bottom"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [
+          "chimney"
+        ],
+        "spatial_relations": [
+          "above"
+        ],
+        "target_category": "vehicle"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: 'above' is a valid spatial preposition; 'at the bottom' is a positional phrase already present and grammatically sound; article 'The' is correct; no missing prepositions, verbs, or articles require insertion; no normalization of 'vehicle' is permitted per concept constraint. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 14636,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_3697__ann_3697__sent_3697",
+      "ref_id": 3697,
+      "ann_id": 3697,
+      "image_id": 3697,
+      "file_name": "03697.jpg",
+      "split": "test",
+      "category_id": 16,
+      "category_name": "tenniscourt",
+      "bbox": [
+        548,
+        307,
+        635,
+        487
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3697
+      },
+      "raw": "The tennis court on the right",
+      "enhanced": "The tennis court on the right",
+      "compressed": "tennis court on the right",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [
+          "right"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "tenniscourt"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed. The raw expression is grammatically complete, contains no missing articles requiring correction (definite article 'The' is appropriate), no incomplete prepositional phrases, no missing relation verbs, and no phrase normalization required. 'on the right' is a valid spatial phrase; no slot label substitution is permitted in natural-language outputs unless the exact token appears in raw, and it does not. All visual tokens are preserved. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 3697,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_8614__ann_8614__sent_8614",
+      "ref_id": 8614,
+      "ann_id": 8614,
+      "image_id": 8614,
+      "file_name": "08614.jpg",
+      "split": "train",
+      "category_id": 19,
+      "category_name": "windmill",
+      "bbox": [
+        626,
+        449,
+        704,
+        538
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 8614
+      },
+      "raw": "The cyan windmill",
+      "enhanced": "The cyan windmill",
+      "compressed": "The cyan windmill",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [
+          "cyan"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "windmill"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No explicitization operation is needed: the raw expression is grammatically complete, contains no missing articles or prepositions, no relational verbs to insert, and no abnormal phrasing requiring normalization. 'Cyan' is a color attribute present in the raw expression and must be preserved. 'Windmill' matches the canonical category name and requires no alias substitution. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 8614,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_16086__ann_16086__sent_16086",
+      "ref_id": 16086,
+      "ann_id": 16086,
+      "image_id": 16086,
+      "file_name": "16086.jpg",
+      "split": "train",
+      "category_id": 6,
+      "category_name": "bridge",
+      "bbox": [
+        487,
+        681,
+        503,
+        703
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 16086
+      },
+      "raw": "The bridge at the bottom",
+      "enhanced": "The bridge at the bottom",
+      "compressed": "The bridge at the bottom",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "bottom"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "bridge"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'The bridge at the bottom' is grammatically complete, contains no missing articles requiring correction (definite article 'The' is appropriate), no preposition is incomplete, no relation verb is missing (e.g., 'located', 'situated' are not required by grammar or convention here), and 'at the bottom' is a valid, self-contained spatial phrase. Synonym normalization is disabled. No concept aliasing or spatial phrase normalization is triggered since no matched spatial phrases were found and 'bridge' has no aliasing need per constraints. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 16086,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_18573__ann_18573__sent_18573",
+      "ref_id": 18573,
+      "ann_id": 18573,
+      "image_id": 18573,
+      "file_name": "18573.jpg",
+      "split": "test",
+      "category_id": 3,
+      "category_name": "airport",
+      "bbox": [
+        415,
+        330,
+        525,
+        534
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 18573
+      },
+      "raw": "The airport in the middle",
+      "enhanced": "The airport in the middle",
+      "compressed": "The airport in the middle",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "center"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "airport"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: 'The airport in the middle' is grammatically complete and contains no missing articles, prepositions, or relation verbs. 'In the middle' is a valid spatial phrase already present; no normalization or completion is required. Concept context confirms 'airport' must not be replaced with subclasses unless explicitly named — it is not — so no change is made. | normalized invalid quantity `{\"value\":1,\"unit\":\"\"}` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 18573,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_12702__ann_12702__sent_12702",
+      "ref_id": 12702,
+      "ann_id": 12702,
+      "image_id": 12702,
+      "file_name": "12702.jpg",
+      "split": "test",
+      "category_id": 1,
+      "category_name": "Expressway-toll-station",
+      "bbox": [
+        438,
+        213,
+        509,
+        364
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 12702
+      },
+      "raw": "The expressway toll station in the middle",
+      "enhanced": "The expressway toll station in the middle",
+      "compressed": "The expressway toll station in the middle",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "center"
+        ],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "Expressway-toll-station"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization is needed: article is already definite ('The'), preposition 'in' is complete, spatial phrase 'in the middle' is grammatically sound and matches allowed slot label 'center' (but the phrase itself must remain unchanged in natural-language outputs), and no relation verb or normalization is required. All visual tokens from raw are preserved. | normalized invalid quantity `` to `unknown`",
+      "expression_index": 0,
+      "sent_id": 12702,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    },
+    {
+      "expr_id": "ref_9872__ann_9872__sent_9872",
+      "ref_id": 9872,
+      "ann_id": 9872,
+      "image_id": 9872,
+      "file_name": "09872.jpg",
+      "split": "train",
+      "category_id": 15,
+      "category_name": "storagetank",
+      "bbox": [
+        397,
+        297,
+        514,
+        415
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 9872
+      },
+      "raw": "A white small storage tank in the middle",
+      "enhanced": "A white small storage tank in the middle",
+      "compressed": "A white small storage tank in the middle",
+      "status": "unchanged",
+      "slots": {
+        "absolute_positions": [
+          "center"
+        ],
+        "attributes": [
+          "white",
+          "small"
+        ],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "storagetank"
+      },
+      "explicitization": {
+        "added_token_justification": [],
+        "added_tokens": [],
+        "operations": []
+      },
+      "notes": "No safe explicitization operation applies: 'A' is grammatically correct for indefinite singular count noun; 'in the middle' is already a complete spatial phrase; no preposition or relation verb is missing; no article or determiner completion needed beyond existing 'A'; no phrase normalization required as lexical items match canonical category name and no synonym substitution is permitted. All visual tokens (white, small, storage tank, in the middle) are preserved unchanged. | normalized invalid quantity `a` to `unknown`; moved absolute position labels from spatial_relations: ['center']",
+      "expression_index": 0,
+      "sent_id": 9872,
+      "source": {
+        "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+        "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+        "expression_path": "sentences[].sent",
+        "join_key": "ann_id -> annotations.id"
+      }
+    }
+  ],
+  "refs": [
+    {
+      "ref_id": 2934,
+      "ann_id": 2934,
+      "image_id": 2934,
+      "file_name": "02934.jpg",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "split": "train",
+      "bbox": [
+        411,
+        53,
+        642,
+        279
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 2934
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_2934__ann_2934__sent_2934",
+          "ref_id": 2934,
+          "ann_id": 2934,
+          "image_id": 2934,
+          "file_name": "02934.jpg",
+          "split": "train",
+          "category_id": 4,
+          "category_name": "baseballfield",
+          "bbox": [
+            411,
+            53,
+            642,
+            279
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 2934
+          },
+          "raw": "The baseball field on the top",
+          "enhanced": "The baseball field on the top",
+          "compressed": "The baseball field on the top",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "top"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "baseballfield"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed. 'The baseball field on the top' is grammatically complete and contains no missing articles, prepositions, or relation verbs that require completion. 'Top' is a spatial phrase already present; no normalization is required as synonym normalization is disabled and no matched spatial phrase pattern triggers phrase_normalization. All visual tokens are preserved. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 2934,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 3995,
+      "ann_id": 3995,
+      "image_id": 3995,
+      "file_name": "03995.jpg",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "split": "train",
+      "bbox": [
+        475,
+        299,
+        689,
+        492
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3995
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_3995__ann_3995__sent_3995",
+          "ref_id": 3995,
+          "ann_id": 3995,
+          "image_id": 3995,
+          "file_name": "03995.jpg",
+          "split": "train",
+          "category_id": 4,
+          "category_name": "baseballfield",
+          "bbox": [
+            475,
+            299,
+            689,
+            492
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 3995
+          },
+          "raw": "A baseball field on the right",
+          "enhanced": "A baseball field on the right",
+          "compressed": "A baseball field on the right",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "right"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "baseballfield"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'A baseball field on the right' is grammatically complete, contains no missing articles requiring correction beyond 'A', has no incomplete prepositional phrase needing completion (e.g., 'on the right' is fully formed), no relation verb is implied or required (e.g., no need to insert 'is' or 'lies'), and no phrase normalization is needed (e.g., 'on the right' is standard phrasing; no synonym or variant in raw requires alignment). All visual tokens ('baseball field', 'on the right') are preserved. No concept tag or internal tag appears in raw, so none is introduced. | normalized invalid quantity `a` to `unknown`; moved absolute position labels from spatial_relations: ['right']",
+          "expression_index": 0,
+          "sent_id": 3995,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 8394,
+      "ann_id": 8394,
+      "image_id": 8394,
+      "file_name": "08394.jpg",
+      "category_id": 2,
+      "category_name": "airplane",
+      "split": "train",
+      "bbox": [
+        471,
+        323,
+        753,
+        594
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 8394
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_8394__ann_8394__sent_8394",
+          "ref_id": 8394,
+          "ann_id": 8394,
+          "image_id": 8394,
+          "file_name": "08394.jpg",
+          "split": "train",
+          "category_id": 2,
+          "category_name": "airplane",
+          "bbox": [
+            471,
+            323,
+            753,
+            594
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 8394
+          },
+          "raw": "A airplane on the right",
+          "enhanced": "An airplane on the right",
+          "compressed": "An airplane on the right",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [
+              "right"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "airplane"
+          },
+          "explicitization": {
+            "added_token_justification": [
+              {
+                "reason": "grammar_only",
+                "token": "An"
+              }
+            ],
+            "added_tokens": [
+              "An"
+            ],
+            "operations": [
+              {
+                "after": "An",
+                "before": "A",
+                "type": "article_completion"
+              }
+            ]
+          },
+          "notes": "No spatial phrase normalization or relation verb insertion is applicable; 'on the right' is retained as-is. No concept tags or internal tags appear in raw, so none are added. | normalized invalid quantity `One` to `unknown`; normalized added_token_justification.reason `article_completion: 'A' before singular count noun 'airplane' requires grammatical correction to 'An' before vowel sound` -> `grammar_only`",
+          "expression_index": 0,
+          "sent_id": 8394,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 6000,
+      "ann_id": 6000,
+      "image_id": 6000,
+      "file_name": "06000.jpg",
+      "category_id": 18,
+      "category_name": "vehicle",
+      "split": "train",
+      "bbox": [
+        588,
+        592,
+        633,
+        623
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 6000
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_6000__ann_6000__sent_6000",
+          "ref_id": 6000,
+          "ann_id": 6000,
+          "image_id": 6000,
+          "file_name": "06000.jpg",
+          "split": "train",
+          "category_id": 18,
+          "category_name": "vehicle",
+          "bbox": [
+            588,
+            592,
+            633,
+            623
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 6000
+          },
+          "raw": "A vehicle on the lower right",
+          "enhanced": "A vehicle on the lower right",
+          "compressed": "A vehicle on the lower right",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "lower_right",
+              "bottom",
+              "right"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [
+              "on"
+            ],
+            "target_category": "vehicle"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: 'A vehicle on the lower right' is grammatically complete, contains no missing articles requiring correction (A is appropriate for indefinite singular count noun), no preposition requires completion (on is complete), no relation verb is implied or required (e.g., no verb like 'located' or 'situated' is necessary per guidelines), and 'on the lower right' is a valid spatial phrase that does not require normalization since no matched spatial phrases were found and synonym normalization is disabled. The category 'vehicle' must not be replaced with any specific type per concept constraint. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 6000,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 7278,
+      "ann_id": 7278,
+      "image_id": 7278,
+      "file_name": "07278.jpg",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "split": "train",
+      "bbox": [
+        459,
+        575,
+        626,
+        746
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 7278
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_7278__ann_7278__sent_7278",
+          "ref_id": 7278,
+          "ann_id": 7278,
+          "image_id": 7278,
+          "file_name": "07278.jpg",
+          "split": "train",
+          "category_id": 4,
+          "category_name": "baseballfield",
+          "bbox": [
+            459,
+            575,
+            626,
+            746
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 7278
+          },
+          "raw": "A baseball field at the bottom",
+          "enhanced": "A baseball field at the bottom",
+          "compressed": "A baseball field at the bottom",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "bottom"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "baseballfield"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: 'A baseball field at the bottom' is grammatically complete, contains no missing articles requiring correction (A is appropriate for singular countable noun), no incomplete prepositional phrases requiring completion, no missing relation verbs, and no phrase normalization required per constraints. Synonym normalization is disabled. All visual tokens are preserved. No concept tags or internal tags appear in raw, so none are introduced. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 7278,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 3600,
+      "ann_id": 3600,
+      "image_id": 3600,
+      "file_name": "03600.jpg",
+      "category_id": 19,
+      "category_name": "windmill",
+      "split": "test",
+      "bbox": [
+        348,
+        272,
+        389,
+        389
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3600
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_3600__ann_3600__sent_3600",
+          "ref_id": 3600,
+          "ann_id": 3600,
+          "image_id": 3600,
+          "file_name": "03600.jpg",
+          "split": "test",
+          "category_id": 19,
+          "category_name": "windmill",
+          "bbox": [
+            348,
+            272,
+            389,
+            389
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 3600
+          },
+          "raw": "The gray small windmill",
+          "enhanced": "The gray small windmill",
+          "compressed": "The gray small windmill",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [
+              "gray",
+              "small"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "windmill"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: the raw expression is grammatically complete, contains no missing articles requiring correction (definite article 'The' is appropriate), no prepositions to complete, no relation verbs to insert, and no phrase normalization required (e.g., 'gray small' order is acceptable and matches common English attributive ordering; no synonym or category aliasing needed beyond identity). All visual tokens ('gray', 'small', 'windmill') are preserved as observed. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 3600,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 1836,
+      "ann_id": 1836,
+      "image_id": 1836,
+      "file_name": "01836.jpg",
+      "category_id": 10,
+      "category_name": "groundtrackfield",
+      "split": "train",
+      "bbox": [
+        55,
+        1,
+        319,
+        631
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 1836
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_1836__ann_1836__sent_1836",
+          "ref_id": 1836,
+          "ann_id": 1836,
+          "image_id": 1836,
+          "file_name": "01836.jpg",
+          "split": "train",
+          "category_id": 10,
+          "category_name": "groundtrackfield",
+          "bbox": [
+            55,
+            1,
+            319,
+            631
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 1836
+          },
+          "raw": "The yellow and orange ground track field on the left",
+          "enhanced": "The yellow and orange ground track field on the left",
+          "compressed": "The yellow and orange ground track field on the left",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "left"
+            ],
+            "attributes": [
+              "yellow",
+              "orange"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "groundtrackfield"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'The' is already definite, 'on the left' is a complete spatial phrase with preposition, no relation verb is missing (e.g., 'is' or 'lies' is not required in nominal referring expressions), and 'ground track field' matches the canonical category name without need for alias normalization. All visual tokens (yellow, orange, on the left) are preserved. No inference or addition is justified. | normalized invalid quantity `One` to `unknown`; moved absolute position labels from spatial_relations: ['left']",
+          "expression_index": 0,
+          "sent_id": 1836,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 110,
+      "ann_id": 110,
+      "image_id": 110,
+      "file_name": "00110.jpg",
+      "category_id": 4,
+      "category_name": "baseballfield",
+      "split": "val",
+      "bbox": [
+        328,
+        532,
+        465,
+        668
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 110
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_110__ann_110__sent_110",
+          "ref_id": 110,
+          "ann_id": 110,
+          "image_id": 110,
+          "file_name": "00110.jpg",
+          "split": "val",
+          "category_id": 4,
+          "category_name": "baseballfield",
+          "bbox": [
+            328,
+            532,
+            465,
+            668
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 110
+          },
+          "raw": "The green and brown baseball field",
+          "enhanced": "The green and brown baseball field",
+          "compressed": "The green and brown baseball field",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [
+              "green",
+              "brown"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "baseballfield"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No explicitization operations are needed. The raw expression is grammatically complete, contains no missing articles or prepositions, and has no ambiguous spatial or relational phrasing requiring normalization. All visual tokens (green, brown, baseball field) are preserved as-is. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 110,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 3890,
+      "ann_id": 3890,
+      "image_id": 3890,
+      "file_name": "03890.jpg",
+      "category_id": 8,
+      "category_name": "dam",
+      "split": "val",
+      "bbox": [
+        224,
+        279,
+        496,
+        484
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3890
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_3890__ann_3890__sent_3890",
+          "ref_id": 3890,
+          "ann_id": 3890,
+          "image_id": 3890,
+          "file_name": "03890.jpg",
+          "split": "val",
+          "category_id": 8,
+          "category_name": "dam",
+          "bbox": [
+            224,
+            279,
+            496,
+            484
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 3890
+          },
+          "raw": "The large dam",
+          "enhanced": "The large dam",
+          "compressed": "The large dam",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [
+              "large"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "dam"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies. 'The large dam' is grammatically complete and contains no missing articles, prepositions, relation verbs, or phrase normalization opportunities. 'Large' is an observed attribute from the raw expression and must be preserved. No spatial or relational phrasing is present to normalize. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 3890,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 20960,
+      "ann_id": 20960,
+      "image_id": 20960,
+      "file_name": "20960.jpg",
+      "category_id": 16,
+      "category_name": "tenniscourt",
+      "split": "test",
+      "bbox": [
+        176,
+        549,
+        221,
+        643
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 20960
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_20960__ann_20960__sent_20960",
+          "ref_id": 20960,
+          "ann_id": 20960,
+          "image_id": 20960,
+          "file_name": "20960.jpg",
+          "split": "test",
+          "category_id": 16,
+          "category_name": "tenniscourt",
+          "bbox": [
+            176,
+            549,
+            221,
+            643
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 20960
+          },
+          "raw": "A tennis court on the lower left",
+          "enhanced": "A tennis court on the lower left",
+          "compressed": "A tennis court on the lower left",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "lower_left",
+              "bottom",
+              "left"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "tenniscourt"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'A tennis court on the lower left' already has correct article ('A'), preposition ('on'), and spatial phrase ('on the lower left') as given; no relation verb is missing (e.g., 'located' or 'situated' is not required by grammar); phrase normalization is unnecessary since 'on the lower left' is standard and no synonym normalization is enabled. All visual tokens are preserved. No concept tag or internal tag appears in raw, so none is added. | normalized invalid quantity `a` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 20960,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 16104,
+      "ann_id": 16104,
+      "image_id": 16104,
+      "file_name": "16104.jpg",
+      "category_id": 8,
+      "category_name": "dam",
+      "split": "train",
+      "bbox": [
+        520,
+        777,
+        562,
+        800
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 16104
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_16104__ann_16104__sent_16104",
+          "ref_id": 16104,
+          "ann_id": 16104,
+          "image_id": 16104,
+          "file_name": "16104.jpg",
+          "split": "train",
+          "category_id": 8,
+          "category_name": "dam",
+          "bbox": [
+            520,
+            777,
+            562,
+            800
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 16104
+          },
+          "raw": "The tiny dam at the bottom",
+          "enhanced": "The tiny dam at the bottom",
+          "compressed": "The tiny dam at the bottom",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "bottom"
+            ],
+            "attributes": [
+              "tiny"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "dam"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'The' is already definite article, 'tiny' is an observed attribute, 'dam' matches canonical category, 'at the bottom' is a complete spatial phrase with preposition and noun phrase; no missing relation verb, no incomplete prepositional phrase requiring completion, no article or preposition omission to correct, and no phrase normalization needed per constraints. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 16104,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 4482,
+      "ann_id": 4482,
+      "image_id": 4482,
+      "file_name": "04482.jpg",
+      "category_id": 17,
+      "category_name": "trainstation",
+      "split": "val",
+      "bbox": [
+        308,
+        336,
+        564,
+        418
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 4482
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_4482__ann_4482__sent_4482",
+          "ref_id": 4482,
+          "ann_id": 4482,
+          "image_id": 4482,
+          "file_name": "04482.jpg",
+          "split": "val",
+          "category_id": 17,
+          "category_name": "trainstation",
+          "bbox": [
+            308,
+            336,
+            564,
+            418
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 4482
+          },
+          "raw": "A small slender train station in the middle",
+          "enhanced": "A small slender train station in the middle",
+          "compressed": "A small slender train station in the middle",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "center"
+            ],
+            "attributes": [
+              "small",
+              "slender"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "trainstation"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: 'A' is grammatically correct for indefinite singular countable noun 'train station'; 'in the middle' is a complete spatial phrase; no preposition, article, relation verb, or phrase normalization is required without introducing unsupported information. All visual tokens (small, slender, train station, in the middle) are preserved as-is. | normalized invalid quantity `1` to `unknown`; moved absolute position labels from spatial_relations: ['center']",
+          "expression_index": 0,
+          "sent_id": 4482,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 11348,
+      "ann_id": 11348,
+      "image_id": 11348,
+      "file_name": "11348.jpg",
+      "category_id": 7,
+      "category_name": "chimney",
+      "split": "test",
+      "bbox": [
+        239,
+        304,
+        509,
+        649
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 11348
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_11348__ann_11348__sent_11348",
+          "ref_id": 11348,
+          "ann_id": 11348,
+          "image_id": 11348,
+          "file_name": "11348.jpg",
+          "split": "test",
+          "category_id": 7,
+          "category_name": "chimney",
+          "bbox": [
+            239,
+            304,
+            509,
+            649
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 11348
+          },
+          "raw": "A large frustum of a cone chimney",
+          "enhanced": "A large frustum of a cone chimney",
+          "compressed": "A large frustum of a cone chimney",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [
+              "large",
+              "frustum of a cone"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "chimney"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'A large frustum of a cone chimney' is grammatically complete, contains no missing articles requiring correction (article_completion not needed), no incomplete prepositional phrases (preposition_completion not needed), no relational verb missing (relation_verb_insertion not needed), and 'frustum of a cone' is a standard geometric descriptor — phrase_normalization is not triggered as no synonymous spatial or category variant is both present in raw and mapped to a normalized form. Synonym normalization is disabled per instruction. All visual tokens ('large', 'frustum of a cone', 'chimney') are preserved. No concept tag or internal tag appears in raw, so none is introduced. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 11348,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 14636,
+      "ann_id": 14636,
+      "image_id": 14636,
+      "file_name": "14636.jpg",
+      "category_id": 18,
+      "category_name": "vehicle",
+      "split": "val",
+      "bbox": [
+        499,
+        34,
+        510,
+        61
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 14636
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_14636__ann_14636__sent_14636",
+          "ref_id": 14636,
+          "ann_id": 14636,
+          "image_id": 14636,
+          "file_name": "14636.jpg",
+          "split": "val",
+          "category_id": 18,
+          "category_name": "vehicle",
+          "bbox": [
+            499,
+            34,
+            510,
+            61
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 14636
+          },
+          "raw": "The vehicle is above the chimney at the bottom",
+          "enhanced": "The vehicle is above the chimney at the bottom",
+          "compressed": "The vehicle is above the chimney at the bottom",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "bottom"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [
+              "chimney"
+            ],
+            "spatial_relations": [
+              "above"
+            ],
+            "target_category": "vehicle"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: 'above' is a valid spatial preposition; 'at the bottom' is a positional phrase already present and grammatically sound; article 'The' is correct; no missing prepositions, verbs, or articles require insertion; no normalization of 'vehicle' is permitted per concept constraint. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 14636,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 3697,
+      "ann_id": 3697,
+      "image_id": 3697,
+      "file_name": "03697.jpg",
+      "category_id": 16,
+      "category_name": "tenniscourt",
+      "split": "test",
+      "bbox": [
+        548,
+        307,
+        635,
+        487
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 3697
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_3697__ann_3697__sent_3697",
+          "ref_id": 3697,
+          "ann_id": 3697,
+          "image_id": 3697,
+          "file_name": "03697.jpg",
+          "split": "test",
+          "category_id": 16,
+          "category_name": "tenniscourt",
+          "bbox": [
+            548,
+            307,
+            635,
+            487
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 3697
+          },
+          "raw": "The tennis court on the right",
+          "enhanced": "The tennis court on the right",
+          "compressed": "tennis court on the right",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [
+              "right"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "tenniscourt"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed. The raw expression is grammatically complete, contains no missing articles requiring correction (definite article 'The' is appropriate), no incomplete prepositional phrases, no missing relation verbs, and no phrase normalization required. 'on the right' is a valid spatial phrase; no slot label substitution is permitted in natural-language outputs unless the exact token appears in raw, and it does not. All visual tokens are preserved. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 3697,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 8614,
+      "ann_id": 8614,
+      "image_id": 8614,
+      "file_name": "08614.jpg",
+      "category_id": 19,
+      "category_name": "windmill",
+      "split": "train",
+      "bbox": [
+        626,
+        449,
+        704,
+        538
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 8614
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_8614__ann_8614__sent_8614",
+          "ref_id": 8614,
+          "ann_id": 8614,
+          "image_id": 8614,
+          "file_name": "08614.jpg",
+          "split": "train",
+          "category_id": 19,
+          "category_name": "windmill",
+          "bbox": [
+            626,
+            449,
+            704,
+            538
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 8614
+          },
+          "raw": "The cyan windmill",
+          "enhanced": "The cyan windmill",
+          "compressed": "The cyan windmill",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [
+              "cyan"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "windmill"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No explicitization operation is needed: the raw expression is grammatically complete, contains no missing articles or prepositions, no relational verbs to insert, and no abnormal phrasing requiring normalization. 'Cyan' is a color attribute present in the raw expression and must be preserved. 'Windmill' matches the canonical category name and requires no alias substitution. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 8614,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 16086,
+      "ann_id": 16086,
+      "image_id": 16086,
+      "file_name": "16086.jpg",
+      "category_id": 6,
+      "category_name": "bridge",
+      "split": "train",
+      "bbox": [
+        487,
+        681,
+        503,
+        703
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 16086
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_16086__ann_16086__sent_16086",
+          "ref_id": 16086,
+          "ann_id": 16086,
+          "image_id": 16086,
+          "file_name": "16086.jpg",
+          "split": "train",
+          "category_id": 6,
+          "category_name": "bridge",
+          "bbox": [
+            487,
+            681,
+            503,
+            703
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 16086
+          },
+          "raw": "The bridge at the bottom",
+          "enhanced": "The bridge at the bottom",
+          "compressed": "The bridge at the bottom",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "bottom"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "bridge"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'The bridge at the bottom' is grammatically complete, contains no missing articles requiring correction (definite article 'The' is appropriate), no preposition is incomplete, no relation verb is missing (e.g., 'located', 'situated' are not required by grammar or convention here), and 'at the bottom' is a valid, self-contained spatial phrase. Synonym normalization is disabled. No concept aliasing or spatial phrase normalization is triggered since no matched spatial phrases were found and 'bridge' has no aliasing need per constraints. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 16086,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 18573,
+      "ann_id": 18573,
+      "image_id": 18573,
+      "file_name": "18573.jpg",
+      "category_id": 3,
+      "category_name": "airport",
+      "split": "test",
+      "bbox": [
+        415,
+        330,
+        525,
+        534
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 18573
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_18573__ann_18573__sent_18573",
+          "ref_id": 18573,
+          "ann_id": 18573,
+          "image_id": 18573,
+          "file_name": "18573.jpg",
+          "split": "test",
+          "category_id": 3,
+          "category_name": "airport",
+          "bbox": [
+            415,
+            330,
+            525,
+            534
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 18573
+          },
+          "raw": "The airport in the middle",
+          "enhanced": "The airport in the middle",
+          "compressed": "The airport in the middle",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "center"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "airport"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: 'The airport in the middle' is grammatically complete and contains no missing articles, prepositions, or relation verbs. 'In the middle' is a valid spatial phrase already present; no normalization or completion is required. Concept context confirms 'airport' must not be replaced with subclasses unless explicitly named — it is not — so no change is made. | normalized invalid quantity `{\"value\":1,\"unit\":\"\"}` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 18573,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 12702,
+      "ann_id": 12702,
+      "image_id": 12702,
+      "file_name": "12702.jpg",
+      "category_id": 1,
+      "category_name": "Expressway-toll-station",
+      "split": "test",
+      "bbox": [
+        438,
+        213,
+        509,
+        364
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 12702
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_12702__ann_12702__sent_12702",
+          "ref_id": 12702,
+          "ann_id": 12702,
+          "image_id": 12702,
+          "file_name": "12702.jpg",
+          "split": "test",
+          "category_id": 1,
+          "category_name": "Expressway-toll-station",
+          "bbox": [
+            438,
+            213,
+            509,
+            364
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 12702
+          },
+          "raw": "The expressway toll station in the middle",
+          "enhanced": "The expressway toll station in the middle",
+          "compressed": "The expressway toll station in the middle",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "center"
+            ],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "Expressway-toll-station"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization is needed: article is already definite ('The'), preposition 'in' is complete, spatial phrase 'in the middle' is grammatically sound and matches allowed slot label 'center' (but the phrase itself must remain unchanged in natural-language outputs), and no relation verb or normalization is required. All visual tokens from raw are preserved. | normalized invalid quantity `` to `unknown`",
+          "expression_index": 0,
+          "sent_id": 12702,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    },
+    {
+      "ref_id": 9872,
+      "ann_id": 9872,
+      "image_id": 9872,
+      "file_name": "09872.jpg",
+      "category_id": 15,
+      "category_name": "storagetank",
+      "split": "train",
+      "bbox": [
+        397,
+        297,
+        514,
+        415
+      ],
+      "segmentation_ref": {
+        "source_file": "instances.json",
+        "annotation_id": 9872
+      },
+      "expressions": [
+        {
+          "expr_id": "ref_9872__ann_9872__sent_9872",
+          "ref_id": 9872,
+          "ann_id": 9872,
+          "image_id": 9872,
+          "file_name": "09872.jpg",
+          "split": "train",
+          "category_id": 15,
+          "category_name": "storagetank",
+          "bbox": [
+            397,
+            297,
+            514,
+            415
+          ],
+          "segmentation_ref": {
+            "source_file": "instances.json",
+            "annotation_id": 9872
+          },
+          "raw": "A white small storage tank in the middle",
+          "enhanced": "A white small storage tank in the middle",
+          "compressed": "A white small storage tank in the middle",
+          "status": "unchanged",
+          "slots": {
+            "absolute_positions": [
+              "center"
+            ],
+            "attributes": [
+              "white",
+              "small"
+            ],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "storagetank"
+          },
+          "explicitization": {
+            "added_token_justification": [],
+            "added_tokens": [],
+            "operations": []
+          },
+          "notes": "No safe explicitization operation applies: 'A' is grammatically correct for indefinite singular count noun; 'in the middle' is already a complete spatial phrase; no preposition or relation verb is missing; no article or determiner completion needed beyond existing 'A'; no phrase normalization required as lexical items match canonical category name and no synonym substitution is permitted. All visual tokens (white, small, storage tank, in the middle) are preserved unchanged. | normalized invalid quantity `a` to `unknown`; moved absolute position labels from spatial_relations: ['center']",
+          "expression_index": 0,
+          "sent_id": 9872,
+          "source": {
+            "ref_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/refs(unc).p",
+            "instance_file": "/home/wangchengjun/huangziyi/data/RRSISD/rrsisd/instances.json",
+            "expression_path": "sentences[].sent",
+            "join_key": "ann_id -> annotations.id"
+          }
+        }
+      ]
+    }
+  ]
+}

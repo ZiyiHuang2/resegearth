@@ -1,0 +1,60 @@
+{
+  "longest_match_risk_severity": "warning",
+  "longest_match_risk_non_blocking": true,
+  "concept_count": 2,
+  "alias_conflict_count": 0,
+  "missing_field_count": 0,
+  "high_risk_term_not_forbidden_count": 0,
+  "overly_strong_statement_count": 0,
+  "longest_match_risk_count": 1,
+  "visual_form_options_schema_error_count": 0,
+  "visual_form_option_emit_policy_missing_count": 0,
+  "visual_form_option_leakage_risk_count": 0,
+  "safe_rewrite_conflict_count": 0,
+  "default_none_option_missing_count": 0,
+  "missing_definition_in_retrieval_count": 0,
+  "missing_remote_sensing_understanding_in_retrieval_count": 0,
+  "missing_segmentation_relevance_in_retrieval_count": 0,
+  "missing_slot_guidance_in_retrieval_count": 0,
+  "missing_anti_specialization_rules_in_retrieval_count": 0,
+  "missing_safe_rewrite_guidance_in_retrieval_count": 0,
+  "missing_visual_form_options_in_retrieval_count": 0,
+  "missing_forbidden_auto_infer_in_retrieval_count": 0,
+  "retrieval_field_completeness_error_count": 0,
+  "concept_tag_leakage_check_missing_count": 0,
+  "golden_concept_errors": [],
+  "details": {
+    "missing_fields": [],
+    "alias_conflicts": [],
+    "empty_or_invalid_aliases": [],
+    "high_risk_term_not_forbidden": [],
+    "overly_strong_statements": [],
+    "longest_match_risks": [
+      {
+        "short_alias": "water",
+        "long_alias": "bridge over water",
+        "owners_short": [
+          "water"
+        ],
+        "owners_long": [
+          "bridge"
+        ]
+      }
+    ],
+    "visual_form_options_schema_errors": [],
+    "visual_form_option_emit_policy_missing": [],
+    "visual_form_option_leakage_risk": [],
+    "safe_rewrite_conflicts": [],
+    "default_none_option_missing": [],
+    "missing_definition_in_retrieval": [],
+    "missing_remote_sensing_understanding_in_retrieval": [],
+    "missing_segmentation_relevance_in_retrieval": [],
+    "missing_slot_guidance_in_retrieval": [],
+    "missing_anti_specialization_rules_in_retrieval": [],
+    "missing_safe_rewrite_guidance_in_retrieval": [],
+    "missing_visual_form_options_in_retrieval": [],
+    "missing_forbidden_auto_infer_in_retrieval": [],
+    "retrieval_field_completeness_errors": [],
+    "concept_tag_leakage_check_missing": []
+  }
+}

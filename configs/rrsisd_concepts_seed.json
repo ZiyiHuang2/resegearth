@@ -1,0 +1,316 @@
+{
+  "dataset": "RRSIS-D",
+  "version": "seed_v1",
+  "concepts": [
+    {
+      "concept_key": "water",
+      "concept_type": "stuff",
+      "canonical_name": "water",
+      "aliases": ["water", "water body", "water bodies"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "irregular contiguous region",
+          "elongated narrow region",
+          "clustered small patches"
+        ],
+        "avoid_visual_form_words": [
+          "simple",
+          "basic",
+          "generic",
+          "blue",
+          "green",
+          "clear",
+          "turbid",
+          "calm",
+          "rough"
+        ],
+        "do_not_put_in_forbidden": [
+          "water",
+          "water body",
+          "water bodies",
+          "body",
+          "bodies",
+          "with",
+          "none"
+        ],
+        "must_put_in_forbidden": [
+          "river",
+          "rivers",
+          "lake",
+          "lakes",
+          "reservoir",
+          "canal",
+          "pond",
+          "ponds",
+          "road",
+          "roads",
+          "blue",
+          "green",
+          "bridge",
+          "bridges",
+          "vehicle",
+          "vehicles",
+          "building",
+          "buildings",
+          "boat",
+          "clear",
+          "turbid",
+          "calm",
+          "rough"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "river",
+        "rivers",
+        "lake",
+        "lakes",
+        "reservoir",
+        "canal",
+        "pond",
+        "ponds"
+      ]
+    },
+    {
+      "concept_key": "bridge",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "bridge",
+      "aliases": ["bridge", "bridges"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "single-span structure",
+          "multi-span structure with piers",
+          "linear crossing structure"
+        ],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["bridge", "bridges", "with", "none"],
+        "must_put_in_forbidden": [
+          "river",
+          "rivers",
+          "road",
+          "roads",
+          "water",
+          "vehicle",
+          "vehicles",
+          "single",
+          "multi",
+          "span",
+          "piers",
+          "linear",
+          "crossing"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "river",
+        "rivers",
+        "road",
+        "roads",
+        "water",
+        "vehicle",
+        "vehicles"
+      ]
+    },
+    {
+      "concept_key": "road",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "road",
+      "aliases": ["road", "roads"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "linear paved corridor",
+          "multi-lane road segment",
+          "curving road section"
+        ],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["road", "roads", "with", "none"],
+        "must_put_in_forbidden": [
+          "bridge",
+          "vehicle",
+          "vehicles",
+          "highway",
+          "runway",
+          "railway",
+          "linear",
+          "paved",
+          "multi",
+          "lane",
+          "curving"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "bridge",
+        "vehicle",
+        "vehicles",
+        "highway",
+        "runway",
+        "railway"
+      ]
+    },
+    {
+      "concept_key": "building",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "building",
+      "aliases": ["building", "buildings"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "rectangular roof block",
+          "dense urban building cluster",
+          "isolated large building footprint"
+        ],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["building", "buildings", "with", "none"],
+        "must_put_in_forbidden": [
+          "residential",
+          "commercial",
+          "roof",
+          "roofs",
+          "window",
+          "windows",
+          "urban",
+          "rectangular",
+          "dense",
+          "isolated",
+          "footprint"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "residential",
+        "commercial",
+        "roof",
+        "roofs",
+        "window",
+        "windows",
+        "urban"
+      ]
+    },
+    {
+      "concept_key": "vehicle",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "vehicle",
+      "aliases": ["vehicle", "vehicles"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "small vehicle cluster",
+          "linear parked vehicle row",
+          "sparse vehicles in open area"
+        ],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": [
+          "vehicle",
+          "vehicles",
+          "in",
+          "on",
+          "near",
+          "with",
+          "of",
+          "and",
+          "the",
+          "a",
+          "an",
+          "none"
+        ],
+        "must_put_in_forbidden": [
+          "car",
+          "cars",
+          "truck",
+          "trucks",
+          "bus",
+          "buses",
+          "van",
+          "vans",
+          "small",
+          "cluster",
+          "linear",
+          "parked",
+          "sparse"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "car",
+        "cars",
+        "truck",
+        "trucks",
+        "bus",
+        "buses",
+        "van",
+        "vans"
+      ]
+    },
+    {
+      "concept_key": "ship",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "ship",
+      "aliases": ["ship", "ships"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "elongated ship silhouette",
+          "clustered ships near harbor area",
+          "single large vessel"
+        ],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["ship", "ships", "with", "none"],
+        "must_put_in_forbidden": [
+          "boat",
+          "boats",
+          "harbor",
+          "port",
+          "dock",
+          "water",
+          "elongated",
+          "clustered",
+          "vessel"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "boat",
+        "boats",
+        "harbor",
+        "port",
+        "dock",
+        "water"
+      ]
+    },
+    {
+      "concept_key": "airport",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "airport",
+      "aliases": ["airport", "airports"],
+      "generation_hint": {
+        "recommended_visual_form_options": [
+          "none",
+          "runway-focused airport region",
+          "airport with terminal zone",
+          "airport apron and hangar area"
+        ],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["airport", "airports", "with", "none"],
+        "must_put_in_forbidden": [
+          "runway",
+          "runways",
+          "terminal",
+          "terminals",
+          "airplane",
+          "airplanes",
+          "aircraft",
+          "hangar",
+          "apron"
+        ]
+      },
+      "mandatory_high_risk_terms": [
+        "runway",
+        "runways",
+        "terminal",
+        "terminals",
+        "airplane",
+        "airplanes",
+        "aircraft",
+        "hangar"
+      ]
+    }
+  ]
+}

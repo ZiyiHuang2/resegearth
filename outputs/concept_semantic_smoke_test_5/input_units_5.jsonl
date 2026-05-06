@@ -1,0 +1,5 @@
+{"expr_id":"smoke_1_find_river","raw_expression":"find river","category_name":"river","source":"manual_smoke_test","split":"smoke"}
+{"expr_id":"smoke_2_find_bridge","raw_expression":"find bridge","category_name":"bridge","source":"manual_smoke_test","split":"smoke"}
+{"expr_id":"smoke_3_find_airport","raw_expression":"find airport","category_name":"airport","source":"manual_smoke_test","split":"smoke"}
+{"expr_id":"smoke_4_find_vehicle_near_river","raw_expression":"find vehicle near river","category_name":"vehicle","source":"manual_smoke_test","split":"smoke"}
+{"expr_id":"smoke_5_find_ship","raw_expression":"find ship","category_name":"ship","source":"manual_smoke_test","split":"smoke"}

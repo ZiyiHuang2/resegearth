@@ -1,0 +1,8 @@
+{"timestamp": "2026-04-30T11:07:54Z", "event": "start_processing_units_jsonl", "input_jsonl": "outputs/concept_semantic_smoke_test_5/input_units_5.jsonl", "total_input_units": 5, "total_units": 5, "limit": 5, "already_processed": 0, "duplicate_input_expr_id_count": 0}
+{"timestamp": "2026-04-30T11:08:00Z", "event": "processed", "expr_id": "smoke_1_find_river", "status": "success"}
+{"timestamp": "2026-04-30T11:08:06Z", "event": "processed", "expr_id": "smoke_2_find_bridge", "status": "success"}
+{"timestamp": "2026-04-30T11:08:11Z", "event": "processed", "expr_id": "smoke_3_find_airport", "status": "success"}
+{"timestamp": "2026-04-30T11:09:41Z", "event": "retry", "expr_id": "smoke_4_find_vehicle_near_river", "attempt": 1, "max_attempts": 3, "error": "HTTPSConnectionPool(host='dashscope.aliyuncs.com', port=443): Read timed out. (read timeout=90)", "next_wait_seconds": 0.659}
+{"timestamp": "2026-04-30T11:09:48Z", "event": "processed", "expr_id": "smoke_4_find_vehicle_near_river", "status": "success"}
+{"timestamp": "2026-04-30T11:09:54Z", "event": "processed", "expr_id": "smoke_5_find_ship", "status": "success"}
+{"timestamp": "2026-04-30T11:09:54Z", "event": "finished", "summary_report": "outputs/concept_semantic_smoke_test_5/summary_report.json"}

@@ -21,6 +21,7 @@ from PIL import Image
 from fvcore.common.config import CfgNode
 import warnings
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
+from segearth_r2.utils.concept_public_grounding_train import build_rrsisd_supervised_human_value
 from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
@@ -222,6 +223,7 @@ class RRSISDDataset(RS_Base_Dataset):
 
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
+        self.concept_public_semantic_library = getattr(data_args, "concept_public_semantic_library", None) or None
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
 
         # 官方目录结构
@@ -309,12 +311,11 @@ class RRSISDDataset(RS_Base_Dataset):
             'image_id': os.path.basename(image_path).split(".")[0],
         })
 
-        prefix_inst = 'This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:'
-
+        human_value = build_rrsisd_supervised_human_value(instruction, self.concept_public_semantic_library)
         token_refer_id = self.preprocess_referring_instruction(instruction)
 
         sources = [[
-            {'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
+            {'from': 'human', 'value': human_value},
             {'from': 'gpt', 'value': '\n' + answer}
         ]]
 

@@ -1,0 +1,187 @@
+{
+  "version": "v1.0",
+  "dataset": "RRSIS-D",
+  "global_constraints": [
+    "concept semantics are for understanding only, not observed facts",
+    "do not add colors, sizes, shapes, states, objects, or locations unless present in raw text",
+    "do not convert concept hints into concrete visual assertions"
+  ],
+  "concepts": {
+    "water": {
+      "canonical_name": "water",
+      "aliases": ["water", "water body", "water bodies", "ponds"],
+      "definition": "Water refers to visible surface water or water-covered regions in remote sensing imagery.",
+      "remote_sensing_understanding": [
+        "Water may appear as a continuous region, a narrow river-like region, or multiple scattered small regions.",
+        "Water-related targets can vary greatly in shape and scale in remote sensing imagery.",
+        "The concept may include rivers, ponds, lakes, reservoirs, or other surface water bodies, but these subtypes must not be assumed unless stated in raw text."
+      ],
+      "visual_form_options": [
+        {
+          "option": "winding small river",
+          "meaning": "a narrow and curved water body",
+          "emit_policy": "do_not_emit_unless_raw_mentions_river_or_winding"
+        },
+        {
+          "option": "large continuous water body",
+          "meaning": "a large connected water-covered area",
+          "emit_policy": "do_not_emit_unless_raw_mentions_large_or_continuous"
+        },
+        {
+          "option": "scattered blocky ponds",
+          "meaning": "multiple separated pond-like water patches",
+          "emit_policy": "do_not_emit_unless_raw_mentions_scattered_or_pond"
+        },
+        {
+          "option": "none",
+          "meaning": "no specific water form is asserted by raw expression",
+          "emit_policy": "default_for_vague_raw"
+        }
+      ],
+      "segmentation_relevance": [
+        "Water may have irregular boundaries.",
+        "Water may appear as either an extended continuous region or several disconnected regions.",
+        "Boundary continuity and separation from shadow or dark surfaces may be important for mask quality."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "condition": "raw expression is an imperative query such as 'find water'",
+          "allowed_rewrite": "the water body",
+          "not_allowed": "do not rewrite as river, pond, lake, reservoir, or canal unless raw text says so"
+        }
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "surface_water",
+          "possible_extended_region",
+          "possible_disconnected_regions",
+          "boundary_sensitive"
+        ],
+        "allowed_slot_hints": [],
+        "do_not_emit_as_text": [
+          "winding small river",
+          "large continuous water body",
+          "scattered blocky ponds",
+          "surface_water",
+          "possible_extended_region",
+          "possible_disconnected_regions",
+          "boundary_sensitive"
+        ]
+      },
+      "concept_semantics": [
+        "water refers to visible surface water in remote sensing imagery",
+        "water concept supports multiple candidate visual forms but these are interpretation options only",
+        "do not infer specific subtype unless raw text explicitly names it"
+      ],
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "rivers",
+        "winding",
+        "small",
+        "large",
+        "continuous",
+        "pond",
+        "ponds",
+        "blocky",
+        "scattered",
+        "lake",
+        "lakes",
+        "reservoir",
+        "canal",
+        "blue",
+        "green",
+        "bridge",
+        "boat",
+        "road"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite water as river unless raw text says river.",
+        "Do not rewrite water as pond unless raw text says pond.",
+        "Do not rewrite water as lake unless raw text says lake.",
+        "Do not rewrite water as reservoir or canal unless raw text explicitly names them.",
+        "Do not add winding, blocky, scattered, large, or continuous unless raw text says so."
+      ],
+      "notes": "Concept-level context only; do not emit visual_form_options unless raw expression explicitly supports them."
+    },
+    "bridge": {
+      "canonical_name": "bridge",
+      "aliases": ["bridge", "bridges", "bridge over water", "bridge over road"],
+      "definition": "Bridge refers to a man-made crossing structure visible in remote sensing imagery.",
+      "remote_sensing_understanding": [
+        "Bridges may span water, roads, or other linear features and can appear as short segments or long linear structures.",
+        "Context around a bridge is easy to confuse with roads, shadows, or piers; segmentation often needs boundary care."
+      ],
+      "visual_form_options": [
+        {
+          "option": "bridge over water",
+          "meaning": "bridge spanning a water surface",
+          "emit_policy": "do_not_emit_unless_raw_mentions_water_or_over_water"
+        },
+        {
+          "option": "bridge over road",
+          "meaning": "bridge spanning a road or highway",
+          "emit_policy": "do_not_emit_unless_raw_mentions_road_or_over_road"
+        },
+        {
+          "option": "long linear bridge",
+          "meaning": "an elongated bridge structure",
+          "emit_policy": "do_not_emit_unless_raw_mentions_long_or_linear"
+        },
+        {
+          "option": "none",
+          "meaning": "no specific bridge form is asserted by raw expression",
+          "emit_policy": "default_for_vague_raw"
+        }
+      ],
+      "segmentation_relevance": [
+        "boundary_sensitive",
+        "elongated_structure",
+        "context_confusion_prone"
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "condition": "raw expression is an imperative query such as 'find bridge'",
+          "allowed_rewrite": "the bridge",
+          "not_allowed": "do not add river, road, water, vehicle, or crossing-structure jargon unless raw text says so"
+        }
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "man_made_structure",
+          "crossing_structure",
+          "boundary_sensitive"
+        ],
+        "allowed_slot_hints": [],
+        "do_not_emit_as_text": [
+          "man_made_structure",
+          "crossing_structure",
+          "boundary_sensitive",
+          "bridge over water",
+          "bridge over road",
+          "long linear bridge"
+        ]
+      },
+      "concept_semantics": [
+        "bridge is a man-made structure crossing obstacles such as rivers or roads",
+        "do not infer what the bridge crosses unless raw text states it"
+      ],
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "rivers",
+        "road",
+        "roads",
+        "water",
+        "vehicle",
+        "vehicles",
+        "long",
+        "over",
+        "linear"
+      ],
+      "anti_specialization_rules": [
+        "Do not add river, road, water, or vehicle to referring expressions unless those words explicitly appear in raw text.",
+        "Do not infer bridge length or linearity unless raw text mentions long, linear, or similar wording."
+      ],
+      "notes": "Do not infer crossing target unless explicitly in raw."
+    }
+  }
+}

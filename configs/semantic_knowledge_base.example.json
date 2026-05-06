@@ -1,0 +1,252 @@
+{
+  "version": "v1.0",
+  "dataset": "RRSIS-D",
+  "categories": {
+    "baseballfield": {
+      "canonical_name": "baseball field",
+      "aliases": ["baseballfield", "baseball field"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "groundtrackfield": {
+      "canonical_name": "ground track field",
+      "aliases": ["groundtrackfield", "ground track field"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "tenniscourt": {
+      "canonical_name": "tennis court",
+      "aliases": ["tenniscourt", "tennis court"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "basketballcourt": {
+      "canonical_name": "basketball court",
+      "aliases": ["basketballcourt", "basketball court"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "golffield": {
+      "canonical_name": "golf field",
+      "aliases": ["golffield", "golf field"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "Expressway-toll-station": {
+      "canonical_name": "expressway toll station",
+      "aliases": ["Expressway-toll-station", "expressway toll station", "expressway-toll-station"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "Expressway-Service-area": {
+      "canonical_name": "expressway service area",
+      "aliases": ["Expressway-Service-area", "expressway service area", "expressway-service-area"],
+      "forbidden_specific_replacements": [],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "vehicle": {
+      "canonical_name": "vehicle",
+      "aliases": ["vehicle"],
+      "forbidden_specific_replacements": ["car", "truck", "bus"],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "ship": {
+      "canonical_name": "ship",
+      "aliases": ["ship"],
+      "forbidden_specific_replacements": ["boat"],
+      "allowed_attribute_words": [],
+      "notes": ""
+    },
+    "airplane": {
+      "canonical_name": "airplane",
+      "aliases": ["airplane"],
+      "forbidden_specific_replacements": ["aircraft"],
+      "allowed_attribute_words": [],
+      "notes": ""
+    }
+  },
+  "spatial_vocabulary": {
+    "on the left": {
+      "type": "absolute_position",
+      "normalized": "left",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the right": {
+      "type": "absolute_position",
+      "normalized": "right",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "in the middle": {
+      "type": "absolute_position",
+      "normalized": "center",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "in the center": {
+      "type": "absolute_position",
+      "normalized": "center",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "in the top": {
+      "type": "absolute_position",
+      "normalized": "top",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "at the bottom": {
+      "type": "absolute_position",
+      "normalized": "bottom",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "at the top": {
+      "type": "absolute_position",
+      "normalized": "top",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the upper left": {
+      "type": "absolute_position",
+      "normalized": "upper_left",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the upper right": {
+      "type": "absolute_position",
+      "normalized": "upper_right",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the lower left": {
+      "type": "absolute_position",
+      "normalized": "lower_left",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the lower right": {
+      "type": "absolute_position",
+      "normalized": "lower_right",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the left of": {
+      "type": "relative_relation",
+      "normalized": "left_of",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "to the left of": {
+      "type": "relative_relation",
+      "normalized": "left_of",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "left of": {
+      "type": "relative_relation",
+      "normalized": "left_of",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on the right of": {
+      "type": "relative_relation",
+      "normalized": "right_of",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "to the right of": {
+      "type": "relative_relation",
+      "normalized": "right_of",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "right of": {
+      "type": "relative_relation",
+      "normalized": "right_of",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "above": {
+      "type": "relative_relation",
+      "normalized": "above",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "below": {
+      "type": "relative_relation",
+      "normalized": "below",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "under": {
+      "type": "relative_relation",
+      "normalized": "below",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "beneath": {
+      "type": "relative_relation",
+      "normalized": "below",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "next to": {
+      "type": "relative_relation",
+      "normalized": "beside",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "close to": {
+      "type": "relative_relation",
+      "normalized": "near",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "near to": {
+      "type": "relative_relation",
+      "normalized": "near",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "smaller than": {
+      "type": "comparative_relation",
+      "normalized": "smaller_than",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "larger than": {
+      "type": "comparative_relation",
+      "normalized": "larger_than",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "at": {
+      "type": "residual_preposition",
+      "normalized": "",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "in": {
+      "type": "residual_preposition",
+      "normalized": "",
+      "allowed_only_if_phrase_in_raw": true
+    },
+    "on": {
+      "type": "residual_preposition",
+      "normalized": "",
+      "allowed_only_if_phrase_in_raw": true
+    }
+  },
+  "explicitization_policy": {
+    "allowed_operations": [
+      "article_completion",
+      "preposition_completion",
+      "relation_verb_insertion",
+      "phrase_normalization"
+    ],
+    "forbidden_inference": [
+      "do not add colors not present in raw",
+      "do not add sizes not present in raw",
+      "do not add shapes not present in raw",
+      "do not add states not present in raw",
+      "do not add new reference objects not present in raw",
+      "do not replace a general category with a more specific subclass"
+    ],
+    "semantic_context_usage": [
+      "semantic context may normalize slots only",
+      "semantic context must not delete raw visual attributes",
+      "semantic context must not rewrite natural-language spatial phrases into slot labels",
+      "semantic context must not change article definiteness except A/An grammar correction",
+      "semantic context must not simplify or remove raw reference objects",
+      "semantic context must not remove raw size/color/shape words"
+    ]
+  },
+  "high_risk_replacements": {
+    "vehicle": ["car", "truck", "bus"],
+    "ship": ["boat"],
+    "airplane": ["aircraft"]
+  }
+}

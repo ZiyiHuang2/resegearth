@@ -53,6 +53,12 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
+    concept_public_semantic_library: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional path to concept_public_semantic_library_v2.json; RRSIS-D injects matched grounding priors in the human message (expression first, then priors, then image, then refer)."
+        },
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

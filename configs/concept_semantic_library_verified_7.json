@@ -1,0 +1,744 @@
+{
+  "version": "seed_v1",
+  "dataset": "RRSIS-D",
+  "global_constraints": [],
+  "concepts": {
+    "water": {
+      "aliases": [
+        "water",
+        "water body",
+        "water bodies"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'water' as 'river', 'lake', 'reservoir', 'canal', 'pond', or any other subtype unless the raw text explicitly names that subtype."
+      ],
+      "canonical_name": "water",
+      "concept_key": "water",
+      "concept_semantics": [
+        "A surface feature in remote sensing imagery characterized by low reflectance in near-infrared (NIR) and shortwave infrared (SWIR) bands, often exhibiting high absorption and specular or diffuse scattering depending on surface conditions.",
+        "Typically exhibits low to medium backscatter in synthetic aperture radar (SAR) imagery under calm conditions; may show higher backscatter if wind-roughened or contaminated with floating material.",
+        "May be spectrally distinguishable from land and vegetation using indices such as NDWI (Normalized Difference Water Index) or MNDWI (Modified NDWI)."
+      ],
+      "definition": "A naturally or artificially occurring surface feature composed of liquid H₂O, observable in remote sensing imagery through its spectral, textural, and contextual properties.",
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "rivers",
+        "lake",
+        "lakes",
+        "reservoir",
+        "canal",
+        "pond",
+        "ponds",
+        "road",
+        "roads",
+        "blue",
+        "green",
+        "bridge",
+        "bridges",
+        "vehicle",
+        "vehicles",
+        "building",
+        "buildings",
+        "boat",
+        "clear",
+        "turbid",
+        "calm",
+        "rough",
+        "irregular",
+        "contiguous",
+        "elongated",
+        "narrow",
+        "clustered",
+        "small",
+        "patches",
+        "region"
+      ],
+      "notes": "This concept refers to water as a broad surface class. Subtype inference (e.g., river vs. lake) requires explicit lexical or contextual support in the referring expression and is not permitted by default.",
+      "remote_sensing_understanding": [
+        "Water detection is highly sensitive to sensor band selection, atmospheric conditions, sun glint, and surface roughness.",
+        "Shallow water, submerged vegetation, and sediment-laden water may reduce spectral contrast with adjacent land or soil.",
+        "Temporal change analysis (e.g., seasonal flooding, reservoir drawdown) is commonly used to validate water presence and extent."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the water",
+          "condition": "when original expression uses definite article + 'water' or synonym without subtype specification.",
+          "not_allowed": "the river, the lake, the reservoir, the canal, the pond, the blue water, the calm water, the turbid water"
+        },
+        {
+          "allowed_rewrite": "the water body",
+          "condition": "when original expression uses 'water body' or plural 'water bodies' without further qualification.",
+          "not_allowed": "the multi-span bridge over the water, the road adjacent to the water, the cluster of ponds"
+        }
+      ],
+      "segmentation_relevance": [
+        "Water is a primary target for binary and multi-class semantic segmentation in land cover mapping.",
+        "Segmentation models must account for spectral variability across sensors, seasons, and geographies.",
+        "Edge ambiguity between water and dark soils, shadows, or dense vegetation remains a persistent challenge."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "irregular_contiguous_region",
+          "elongated_narrow_region",
+          "clustered_small_patches"
+        ],
+        "allowed_slot_hints": [
+          "irregular_contiguous_region",
+          "elongated_narrow_region",
+          "clustered_small_patches"
+        ],
+        "do_not_emit_as_text": [
+          "irregular_contiguous_region",
+          "elongated_narrow_region",
+          "clustered_small_patches"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visually discriminable water form is specified or inferable from the input expression.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_highly_contextual",
+          "meaning": "A single connected area of water with non-geometric, organic boundary shape and no dominant linear orientation.",
+          "option": "irregular contiguous region"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_highly_contextual",
+          "meaning": "A water body exhibiting strong linear morphology, typically longer than 3× its maximum width, with relatively consistent width along its length.",
+          "option": "elongated narrow region"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned_or_highly_contextual",
+          "meaning": "Multiple discrete, small-area water bodies distributed across the scene without forming a single connected region.",
+          "option": "clustered small patches"
+        }
+      ]
+    },
+    "bridge": {
+      "aliases": [
+        "bridge",
+        "bridges"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'bridge' as 'river bridge', 'road bridge', 'railway bridge', 'water crossing', 'vehicle bridge', or any subtype unless the raw referring expression explicitly states such a qualifier."
+      ],
+      "canonical_name": "bridge",
+      "concept_key": "bridge",
+      "concept_semantics": [
+        "A man-made linear infrastructure element designed to span an obstacle (e.g., water body, valley, road) and support passage.",
+        "In remote sensing imagery, typically appears as a distinct, elongated, often rectilinear structure intersecting another linear feature or gap."
+      ],
+      "definition": "A fixed structure providing passage over an obstacle such as a body of water, valley, road, or railway. In remote sensing, identified by spatial configuration, alignment, continuity, and contextual relationship with adjacent terrain or features.",
+      "forbidden_auto_infer_tokens": [
+        "river",
+        "rivers",
+        "road",
+        "roads",
+        "water",
+        "vehicle",
+        "vehicles",
+        "single",
+        "multi",
+        "span",
+        "piers",
+        "linear",
+        "crossing",
+        "structure"
+      ],
+      "notes": "Bridge detection in remote sensing relies on geometric, spectral, and contextual cues; visual form is highly variable and context-dependent. No single spectral signature or shape is diagnostic across sensors or geographies.",
+      "remote_sensing_understanding": [
+        "Often exhibits higher reflectance than surrounding terrain due to construction materials (concrete, steel, asphalt).",
+        "May be partially occluded by vegetation, shadows, or water surface glare.",
+        "Typically aligned orthogonally or obliquely across a linear discontinuity (e.g., river, road, canal), but orientation alone is insufficient for confirmation.",
+        "Length-to-width ratio tends to be high; may show periodic support elements (e.g., piers) in high-resolution imagery."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the bridge",
+          "condition": "When raw text uses a definite article or demonstrative (e.g., 'the bridge', 'that bridge') — retain as generic definite noun phrase.",
+          "not_allowed": "Replace with 'the multi-span bridge', 'the river crossing', or 'the road bridge' unless those modifiers appear verbatim in the raw referring expression."
+        },
+        {
+          "allowed_rewrite": "bridge",
+          "condition": "When raw text uses bare noun or plural (e.g., 'bridge', 'bridges') — retain canonical form without added modifiers.",
+          "not_allowed": "Introduce 'linear', 'single-span', 'with piers', or 'crossing' unless present in original text."
+        }
+      ],
+      "segmentation_relevance": [
+        "Bridge segmentation requires distinguishing the structure from its supports, deck, approach roads, and background — especially where spectral similarity exists (e.g., asphalt deck vs. road surface).",
+        "Occlusion, low resolution, or poor contrast may result in fragmented or incomplete masks; outputs should reflect observable extent, not inferred full geometry."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "support_type",
+          "span_count",
+          "crossing_target"
+        ],
+        "allowed_slot_hints": [
+          "support_type:piers",
+          "span_count:multi",
+          "crossing_target:river"
+        ],
+        "do_not_emit_as_text": [
+          "support_type",
+          "span_count",
+          "crossing_target",
+          "support_type:piers",
+          "span_count:multi",
+          "crossing_target:river"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visually discriminable bridge form is evident in the imagery — e.g., due to occlusion, resolution limit, or absence.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_geometry_and_context",
+          "meaning": "A single continuous span without visible intermediate supports; may appear as an unbroken linear segment bridging a gap.",
+          "option": "single-span structure"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_geometry_and_context",
+          "meaning": "Multiple spans separated by visible vertical supports (e.g., piers) aligned along the longitudinal axis; common over wide rivers or valleys.",
+          "option": "multi-span structure with piers"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_geometry_and_context",
+          "meaning": "A narrow, elongated structure oriented across a linear discontinuity; emphasizes alignment and crossing function rather than structural detail.",
+          "option": "linear crossing structure"
+        }
+      ]
+    },
+    "road": {
+      "aliases": [
+        "road",
+        "roads"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'road' as 'highway', 'runway', 'railway', 'bridge', or any vehicle-related term unless explicitly stated in the raw referring expression.",
+        "Do not infer presence of vehicles, lanes, curvature, or pavement unless explicitly mentioned."
+      ],
+      "canonical_name": "road",
+      "concept_key": "road",
+      "concept_semantics": [
+        "A constructed linear transport corridor intended for wheeled ground vehicles.",
+        "In remote sensing imagery, typically appears as a continuous, relatively uniform-width linear feature with distinct spectral and textural contrast relative to surrounding land cover.",
+        "May vary in visibility depending on surface material, vegetation occlusion, shadowing, and sensor resolution."
+      ],
+      "definition": "A human-made linear infrastructure element designed to support surface transportation, distinguishable in remote sensing imagery by its geometry, continuity, and contextual relationship to built environment features.",
+      "forbidden_auto_infer_tokens": [
+        "bridge",
+        "vehicle",
+        "vehicles",
+        "highway",
+        "runway",
+        "railway",
+        "linear",
+        "paved",
+        "multi",
+        "lane",
+        "curving",
+        "corridor",
+        "segment",
+        "section"
+      ],
+      "notes": "Roads are often ambiguous with other linear anthropogenic features (e.g., canals, power line corridors, fence lines) and require contextual or multi-spectral validation. Visual form options describe common appearance patterns—not definitive diagnostic criteria.",
+      "remote_sensing_understanding": [
+        "Roads may be spectrally similar to bare soil, asphalt, concrete, or gravel; material inference requires ancillary data or high-resolution multispectral analysis.",
+        "Occlusion by trees, clouds, or shadows may fragment apparent continuity, affecting segmentation reliability.",
+        "Curvature and width variation are observable but not invariant; straightness or multi-lane configuration should not be assumed without evidence."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the road",
+          "condition": "when original refers to a specific road instance with clear spatial anchoring.",
+          "not_allowed": "a paved multi-lane curving road"
+        },
+        {
+          "allowed_rewrite": "the road",
+          "condition": "only if 'segment' appears in original text or is unambiguously implied by bounding context (e.g., 'the road between buildings A and B').",
+          "not_allowed": "a linear paved corridor"
+        },
+        {
+          "allowed_rewrite": "the road",
+          "condition": "default safe form for vague or underspecified references.",
+          "not_allowed": "the curving road section"
+        }
+      ],
+      "segmentation_relevance": [
+        "Roads are frequently targeted for semantic segmentation due to applications in navigation, urban planning, and change detection.",
+        "Segmentation performance is sensitive to scale, orientation variance, and adjacency to similar-contrast features (e.g., field boundaries, rivers)."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "road_type",
+          "surface_material",
+          "lanes",
+          "curvature"
+        ],
+        "allowed_slot_hints": [
+          "road_type=unspecified",
+          "surface_material=unknown",
+          "lanes=unknown",
+          "curvature=unknown"
+        ],
+        "do_not_emit_as_text": [
+          "road_type",
+          "surface_material",
+          "lanes",
+          "curvature",
+          "road_type=unspecified",
+          "surface_material=unknown",
+          "lanes=unknown",
+          "curvature=unknown"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No distinctive visual form is specified or inferable from the input expression.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "The expression explicitly describes the road as a long, straight, uniform-width feature with engineered surface characteristics.",
+          "option": "linear paved corridor"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "The expression explicitly states or strongly implies multiple parallel traffic lanes, often with visible lane markings or width exceeding typical single-lane roads.",
+          "option": "multi-lane road segment"
+        },
+        {
+          "emit_policy": "emit_if_explicitly_mentioned",
+          "meaning": "The expression explicitly references curvature—e.g., 'bend', 'curve', 'arc', or 'winding'—in describing the road's planimetric geometry.",
+          "option": "curving road section"
+        }
+      ]
+    },
+    "building": {
+      "aliases": [
+        "building",
+        "buildings"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'building' as 'residential building', 'commercial building', 'industrial building', or any subtype unless the raw text explicitly states the subtype."
+      ],
+      "canonical_name": "building",
+      "concept_key": "building",
+      "concept_semantics": [
+        "A constructed, human-made structure intended for occupancy or use, typically with walls and a roof. In remote sensing imagery, buildings are commonly identified by their geometric footprint, spectral signature, shadow patterns, and spatial context (e.g., proximity to roads or other built infrastructure)."
+      ],
+      "definition": "A permanent, above-ground, human-constructed structure designed for habitation, work, storage, or other functional use. In remote sensing, detection and segmentation rely on visual cues such as shape regularity, contrast with surroundings, cast shadows, and contextual spatial arrangement — not semantic labels like function or occupancy.",
+      "forbidden_auto_infer_tokens": [
+        "residential",
+        "commercial",
+        "roof",
+        "roofs",
+        "window",
+        "windows",
+        "urban",
+        "rectangular",
+        "dense",
+        "isolated",
+        "footprint",
+        "cluster",
+        "large",
+        "block"
+      ],
+      "notes": "Building identification in remote sensing is inherently ambiguous without auxiliary data: footprint geometry alone cannot determine function, construction material, height, or occupancy status. Visual form options describe observable spatial patterns — not inferred attributes.",
+      "remote_sensing_understanding": [
+        "Buildings may appear as closed polygons (footprints), high-contrast objects against natural surfaces, or as aligned shadow–object pairs in oblique or high-sun imagery.",
+        "Spectral response varies widely (concrete, metal, tile, asphalt) and overlaps with other impervious surfaces; thus, shape and context are often more reliable than color alone.",
+        "No single visual form is universally diagnostic: isolated large footprints may be industrial sheds or rural barns; dense clusters may include mixed-use or non-residential structures."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "a building",
+          "condition": "when raw text says 'the building' or 'a building' — retain generic noun phrase form; do not upgrade to 'the rectangular roof block' or 'the urban cluster' unless those exact phrases appear in input text.",
+          "not_allowed": "the residential building, the commercial structure, the windowed facade, the simple building, the basic structure, the generic building"
+        },
+        {
+          "allowed_rewrite": "buildings",
+          "condition": "when raw text uses plural or collective reference without specifying form or function — retain neutral plural; do not insert modifiers like 'dense', 'urban', or 'rectangular' unless present in source text.",
+          "not_allowed": "dense urban buildings, rectangular buildings, isolated buildings, roofed buildings"
+        }
+      ],
+      "segmentation_relevance": [
+        "Building footprint segmentation is foundational for urban mapping, change detection, and population estimation.",
+        "Remote sensing segmentation models must avoid conflating buildings with other man-made objects (e.g., parking lots, silos, solar farms) based solely on shape or texture."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "footprint",
+          "shadow",
+          "context_density",
+          "arrangement"
+        ],
+        "allowed_slot_hints": [
+          "footprint_shape",
+          "shadow_length",
+          "neighbor_density",
+          "spatial_arrangement"
+        ],
+        "do_not_emit_as_text": [
+          "footprint",
+          "shadow",
+          "context_density",
+          "arrangement",
+          "footprint_shape",
+          "shadow_length",
+          "neighbor_density",
+          "spatial_arrangement"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No visually distinctive building pattern is discernible in the region of interest — e.g., due to low resolution, occlusion, or absence of detectable structures.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_visual_evidence",
+          "meaning": "A compact, closed polygonal region exhibiting high spectral contrast and consistent rectangular or near-rectangular geometry, often associated with roof-level observation (e.g., in aerial or satellite imagery with sufficient resolution).",
+          "option": "rectangular roof block"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_visual_evidence",
+          "meaning": "A contiguous or semi-contiguous group of building footprints with high spatial density, minimal inter-building gaps, and alignment suggestive of planned urban development — not inferable from label alone.",
+          "option": "dense urban building cluster"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_visual_evidence",
+          "meaning": "A single, prominent, closed footprint significantly larger than surrounding structures, with clear boundaries and no adjacent footprints within typical urban spacing — observable without reliance on textual metadata.",
+          "option": "isolated large building footprint"
+        }
+      ]
+    },
+    "vehicle": {
+      "aliases": [
+        "vehicle",
+        "vehicles"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'vehicle' as 'car', 'truck', 'bus', 'van', or any other specific vehicle type unless the raw text explicitly names that type."
+      ],
+      "canonical_name": "vehicle",
+      "concept_key": "vehicle",
+      "concept_semantics": [
+        "A movable ground-based transport object detectable in remote sensing imagery.",
+        "Typically appears as discrete, compact, high-contrast objects with consistent aspect ratios and spectral signatures relative to surrounding surfaces.",
+        "May occur individually or in aggregations; spatial arrangement and density are key discriminative cues in segmentation tasks."
+      ],
+      "definition": "A ground-based motorized transport object, including but not limited to cars, trucks, buses, and vans, identifiable in remote sensing imagery by shape, size, texture, and context.",
+      "forbidden_auto_infer_tokens": [
+        "car",
+        "cars",
+        "truck",
+        "trucks",
+        "bus",
+        "buses",
+        "van",
+        "vans",
+        "small",
+        "cluster",
+        "linear",
+        "parked",
+        "sparse",
+        "row",
+        "area",
+        "open"
+      ],
+      "notes": "This concept refers to vehicles as observable entities in remote sensing imagery—not as semantic categories from natural language descriptions. Visual form options describe spatial arrangements and densities observed in imagery, not functional or legal classifications.",
+      "remote_sensing_understanding": [
+        "Vehicles are typically resolved as sub-meter to multi-meter discrete objects depending on sensor resolution.",
+        "Spectral response varies with surface material (e.g., metal, glass, paint) and illumination, but shape and context (e.g., road, parking lot, bare soil) often dominate detection cues.",
+        "Shadow presence, orientation, and adjacency to infrastructure (e.g., roads, curbs, parking markings) support reliable segmentation in high-resolution optical and SAR data."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "a vehicle",
+          "condition": "when raw text says 'a vehicle' or equivalent indefinite reference",
+          "not_allowed": "a car, a truck, a bus, a van"
+        },
+        {
+          "allowed_rewrite": "the vehicle",
+          "condition": "when raw text uses definite article and refers to a single previously established vehicle",
+          "not_allowed": "the car, the truck, the bus, the van"
+        },
+        {
+          "allowed_rewrite": "vehicles",
+          "condition": "when raw text uses plural generic noun phrase without subtype specification",
+          "not_allowed": "cars, trucks, buses, vans, motor vehicles, automobiles"
+        }
+      ],
+      "segmentation_relevance": [
+        "Vehicle segmentation supports traffic monitoring, urban activity analysis, and change detection.",
+        "Distinguishing vehicle instances from similar-sized objects (e.g., debris, containers, shadows) requires contextual and multispectral reasoning.",
+        "Aggregated forms (e.g., clusters, rows) are often more reliably segmented than isolated instances due to collective spatial priors."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "road",
+          "parking_lot",
+          "bare_soil",
+          "asphalt",
+          "concrete",
+          "gravel",
+          "shadow"
+        ],
+        "allowed_slot_hints": [
+          "road",
+          "parking_lot",
+          "bare_soil",
+          "asphalt",
+          "concrete",
+          "gravel",
+          "shadow"
+        ],
+        "do_not_emit_as_text": [
+          "road",
+          "parking_lot",
+          "bare_soil",
+          "asphalt",
+          "concrete",
+          "gravel",
+          "shadow"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No vehicle or vehicle-like object is present or discernible in the region of interest.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_context_and_shape",
+          "meaning": "Multiple vehicles grouped closely together, occupying a compact area without strong linear alignment.",
+          "option": "small vehicle cluster"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_alignment_and_orientation",
+          "meaning": "Vehicles aligned along a linear feature (e.g., curb, lane marking, edge), typically oriented parallel to one another and to the feature.",
+          "option": "linear parked vehicle row"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_low_density_and_isolation",
+          "meaning": "Few vehicles scattered across an unstructured, non-road surface such as bare soil, grass, or sand.",
+          "option": "sparse vehicles in open area"
+        }
+      ]
+    },
+    "ship": {
+      "aliases": [
+        "ship",
+        "ships"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'ship' as 'boat', 'vessel', 'harbor infrastructure', 'dock', 'port', or 'water body' unless the raw text explicitly uses that term.",
+        "Do not infer presence of water, harbor, port, dock, or boats from the mention of 'ship' alone."
+      ],
+      "canonical_name": "ship",
+      "concept_key": "ship",
+      "concept_semantics": [
+        "A large watercraft designed for oceangoing or major inland waterway transport.",
+        "In remote sensing imagery, typically appears as a discrete, high-contrast object with elongated form and measurable length-to-width ratio.",
+        "May occur in isolation or in groups; position relative to coastline or built infrastructure (e.g., breakwaters, jetties) may support contextual interpretation but is not definitive."
+      ],
+      "definition": "A powered, seagoing or large inland waterway vessel, distinguishable in remote sensing imagery by its size, shape, and spatial context relative to water bodies and coastal infrastructure.",
+      "forbidden_auto_infer_tokens": [
+        "boat",
+        "boats",
+        "harbor",
+        "port",
+        "dock",
+        "water",
+        "elongated",
+        "clustered",
+        "vessel",
+        "silhouette",
+        "area",
+        "single",
+        "large"
+      ],
+      "notes": "Ship detection in remote sensing relies on geometric and radiometric signatures; visual forms are descriptive hypotheses—not guaranteed attributes. 'None' is used when no ship-like object is discernible at sensor resolution and confidence threshold.",
+      "remote_sensing_understanding": [
+        "Ships are typically resolved as sub-pixel to multi-pixel objects depending on sensor resolution (e.g., <1 m VHR vs. 10 m Sentinel-2).",
+        "Spectral signature varies with material (steel, aluminum), coating (paint, rust), sea state, and sun-glint conditions.",
+        "Shadow, wake, and adjacency to water or quay structures may support identification but are not required or sufficient alone."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the ship",
+          "condition": "when referring to a specific ship previously mentioned or unambiguously locatable in the image.",
+          "not_allowed": "find the ship, locate the ship, detect the ship, identify the ship"
+        },
+        {
+          "allowed_rewrite": "ships",
+          "condition": "when plural reference is supported by visual evidence or raw text.",
+          "not_allowed": "a fleet, a convoy, maritime traffic, naval assets"
+        },
+        {
+          "allowed_rewrite": "a ship",
+          "condition": "when introducing a single ship without specifying size, configuration, or context.",
+          "not_allowed": "a large vessel, an elongated silhouette, ships near harbor"
+        }
+      ],
+      "segmentation_relevance": [
+        "High relevance: ships are discrete, countable objects with clear boundaries in high-resolution optical and SAR imagery.",
+        "Medium relevance: segmentation may be degraded by occlusion (e.g., container stacking), low contrast (e.g., dark hull on dark water), or motion blur in video/SAR.",
+        "Low relevance: in coarse-resolution imagery where ships fall below detection threshold."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "is_isolated",
+          "is_clustered",
+          "has_visible_wake",
+          "has_shadow"
+        ],
+        "allowed_slot_hints": [
+          "count",
+          "approximate_length_m",
+          "orientation_deg",
+          "relative_to_coastline"
+        ],
+        "do_not_emit_as_text": [
+          "is_isolated",
+          "is_clustered",
+          "has_visible_wake",
+          "has_shadow",
+          "count",
+          "approximate_length_m",
+          "orientation_deg",
+          "relative_to_coastline"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No ship-like object is discernible in the region of interest at current resolution and confidence level.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_shape_and_contrast",
+          "meaning": "A single, continuous, high-contrast linear object consistent with ship profile under typical viewing geometry and lighting.",
+          "option": "elongated ship silhouette"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_spatial_density_and_proximity_to_coastal_infrastructure",
+          "meaning": "Multiple ship-like objects grouped within a confined area adjacent to known harbor-related features (e.g., breakwaters, piers, terminals), but without explicit labeling of 'harbor'.",
+          "option": "clustered ships near harbor area"
+        },
+        {
+          "emit_policy": "emit_if_confirmed_by_size_relative_to_context_and_absence_of_nearby_objects",
+          "meaning": "One dominant, high-contrast object significantly larger than surrounding vessels or features, with no other ships in immediate proximity.",
+          "option": "single large vessel"
+        }
+      ]
+    },
+    "airport": {
+      "aliases": [
+        "airport",
+        "airports"
+      ],
+      "anti_specialization_rules": [
+        "Do not rewrite 'airport' as 'runway-focused airport region' unless the raw text explicitly mentions runways or runway-related features.",
+        "Do not rewrite 'airport' as 'airport with terminal zone' unless the raw text explicitly mentions a terminal or terminal zone.",
+        "Do not rewrite 'airport' as 'airport apron and hangar area' unless the raw text explicitly mentions an apron, hangar, or both."
+      ],
+      "canonical_name": "airport",
+      "concept_key": "airport",
+      "concept_semantics": [
+        "A human-made infrastructure complex designed for aircraft takeoff, landing, and ground operations.",
+        "A geospatially bounded facility containing paved surfaces, taxiways, and support structures for civil or military aviation."
+      ],
+      "definition": "A designated area with facilities for aircraft to land, take off, and be serviced; typically includes runways, taxiways, aprons, terminals, and hangars — though not all components are necessarily visible or resolvable in remote sensing imagery.",
+      "forbidden_auto_infer_tokens": [
+        "runway",
+        "runways",
+        "terminal",
+        "terminals",
+        "airplane",
+        "airplanes",
+        "aircraft",
+        "hangar",
+        "apron",
+        "focused",
+        "region",
+        "zone",
+        "area"
+      ],
+      "notes": "Remote sensing imagery may show partial or ambiguous manifestations of airports (e.g., linear pavement without contextual labels); visual form options reflect observable spatial patterns, not inferred function or operational status.",
+      "remote_sensing_understanding": [
+        "Airport detection relies on geometric regularity (e.g., long straight segments, orthogonal taxiway networks), scale, and contextual land use (e.g., proximity to urban centers or transportation corridors).",
+        "No single spectral signature is diagnostic; interpretation depends on spatial configuration, size, and co-located infrastructure patterns."
+      ],
+      "safe_rewrite_guidance": [
+        {
+          "allowed_rewrite": "the airport",
+          "condition": "when referring to a previously identified or contextually anchored airport instance.",
+          "not_allowed": "the runway-focused airport region"
+        },
+        {
+          "allowed_rewrite": "an airport",
+          "condition": "when introducing a generic, non-specific instance without visual form specification.",
+          "not_allowed": "an airport apron and hangar area"
+        }
+      ],
+      "segmentation_relevance": [
+        "High relevance: airports are frequently targeted for semantic segmentation due to strategic, logistical, and safety applications.",
+        "Challenging due to intra-class variability (e.g., small rural airstrips vs. large international hubs) and partial occlusion."
+      ],
+      "slot_guidance": {
+        "allowed_internal_tags": [
+          "runway_presence",
+          "terminal_presence",
+          "apron_presence",
+          "hangar_presence"
+        ],
+        "allowed_slot_hints": [
+          "has_runway",
+          "has_terminal",
+          "has_apron",
+          "has_hangar"
+        ],
+        "do_not_emit_as_text": [
+          "runway_presence",
+          "terminal_presence",
+          "apron_presence",
+          "hangar_presence",
+          "has_runway",
+          "has_terminal",
+          "has_apron",
+          "has_hangar"
+        ]
+      },
+      "visual_form_options": [
+        {
+          "emit_policy": "default_for_vague_raw",
+          "meaning": "No distinguishable airport-associated visual pattern is evident in the imagery; insufficient evidence to assign a more specific form.",
+          "option": "none"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "Imagery shows one or more prominent linear, high-contrast paved surfaces aligned with typical runway orientation and dimensions, possibly with associated taxiways but no clearly resolved terminal or hangar structures.",
+          "option": "runway-focused airport region"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "Imagery contains a compact, often rectangular or L-shaped built-up zone adjacent to runway/taxiway infrastructure, exhibiting higher density and complexity consistent with terminal buildings and access roads.",
+          "option": "airport with terminal zone"
+        },
+        {
+          "emit_policy": "emit_if_explicit",
+          "meaning": "Imagery shows a paved open area adjacent to runways/taxiways containing multiple discrete, roofed rectangular structures (hangars) and vehicle/parking patterns consistent with aircraft servicing.",
+          "option": "airport apron and hangar area"
+        }
+      ]
+    }
+  }
+}

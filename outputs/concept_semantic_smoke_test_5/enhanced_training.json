@@ -1,0 +1,502 @@
+{
+  "dataset": "RRSIS-D",
+  "enhancement_version": "v1.0_explicitization_only",
+  "num_records": 5,
+  "records": [
+    {
+      "expr_id": "smoke_1_find_river",
+      "ref_id": null,
+      "ann_id": null,
+      "image_id": null,
+      "file_name": null,
+      "split": "smoke",
+      "category_id": null,
+      "category_name": "river",
+      "bbox": null,
+      "segmentation_ref": null,
+      "raw": "find river",
+      "enhanced": "find the river",
+      "compressed": "find river",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "river"
+      },
+      "explicitization": {
+        "added_token_justification": [
+          {
+            "reason": "grammar_only",
+            "token": "the"
+          }
+        ],
+        "added_tokens": [
+          "the"
+        ],
+        "operations": [
+          {
+            "after": "find the river",
+            "before": "find river",
+            "type": "article_completion"
+          }
+        ]
+      },
+      "notes": "No spatial phrases or attributes present; only grammatical article completion is safe and required. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: 'river' is a singular countable noun and requires a definite article in imperative referring expressions to indicate a specific instance.` -> `grammar_only`",
+      "expression_index": null,
+      "sent_id": null,
+      "source": "manual_smoke_test"
+    },
+    {
+      "expr_id": "smoke_2_find_bridge",
+      "ref_id": null,
+      "ann_id": null,
+      "image_id": null,
+      "file_name": null,
+      "split": "smoke",
+      "category_id": null,
+      "category_name": "bridge",
+      "bbox": null,
+      "segmentation_ref": null,
+      "raw": "find bridge",
+      "enhanced": "find the bridge",
+      "compressed": "find bridge",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "bridge"
+      },
+      "explicitization": {
+        "added_token_justification": [
+          {
+            "reason": "grammar_only",
+            "token": "the"
+          }
+        ],
+        "added_tokens": [
+          "the"
+        ],
+        "operations": [
+          {
+            "after": "find the bridge",
+            "before": "find bridge",
+            "type": "article_completion"
+          }
+        ]
+      },
+      "notes": "No spatial phrases or attributes present; only grammatical article completion applied. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: definite article 'the' is grammatically required before singular countable noun 'bridge' in imperative context` -> `grammar_only`",
+      "expression_index": null,
+      "sent_id": null,
+      "source": "manual_smoke_test"
+    },
+    {
+      "expr_id": "smoke_3_find_airport",
+      "ref_id": null,
+      "ann_id": null,
+      "image_id": null,
+      "file_name": null,
+      "split": "smoke",
+      "category_id": null,
+      "category_name": "airport",
+      "bbox": null,
+      "segmentation_ref": null,
+      "raw": "find airport",
+      "enhanced": "find the airport",
+      "compressed": "find airport",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "airport"
+      },
+      "explicitization": {
+        "added_token_justification": [
+          {
+            "reason": "grammar_only",
+            "token": "the"
+          }
+        ],
+        "added_tokens": [
+          "the"
+        ],
+        "operations": [
+          {
+            "after": "find the airport",
+            "before": "find airport",
+            "type": "article_completion"
+          }
+        ]
+      },
+      "notes": "No spatial phrases or attributes present; only grammatical article completion applied. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: definite article 'the' is grammatically required before singular countable noun 'airport' in imperative context` -> `grammar_only`",
+      "expression_index": null,
+      "sent_id": null,
+      "source": "manual_smoke_test"
+    },
+    {
+      "expr_id": "smoke_4_find_vehicle_near_river",
+      "ref_id": null,
+      "ann_id": null,
+      "image_id": null,
+      "file_name": null,
+      "split": "smoke",
+      "category_id": null,
+      "category_name": "vehicle",
+      "bbox": null,
+      "segmentation_ref": null,
+      "raw": "find vehicle near river",
+      "enhanced": "find the vehicle near the river",
+      "compressed": "find vehicle near river",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [
+          "river"
+        ],
+        "spatial_relations": [
+          "near"
+        ],
+        "target_category": "vehicle"
+      },
+      "explicitization": {
+        "added_token_justification": [
+          {
+            "reason": "grammar_only",
+            "token": "the"
+          }
+        ],
+        "added_tokens": [
+          "the",
+          "the"
+        ],
+        "operations": [
+          {
+            "after": "find the vehicle near the river",
+            "before": "find vehicle near river",
+            "type": "article_completion"
+          }
+        ]
+      },
+      "notes": "No spatial phrase normalization or relation verb insertion is needed because 'near' is already a valid preposition and no verb is missing. No concept specialization is performed per constraints. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: added definite article 'the' before 'vehicle' and 'river' for grammatical correctness in referring expression context` -> `grammar_only`",
+      "expression_index": null,
+      "sent_id": null,
+      "source": "manual_smoke_test"
+    },
+    {
+      "expr_id": "smoke_5_find_ship",
+      "ref_id": null,
+      "ann_id": null,
+      "image_id": null,
+      "file_name": null,
+      "split": "smoke",
+      "category_id": null,
+      "category_name": "ship",
+      "bbox": null,
+      "segmentation_ref": null,
+      "raw": "find ship",
+      "enhanced": "find the ship",
+      "compressed": "find ship",
+      "status": "success",
+      "slots": {
+        "absolute_positions": [],
+        "attributes": [],
+        "clean_label_valid": true,
+        "quantity": "unknown",
+        "reference_objects": [],
+        "spatial_relations": [],
+        "target_category": "ship"
+      },
+      "explicitization": {
+        "added_token_justification": [
+          {
+            "reason": "grammar_only",
+            "token": "the"
+          }
+        ],
+        "added_tokens": [
+          "the"
+        ],
+        "operations": [
+          {
+            "after": "find the ship",
+            "before": "find ship",
+            "type": "article_completion"
+          }
+        ]
+      },
+      "notes": "No spatial phrases or attributes present; only grammatical article completion applied. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: definite article 'the' is required before singular countable noun 'ship' in imperative context` -> `grammar_only`",
+      "expression_index": null,
+      "sent_id": null,
+      "source": "manual_smoke_test"
+    }
+  ],
+  "refs": [
+    {
+      "ref_id": null,
+      "ann_id": null,
+      "image_id": null,
+      "file_name": null,
+      "category_id": null,
+      "category_name": "river",
+      "split": "smoke",
+      "bbox": null,
+      "segmentation_ref": null,
+      "expressions": [
+        {
+          "expr_id": "smoke_1_find_river",
+          "ref_id": null,
+          "ann_id": null,
+          "image_id": null,
+          "file_name": null,
+          "split": "smoke",
+          "category_id": null,
+          "category_name": "river",
+          "bbox": null,
+          "segmentation_ref": null,
+          "raw": "find river",
+          "enhanced": "find the river",
+          "compressed": "find river",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "river"
+          },
+          "explicitization": {
+            "added_token_justification": [
+              {
+                "reason": "grammar_only",
+                "token": "the"
+              }
+            ],
+            "added_tokens": [
+              "the"
+            ],
+            "operations": [
+              {
+                "after": "find the river",
+                "before": "find river",
+                "type": "article_completion"
+              }
+            ]
+          },
+          "notes": "No spatial phrases or attributes present; only grammatical article completion is safe and required. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: 'river' is a singular countable noun and requires a definite article in imperative referring expressions to indicate a specific instance.` -> `grammar_only`",
+          "expression_index": null,
+          "sent_id": null,
+          "source": "manual_smoke_test"
+        },
+        {
+          "expr_id": "smoke_2_find_bridge",
+          "ref_id": null,
+          "ann_id": null,
+          "image_id": null,
+          "file_name": null,
+          "split": "smoke",
+          "category_id": null,
+          "category_name": "bridge",
+          "bbox": null,
+          "segmentation_ref": null,
+          "raw": "find bridge",
+          "enhanced": "find the bridge",
+          "compressed": "find bridge",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "bridge"
+          },
+          "explicitization": {
+            "added_token_justification": [
+              {
+                "reason": "grammar_only",
+                "token": "the"
+              }
+            ],
+            "added_tokens": [
+              "the"
+            ],
+            "operations": [
+              {
+                "after": "find the bridge",
+                "before": "find bridge",
+                "type": "article_completion"
+              }
+            ]
+          },
+          "notes": "No spatial phrases or attributes present; only grammatical article completion applied. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: definite article 'the' is grammatically required before singular countable noun 'bridge' in imperative context` -> `grammar_only`",
+          "expression_index": null,
+          "sent_id": null,
+          "source": "manual_smoke_test"
+        },
+        {
+          "expr_id": "smoke_3_find_airport",
+          "ref_id": null,
+          "ann_id": null,
+          "image_id": null,
+          "file_name": null,
+          "split": "smoke",
+          "category_id": null,
+          "category_name": "airport",
+          "bbox": null,
+          "segmentation_ref": null,
+          "raw": "find airport",
+          "enhanced": "find the airport",
+          "compressed": "find airport",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "airport"
+          },
+          "explicitization": {
+            "added_token_justification": [
+              {
+                "reason": "grammar_only",
+                "token": "the"
+              }
+            ],
+            "added_tokens": [
+              "the"
+            ],
+            "operations": [
+              {
+                "after": "find the airport",
+                "before": "find airport",
+                "type": "article_completion"
+              }
+            ]
+          },
+          "notes": "No spatial phrases or attributes present; only grammatical article completion applied. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: definite article 'the' is grammatically required before singular countable noun 'airport' in imperative context` -> `grammar_only`",
+          "expression_index": null,
+          "sent_id": null,
+          "source": "manual_smoke_test"
+        },
+        {
+          "expr_id": "smoke_4_find_vehicle_near_river",
+          "ref_id": null,
+          "ann_id": null,
+          "image_id": null,
+          "file_name": null,
+          "split": "smoke",
+          "category_id": null,
+          "category_name": "vehicle",
+          "bbox": null,
+          "segmentation_ref": null,
+          "raw": "find vehicle near river",
+          "enhanced": "find the vehicle near the river",
+          "compressed": "find vehicle near river",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [
+              "river"
+            ],
+            "spatial_relations": [
+              "near"
+            ],
+            "target_category": "vehicle"
+          },
+          "explicitization": {
+            "added_token_justification": [
+              {
+                "reason": "grammar_only",
+                "token": "the"
+              }
+            ],
+            "added_tokens": [
+              "the",
+              "the"
+            ],
+            "operations": [
+              {
+                "after": "find the vehicle near the river",
+                "before": "find vehicle near river",
+                "type": "article_completion"
+              }
+            ]
+          },
+          "notes": "No spatial phrase normalization or relation verb insertion is needed because 'near' is already a valid preposition and no verb is missing. No concept specialization is performed per constraints. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: added definite article 'the' before 'vehicle' and 'river' for grammatical correctness in referring expression context` -> `grammar_only`",
+          "expression_index": null,
+          "sent_id": null,
+          "source": "manual_smoke_test"
+        },
+        {
+          "expr_id": "smoke_5_find_ship",
+          "ref_id": null,
+          "ann_id": null,
+          "image_id": null,
+          "file_name": null,
+          "split": "smoke",
+          "category_id": null,
+          "category_name": "ship",
+          "bbox": null,
+          "segmentation_ref": null,
+          "raw": "find ship",
+          "enhanced": "find the ship",
+          "compressed": "find ship",
+          "status": "success",
+          "slots": {
+            "absolute_positions": [],
+            "attributes": [],
+            "clean_label_valid": true,
+            "quantity": "unknown",
+            "reference_objects": [],
+            "spatial_relations": [],
+            "target_category": "ship"
+          },
+          "explicitization": {
+            "added_token_justification": [
+              {
+                "reason": "grammar_only",
+                "token": "the"
+              }
+            ],
+            "added_tokens": [
+              "the"
+            ],
+            "operations": [
+              {
+                "after": "find the ship",
+                "before": "find ship",
+                "type": "article_completion"
+              }
+            ]
+          },
+          "notes": "No spatial phrases or attributes present; only grammatical article completion applied. | normalized invalid quantity `` to `unknown`; normalized added_token_justification.reason `article_completion: definite article 'the' is required before singular countable noun 'ship' in imperative context` -> `grammar_only`",
+          "expression_index": null,
+          "sent_id": null,
+          "source": "manual_smoke_test"
+        }
+      ]
+    }
+  ]
+}

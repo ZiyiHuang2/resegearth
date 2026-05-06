@@ -1,0 +1,138 @@
+{
+  "dataset": "RRSIS-D",
+  "version": "seed_next_v1",
+  "concepts": [
+    {
+      "concept_key": "vegetation",
+      "concept_type": "stuff",
+      "canonical_name": "vegetation",
+      "aliases": ["vegetation", "vegetated area", "vegetation cover"],
+      "mandatory_high_risk_terms": ["tree", "trees", "grass", "crop", "farmland", "forest", "green"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "dense canopy region", "sparse mixed vegetation", "linear vegetated belt"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["vegetation", "vegetated area", "vegetation cover", "none", "with"],
+        "must_put_in_forbidden": ["tree", "trees", "grass", "crop", "farmland", "forest", "green", "dense", "sparse", "canopy"]
+      }
+    },
+    {
+      "concept_key": "farmland",
+      "concept_type": "stuff",
+      "canonical_name": "farmland",
+      "aliases": ["farmland", "farmlands", "agricultural land"],
+      "mandatory_high_risk_terms": ["crop", "crops", "field", "fields", "irrigation", "greenhouse"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "rectangular field mosaic", "strip cultivated parcels", "irregular cultivated patches"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["farmland", "farmlands", "agricultural land", "none", "with"],
+        "must_put_in_forbidden": ["crop", "crops", "field", "fields", "irrigation", "greenhouse", "rectangular", "mosaic", "cultivated"]
+      }
+    },
+    {
+      "concept_key": "grassland",
+      "concept_type": "stuff",
+      "canonical_name": "grassland",
+      "aliases": ["grassland", "grasslands", "grass area"],
+      "mandatory_high_risk_terms": ["pasture", "meadow", "lawn", "shrub", "forest", "farmland"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "continuous grassy region", "patchy grass coverage", "mixed grass shrub zone"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["grassland", "grasslands", "grass area", "none", "with"],
+        "must_put_in_forbidden": ["pasture", "meadow", "lawn", "shrub", "forest", "farmland", "continuous", "patchy", "grassy"]
+      }
+    },
+    {
+      "concept_key": "forest",
+      "concept_type": "stuff",
+      "canonical_name": "forest",
+      "aliases": ["forest", "forests", "woodland"],
+      "mandatory_high_risk_terms": ["tree", "trees", "canopy", "shrub", "grassland", "farmland"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "dense closed canopy", "open canopy forest", "fragmented woodland patches"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["forest", "forests", "woodland", "none", "with"],
+        "must_put_in_forbidden": ["tree", "trees", "canopy", "shrub", "grassland", "farmland", "dense", "open", "fragmented"]
+      }
+    },
+    {
+      "concept_key": "bare land",
+      "concept_type": "stuff",
+      "canonical_name": "bare land",
+      "aliases": ["bare land", "bareland", "exposed soil"],
+      "mandatory_high_risk_terms": ["sand", "soil", "rock", "vegetation", "farmland", "construction"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "exposed soil region", "rocky barren patch", "sandy open surface"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["bare land", "bareland", "exposed soil", "none", "with"],
+        "must_put_in_forbidden": ["sand", "soil", "rock", "vegetation", "farmland", "construction", "rocky", "barren", "sandy"]
+      }
+    },
+    {
+      "concept_key": "parking lot",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "parking lot",
+      "aliases": ["parking lot", "parking lots", "car park"],
+      "mandatory_high_risk_terms": ["vehicle", "vehicles", "car", "cars", "building", "road", "lane"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "regular marked parking area", "dense parked vehicle cluster", "open paved parking surface"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["parking lot", "parking lots", "car park", "none", "with"],
+        "must_put_in_forbidden": ["vehicle", "vehicles", "car", "cars", "building", "road", "lane", "marked", "parked", "paved"]
+      }
+    },
+    {
+      "concept_key": "playground",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "playground",
+      "aliases": ["playground", "playgrounds", "sports ground"],
+      "mandatory_high_risk_terms": ["court", "track", "field", "school", "building", "parking lot"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "rectangular sports field", "track associated ground", "multi zone play area"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["playground", "playgrounds", "sports ground", "none", "with"],
+        "must_put_in_forbidden": ["court", "track", "field", "school", "building", "parking lot", "rectangular", "sports", "multi", "zone"]
+      }
+    },
+    {
+      "concept_key": "river",
+      "concept_type": "stuff",
+      "canonical_name": "river",
+      "aliases": ["river", "rivers", "river channel"],
+      "mandatory_high_risk_terms": ["lake", "canal", "bridge", "bank", "stream"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "elongated winding channel", "broad meandering river", "narrow straight segment"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["river", "rivers", "river channel", "none", "with", "in", "on", "of", "and", "the", "a", "an"],
+        "must_put_in_forbidden": ["lake", "canal", "bridge", "bank", "stream", "elongated", "winding", "meandering"],
+        "forbidden_list_policy_reminder": "Never include canonical_name, aliases, none, or stop words in forbidden_auto_infer_tokens, even if they appear in visual_form_options or mandatory_high_risk_terms. Rephrase visual_form_options so the canonical/alias words are not standalone forbidden tokens (e.g. prefer channel/meandering tokens over repeating river)."
+      }
+    },
+    {
+      "concept_key": "lake",
+      "concept_type": "stuff",
+      "canonical_name": "lake",
+      "aliases": ["lake", "lakes", "lake area"],
+      "mandatory_high_risk_terms": ["river", "reservoir", "pond", "shore", "island"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "closed water body", "irregular shoreline lake", "large open lake region"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["lake", "lakes", "lake area", "none", "with", "in", "on", "of", "and", "the", "a", "an"],
+        "must_put_in_forbidden": ["river", "reservoir", "pond", "shore", "island", "closed", "shoreline", "open"],
+        "forbidden_list_policy_reminder": "Never include canonical_name, aliases, none, or stop words in forbidden_auto_infer_tokens, even if they appear in visual_form_options or mandatory_high_risk_terms. Rephrase visual_form_options so the canonical/alias words are not standalone forbidden tokens (e.g. prefer water/shoreline tokens over repeating lake)."
+      }
+    },
+    {
+      "concept_key": "harbor",
+      "concept_type": "thing_or_facility",
+      "canonical_name": "harbor",
+      "aliases": ["harbor", "harbors", "port area"],
+      "mandatory_high_risk_terms": ["ship", "ships", "dock", "pier", "breakwater", "water"],
+      "generation_hint": {
+        "recommended_visual_form_options": ["none", "dense ship harbor basin", "dock aligned waterfront", "enclosed breakwater port region"],
+        "avoid_visual_form_words": ["simple", "basic", "generic"],
+        "do_not_put_in_forbidden": ["harbor", "harbors", "port area", "none", "with"],
+        "must_put_in_forbidden": ["ship", "ships", "dock", "pier", "breakwater", "water", "basin", "waterfront", "enclosed"]
+      }
+    }
+  ]
+}

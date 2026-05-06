@@ -1,0 +1,27 @@
+{
+  "dataset": "RRSIS-D",
+  "enhancement_version": "v1.0_explicitization_only",
+  "total_input_units": 17402,
+  "limit": 20,
+  "processed_scope_units": 20,
+  "total_expressions": 20,
+  "success_count": 1,
+  "unchanged_count": 19,
+  "failed_count": 0,
+  "failed_postcheck_count": 0,
+  "failed_api_error_count": 0,
+  "skipped_count": 0,
+  "status_breakdown": {
+    "unchanged": 19,
+    "success": 1
+  },
+  "checkpoint_count": 1,
+  "duplicate_input_expr_id_count": 0,
+  "failed_cases_count": 0,
+  "jsonl_result_file": "intermediate/enhancement_results.jsonl",
+  "output_file": "enhanced_training.json",
+  "adapter_file": "data_adapter.py",
+  "failed_cases_file": "failed_cases.jsonl",
+  "log_file": "enhancement_log.jsonl",
+  "build_invalid": false
+}

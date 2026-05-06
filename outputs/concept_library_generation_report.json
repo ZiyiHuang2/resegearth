@@ -1,0 +1,42 @@
+{
+  "seed_concept_count": 2,
+  "concepts_present_in_draft_count": 2,
+  "generated_concept_count_this_run": 2,
+  "failed_concept_count_this_run": 0,
+  "output_json_path": "/home/wangchengjun/huangziyi/reseg/resegearth+source/configs/concept_semantic_library_draft.json",
+  "failed_concepts_path": "/home/wangchengjun/huangziyi/reseg/resegearth+source/outputs/failed_concepts.jsonl",
+  "audit_report_path": "/home/wangchengjun/huangziyi/reseg/resegearth+source/outputs/concept_library_draft_audit_report.json",
+  "audit_subprocess": {
+    "returncode": 0,
+    "stdout_chars": 2223,
+    "stderr_tail": "",
+    "stdout_tail": "longest_match_risks\": [],\n    \"visual_form_options_schema_errors\": [],\n    \"visual_form_option_emit_policy_missing\": [],\n    \"visual_form_option_leakage_risk\": [],\n    \"visual_form_options_leakage_risk\": [],\n    \"safe_rewrite_conflicts\": [],\n    \"default_none_option_missing\": [],\n    \"missing_definition_in_retrieval\": [],\n    \"missing_remote_sensing_understanding_in_retrieval\": [],\n    \"missing_segmentation_relevance_in_retrieval\": [],\n    \"missing_slot_guidance_in_retrieval\": [],\n    \"missing_anti_specialization_rules_in_retrieval\": [],\n    \"missing_safe_rewrite_guidance_in_retrieval\": [],\n    \"missing_visual_form_options_in_retrieval\": [],\n    \"missing_forbidden_auto_infer_in_retrieval\": [],\n    \"retrieval_field_completeness_errors\": [],\n    \"concept_tag_leakage_check_missing\": []\n  }\n}\n",
+    "self_check_error": ""
+  },
+  "concept_semantic_self_check_passed": false,
+  "self_check_blocked_reason": null,
+  "self_check_failed_cases": [
+    {
+      "case_name": "self_check_exception",
+      "raw": "",
+      "enhanced": "",
+      "expected": "pass",
+      "actual": "failed_postcheck",
+      "failure_reason": ""
+    }
+  ],
+  "audit_core": {
+    "concept_count": 2,
+    "alias_conflict_count": 0,
+    "missing_field_count": 0,
+    "high_risk_term_not_forbidden_count": 0,
+    "overly_strong_statement_count": 0,
+    "visual_form_options_schema_error_count": 0,
+    "visual_form_option_emit_policy_missing_count": 0,
+    "default_none_option_missing_count": 0,
+    "safe_rewrite_conflict_count": 0
+  },
+  "high_risk_term_not_forbidden_details_path": null,
+  "high_risk_term_not_forbidden_preview": [],
+  "human_review_concepts": []
+}

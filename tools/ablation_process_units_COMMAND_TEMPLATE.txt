@@ -1,0 +1,87 @@
+# =============================================================================
+# A/B：不传 public 边界表 vs concept_public_semantic_library_v0
+# 仅命令模板 — 请勿将本文件当作可执行脚本直接 source（需自行复制并填变量后执行）。
+# 约束：不修改 v0 schema；不调用 API 的说明见各命令注释（实际跑 pipeline 会调 API）。
+# =============================================================================
+
+# 通用变量（请按环境修改）
+# REPO_ROOT=/path/to/resegearth+source
+# PY=python3
+# PIPELINE="${REPO_ROOT}/tools/rrsisd_explicitization_pipeline.py"
+# MODEL="your-model-id"
+# INPUT_JSONL="${REPO_ROOT}/path/to/your_units.jsonl"   # 规范 units jsonl（与 process_units_jsonl 一致）
+
+# -----------------------------------------------------------------------------
+# Smoke：limit 20
+# 输出：outputs/ablation_baseline_20 / outputs/ablation_public_v0_20
+# （路径相对于 REPO_ROOT 或你指定的工作目录；与 --output-dir 一致即可）
+# -----------------------------------------------------------------------------
+
+# A. baseline：不传 --concept-public-semantic-library
+# ${PY} "${PIPELINE}" process_units_jsonl \
+#   --input-jsonl "${INPUT_JSONL}" \
+#   --output-dir "${REPO_ROOT}/outputs/ablation_baseline_20" \
+#   --model "${MODEL}" \
+#   --limit 20 \
+#   --overwrite
+
+# B. public_v0：传入 v0 公共边界表
+# ${PY} "${PIPELINE}" process_units_jsonl \
+#   --input-jsonl "${INPUT_JSONL}" \
+#   --output-dir "${REPO_ROOT}/outputs/ablation_public_v0_20" \
+#   --model "${MODEL}" \
+#   --limit 20 \
+#   --concept-public-semantic-library "${REPO_ROOT}/configs/concept_public_semantic_library_v0.json" \
+#   --overwrite
+
+# 只读分析（无 API）— smoke 结果对比
+# ${PY} "${REPO_ROOT}/tools/analyze_enhancement_ablation_jsonl.py" \
+#   --baseline-jsonl "${REPO_ROOT}/outputs/ablation_baseline_20/intermediate/enhancement_results.jsonl" \
+#   --variant-jsonl "${REPO_ROOT}/outputs/ablation_public_v0_20/intermediate/enhancement_results.jsonl" \
+#   --variant-label public_v0
+
+# -----------------------------------------------------------------------------
+# 正式中试：300 或 500 条 hard-negative
+# 筛选建议（需自备只读筛选脚本或手工 jsonl，本仓库本任务不生成该 jsonl）：
+#   - 优先类别关键词：water, river, lake, vegetation, farmland, grassland,
+#     forest, bare land, bridge, road, vehicle, airport 等（按 category_name / raw 匹配）。
+#   - 短 raw 优先：len(raw) 升序或设定上限（如 <= 40 字符），短句更易错误特化。
+#   - 固定随机种子便于复现。
+# 产出例如：configs/ablation_hardneg_300.jsonl（仅示例路径）
+# -----------------------------------------------------------------------------
+
+# HN_JSONL="${REPO_ROOT}/configs/ablation_hardneg_300.jsonl"
+# LIMIT=300
+
+# A. baseline 中试
+# ${PY} "${PIPELINE}" process_units_jsonl \
+#   --input-jsonl "${HN_JSONL}" \
+#   --output-dir "${REPO_ROOT}/outputs/ablation_baseline_${LIMIT}" \
+#   --model "${MODEL}" \
+#   --limit "${LIMIT}" \
+#   --overwrite
+
+# B. public_v0 中试
+# ${PY} "${PIPELINE}" process_units_jsonl \
+#   --input-jsonl "${HN_JSONL}" \
+#   --output-dir "${REPO_ROOT}/outputs/ablation_public_v0_${LIMIT}" \
+#   --model "${MODEL}" \
+#   --limit "${LIMIT}" \
+#   --concept-public-semantic-library "${REPO_ROOT}/configs/concept_public_semantic_library_v0.json" \
+#   --overwrite
+
+# 只读分析 — 中试 + 可选分割评估 JSON（若已完成分割评测）
+# ${PY} "${REPO_ROOT}/tools/analyze_enhancement_ablation_jsonl.py" \
+#   --baseline-jsonl "${REPO_ROOT}/outputs/ablation_baseline_${LIMIT}/intermediate/enhancement_results.jsonl" \
+#   --variant-jsonl "${REPO_ROOT}/outputs/ablation_public_v0_${LIMIT}/intermediate/enhancement_results.jsonl" \
+#   --variant-label public_v0 \
+#   --baseline-seg-metrics-json "${REPO_ROOT}/path/to/baseline_rrsisd_test_metrics.json" \
+#   --variant-seg-metrics-json "${REPO_ROOT}/path/to/public_v0_rrsisd_test_metrics.json"
+
+# =============================================================================
+# 结论判读（摘要）
+# - public_v0 failed_postcheck 较 baseline 上升 → 优先怀疑 boundary 负向列举触发反效果。
+# - public_v0 unchanged 上升 → 约束偏保守，模型少改。
+# - subtype 新增次数下降而 gIoU/cIoU 不变 → 主要改善语言层，未必改善分割。
+# - hard-negative 子集上 gIoU/cIoU 提升 → v0 表值得作为论文 ablation 保留。
+# =============================================================================

@@ -1,0 +1,28 @@
+{
+  "join_key_checked": "ann_id -> annotations.id",
+  "num_refs": 17402,
+  "num_annotations": 17402,
+  "num_units": 17402,
+  "matched_ref_count": 17402,
+  "unmatched_ref_count": 0,
+  "unmatched_ann_count": 0,
+  "matched_ratio": 1.0,
+  "image_id_mismatch_count": 0,
+  "first_10_unmatched_ref_ann_ids": [],
+  "first_10_unmatched_annotation_ids": [],
+  "first_10_image_id_mismatches": [],
+  "split_ref_counts": {
+    "train": 12181,
+    "test": 3481,
+    "val": 1740
+  },
+  "split_unit_counts": {
+    "train": 12181,
+    "test": 3481,
+    "val": 1740
+  },
+  "sentences_len_distribution": {
+    "1": 17402
+  },
+  "join_safe_to_use": true
+}
