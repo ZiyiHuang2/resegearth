@@ -1,6 +1,7 @@
 from typing import List, Optional, Tuple, Union
 from addict import Dict
 from dataclasses import dataclass
+import math
 import torch.nn.functional as F
 import fvcore.nn.weight_init as weight_init
 import numpy as np
@@ -27,6 +28,7 @@ from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
+from ..prior import RemoteCLIPPriorBranch
 
 @dataclass
 class CausalOutputWithMask(CausalLMOutputWithPast):
@@ -39,6 +41,7 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    diag_metrics: Optional[dict] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -67,6 +70,51 @@ class AttentionLoss(nn.Module):
         elif self.reduction == 'mean':
             loss = loss / model_attention_logits.numel()  # Overall mean loss
         return loss
+
+
+class SEGVisualPriorGate(nn.Module):
+    def __init__(self, dim: int, alpha: float = 0.05, beta: float = 0.05, use_weak_residual: bool = True):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.use_weak_residual = bool(use_weak_residual)
+        self.seg_delta = nn.Sequential(
+            nn.Linear(dim * 3, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+        self.seg_gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.Sigmoid(),
+        )
+        self.visual_delta = nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+        )
+
+    def forward(self, visual_tokens, seg_token, patch_prior, global_conf, use_confidence_scaling=True):
+        # visual_tokens: [B, N, D], seg_token: [B, D], patch_prior: [B, N], global_conf: [B, 1]
+        w = torch.softmax(patch_prior, dim=-1)
+        context = torch.sum(visual_tokens * w.unsqueeze(-1), dim=1)
+        seg_feat = torch.cat([seg_token, context, seg_token * context], dim=-1)
+        seg_gate = self.seg_gate(torch.cat([seg_token, context], dim=-1))
+        delta_seg = self.seg_delta(seg_feat)
+
+        conf = global_conf if use_confidence_scaling else torch.ones_like(global_conf)
+        scale = self.beta if self.use_weak_residual else 1.0
+        effective_seg_delta = scale * conf * seg_gate * delta_seg
+        seg_token_enhanced = seg_token + effective_seg_delta
+
+        seg_expand = seg_token_enhanced.unsqueeze(1).expand(-1, visual_tokens.shape[1], -1)
+        delta_v = self.visual_delta(torch.cat([visual_tokens, seg_expand], dim=-1))
+        patch_gate = w.unsqueeze(-1)
+        v_scale = self.alpha if self.use_weak_residual else 1.0
+        effective_visual_delta = v_scale * conf.unsqueeze(-1) * patch_gate * delta_v
+        visual_tokens_enhanced = visual_tokens + effective_visual_delta
+        return visual_tokens_enhanced, seg_token_enhanced, seg_gate, patch_gate.squeeze(-1), effective_seg_delta, effective_visual_delta
 
 class SegEarthR2Model(MiphaPhiModel):
 
@@ -136,6 +184,152 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print('Mask Decoder has been trained, init directly')
             self.initial_mask_module()
         self.post_init()
+        self.runtime_tokenizer = None
+        self.remoteclip_prior = None
+        self.seg_visual_prior_gate = None
+        self.use_remoteclip_prior = False
+        self.prior_clip_input_size = 224
+        self.use_confidence_scaling = True
+        self.debug_seg_input_alignment = False
+        self._seg_align_debug_printed = False
+
+    def initialize_remoteclip_prior(self, model_args):
+        self.use_remoteclip_prior = bool(getattr(model_args, "use_remoteclip_prior", False))
+        self.use_confidence_scaling = bool(getattr(model_args, "use_confidence_scaling", True))
+        self.prior_clip_input_size = int(getattr(model_args, "remoteclip_clip_input_size", 224))
+        self.debug_seg_input_alignment = bool(getattr(model_args, "debug_seg_input_alignment", False))
+        if not self.use_remoteclip_prior:
+            return
+
+        weight_path = getattr(model_args, "remoteclip_weight_path", None)
+        if not weight_path:
+            raise ValueError("use_remoteclip_prior=True but remoteclip_weight_path is empty")
+        self.remoteclip_prior = RemoteCLIPPriorBranch(
+            model_name=getattr(model_args, "remoteclip_model_name", "ViT-B-32"),
+            weight_path=weight_path,
+            device=getattr(model_args, "remoteclip_device", "cuda"),
+            unfreeze_last_layer=bool(getattr(model_args, "unfreeze_remoteclip_last_layer", False)),
+            temperature=float(getattr(model_args, "remoteclip_temperature", 1.0)),
+        )
+        self.seg_visual_prior_gate = SEGVisualPriorGate(
+            dim=self.config.hidden_size,
+            alpha=float(getattr(model_args, "prior_alpha", 0.05)),
+            beta=float(getattr(model_args, "prior_beta", 0.05)),
+            use_weak_residual=bool(getattr(model_args, "use_weak_residual", True)),
+        ).to(self.device)
+
+    def _decode_refer_text(self, refer_ids):
+        if self.runtime_tokenizer is None:
+            return ""
+        rid = refer_ids.detach().cpu().tolist() if torch.is_tensor(refer_ids) else list(refer_ids)
+        while len(rid) > 0 and rid[-1] == self.SEG_id.item():
+            rid = rid[:-1]
+        return self.runtime_tokenizer.decode(rid, skip_special_tokens=True).strip()
+
+    def _build_prior_and_apply_gate(self, inputs_embeds, SEG_token_embedding_indices, image_features_indices, token_refer_id, seg_info):
+        if self.remoteclip_prior is None or self.seg_visual_prior_gate is None:
+            return inputs_embeds, {}
+        bs, seq_len, hidden_dim = inputs_embeds.shape
+        diag = {
+            "remoteclip/global_conf_mean": 0.0,
+            "remoteclip/global_conf_min": 0.0,
+            "remoteclip/global_conf_max": 0.0,
+            "remoteclip/global_conf_median": 0.0,
+            "remoteclip/normalized_entropy_mean": 0.0,
+            "remoteclip/patch_prior_peak_mean": 0.0,
+            "gate/seg_gate_mean": 0.0,
+            "gate/seg_gate_min": 0.0,
+            "gate/seg_gate_max": 0.0,
+            "gate/seg_gate_median": 0.0,
+            "gate/visual_gate_mean": 0.0,
+            "gate/visual_gate_min": 0.0,
+            "gate/visual_gate_max": 0.0,
+            "gate/visual_gate_median": 0.0,
+            "gate/effective_seg_delta_norm": 0.0,
+            "gate/effective_visual_delta_norm": 0.0,
+            "gate/original_seg_norm": 0.0,
+            "gate/original_visual_norm": 0.0,
+            "gate/seg_delta_ratio": 0.0,
+            "gate/visual_delta_ratio": 0.0,
+        }
+        conf_vals, ent_vals, peak_vals = [], [], []
+        seg_gate_vals, vis_gate_vals = [], []
+        seg_delta_norms, vis_delta_norms = [], []
+        seg_norms, vis_norms = [], []
+
+        for b in range(bs):
+            seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
+            img_pos = torch.where(image_features_indices[b].bool())[0]
+            if seg_pos.numel() == 0 or img_pos.numel() == 0:
+                continue
+            if self.debug_seg_input_alignment and (not self._seg_align_debug_printed):
+                print(f"[SEG_ALIGN] sample={b} seq_len={seq_len} seg_positions={seg_pos.tolist()} image_token_count={int(img_pos.numel())}")
+            seg_idx = seg_pos[0].item()
+            if not (0 <= seg_idx < seq_len):
+                raise RuntimeError(f"[SEG_ALIGN] invalid seg idx={seg_idx} for seq_len={seq_len}")
+
+            if seg_info is None or len(seg_info) <= b or "image_path" not in seg_info[b]:
+                continue
+            image_path = seg_info[b]["image_path"]
+            text = self._decode_refer_text(token_refer_id[b]) if token_refer_id is not None else ""
+            if not text:
+                continue
+
+            prior_out = self.remoteclip_prior.forward_image_expression(image_path=image_path, expression=text, clip_input_size=self.prior_clip_input_size)
+            sim = prior_out.patch_text_sim[0] if prior_out.patch_text_sim.ndim == 2 else prior_out.patch_text_sim
+            patch_prior = sim
+            n_img = int(img_pos.numel())
+            if patch_prior.numel() != n_img:
+                g = int(round(math.sqrt(patch_prior.numel())))
+                vg = int(round(math.sqrt(n_img)))
+                if g * g != patch_prior.numel() or vg * vg != n_img:
+                    continue
+                patch_prior = F.interpolate(patch_prior.view(1, 1, g, g), size=(vg, vg), mode="bilinear", align_corners=False).view(-1)
+
+            visual_tokens = inputs_embeds[b:b+1, img_pos, :]
+            seg_token = inputs_embeds[b:b+1, seg_idx, :]
+            conf = prior_out.global_conf.view(1, 1).to(inputs_embeds.device, dtype=inputs_embeds.dtype)
+            patch_prior = patch_prior.view(1, -1).to(inputs_embeds.device, dtype=inputs_embeds.dtype)
+
+            v_new, s_new, seg_gate, vis_gate, eff_seg_delta, eff_vis_delta = self.seg_visual_prior_gate(
+                visual_tokens, seg_token, patch_prior, conf, use_confidence_scaling=self.use_confidence_scaling
+            )
+            inputs_embeds[b, img_pos, :] = v_new[0]
+            inputs_embeds[b, seg_idx, :] = s_new[0]
+
+            conf_vals.append(float(conf.item()))
+            ent_vals.append(float(prior_out.normalized_entropy.item()))
+            peak_vals.append(float(prior_out.peak_prob.item()))
+            seg_gate_vals.append(float(seg_gate.mean().item()))
+            vis_gate_vals.append(float(vis_gate.mean().item()))
+            seg_delta_norms.append(float(eff_seg_delta.norm().item()))
+            vis_delta_norms.append(float(eff_vis_delta.norm().item()))
+            seg_norms.append(float(seg_token.norm().item()))
+            vis_norms.append(float(visual_tokens.norm().item()))
+
+        self._seg_align_debug_printed = True
+        if len(conf_vals) == 0:
+            return inputs_embeds, diag
+
+        def _set_stats(prefix, vals):
+            vals_t = torch.tensor(vals, dtype=torch.float32)
+            diag[f"{prefix}_mean"] = float(vals_t.mean().item())
+            diag[f"{prefix}_min"] = float(vals_t.min().item())
+            diag[f"{prefix}_max"] = float(vals_t.max().item())
+            diag[f"{prefix}_median"] = float(vals_t.median().item())
+
+        _set_stats("remoteclip/global_conf", conf_vals)
+        diag["remoteclip/normalized_entropy_mean"] = float(torch.tensor(ent_vals).mean().item())
+        diag["remoteclip/patch_prior_peak_mean"] = float(torch.tensor(peak_vals).mean().item())
+        _set_stats("gate/seg_gate", seg_gate_vals)
+        _set_stats("gate/visual_gate", vis_gate_vals)
+        diag["gate/effective_seg_delta_norm"] = float(torch.tensor(seg_delta_norms).mean().item())
+        diag["gate/effective_visual_delta_norm"] = float(torch.tensor(vis_delta_norms).mean().item())
+        diag["gate/original_seg_norm"] = float(torch.tensor(seg_norms).mean().item())
+        diag["gate/original_visual_norm"] = float(torch.tensor(vis_norms).mean().item())
+        diag["gate/seg_delta_ratio"] = diag["gate/effective_seg_delta_norm"] / max(diag["gate/original_seg_norm"], 1e-8)
+        diag["gate/visual_delta_ratio"] = diag["gate/effective_visual_delta_norm"] / max(diag["gate/original_visual_norm"], 1e-8)
+        return inputs_embeds, diag
 
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
@@ -631,6 +825,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        diag_metrics = {}
 
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
@@ -642,6 +837,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
                 token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
+            if self.use_remoteclip_prior and inputs_embeds is not None and image_features_indices is not None:
+                inputs_embeds, diag_metrics = self._build_prior_and_apply_gate(
+                    inputs_embeds=inputs_embeds,
+                    SEG_token_embedding_indices=SEG_token_embedding_indices,
+                    image_features_indices=image_features_indices,
+                    token_refer_id=token_refer_id,
+                    seg_info=seg_info,
+                )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -656,7 +859,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        # gradient_checkpointing=True 时 HF Phi 常返回 attentions=None 或各层为 None，不能假定可 sum。
+        _raw_attn = outputs.attentions
+        if _raw_attn is None:
+            attentions = []
+        else:
+            attentions = [
+                attention_item.sum(dim=1)
+                for attention_item in _raw_attn
+                if attention_item is not None
+            ]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
@@ -765,6 +977,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            diag_metrics=diag_metrics,
         )
     
     def eval_seg(

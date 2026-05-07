@@ -264,6 +264,8 @@ class LLaVATrainer(Trainer):
                         loss_dict[name] = loss_value
                 self.update_history_loss_dict(outputs)
                 self.log(loss_dict)
+            if isinstance(outputs, dict) and 'diag_metrics' in outputs and isinstance(outputs['diag_metrics'], dict):
+                self.log(outputs['diag_metrics'])
 
         return (loss, outputs) if return_outputs else loss
 

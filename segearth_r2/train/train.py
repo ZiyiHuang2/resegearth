@@ -40,6 +40,18 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    use_remoteclip_prior: bool = field(default=False)
+    remoteclip_weight_path: Optional[str] = field(default=None)
+    remoteclip_model_name: str = field(default="ViT-B-32")
+    remoteclip_device: str = field(default="cuda")
+    remoteclip_temperature: float = field(default=1.0)
+    remoteclip_clip_input_size: int = field(default=224)
+    unfreeze_remoteclip_last_layer: bool = field(default=False)
+    use_confidence_scaling: bool = field(default=True)
+    use_weak_residual: bool = field(default=True)
+    prior_beta: float = field(default=0.05)
+    prior_alpha: float = field(default=0.05)
+    debug_seg_input_alignment: bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -258,6 +270,7 @@ def train():
         cache_dir=training_args.cache_dir,
         **bnb_model_from_pretrained_args
                 )
+    model.runtime_tokenizer = None
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
@@ -292,6 +305,7 @@ def train():
             tokenizer=tokenizer,
             model=model,
         )
+    model.runtime_tokenizer = tokenizer
     if model_args.version in conversation_lib.conv_templates:
         conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
     else:
@@ -357,6 +371,8 @@ def train():
                 p.requires_grad = True
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    if hasattr(model, "initialize_remoteclip_prior"):
+        model.initialize_remoteclip_prior(model_args)
     
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
     
