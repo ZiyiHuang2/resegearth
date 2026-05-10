@@ -9,6 +9,29 @@ from torch.nn import functional as F
 from .position_encoding import PositionEmbeddingSine
 
 
+def merge_memory_mask_and_spatial_bias(
+    memory_mask: Optional[Tensor],
+    spatial_bias: Optional[Tensor],
+    dtype: torch.dtype,
+    device: torch.device,
+):
+    """Merge bool memory_mask (True = forbid) with float spatial_bias for nn.MultiheadAttention."""
+    if spatial_bias is None:
+        return memory_mask
+
+    spatial_bias = spatial_bias.to(dtype=dtype, device=device)
+
+    if memory_mask is None:
+        return spatial_bias
+
+    if memory_mask.dtype == torch.bool:
+        float_mask = torch.zeros_like(memory_mask, dtype=dtype, device=device)
+        float_mask = float_mask.masked_fill(memory_mask, -10000.0)
+        return float_mask + spatial_bias
+
+    return memory_mask.to(dtype=dtype, device=device) + spatial_bias
+
+
 class SelfAttentionLayer(nn.Module):
 
     def __init__(self, d_model, nhead, dropout=0.0,
@@ -94,10 +117,14 @@ class CrossAttentionLayer(nn.Module):
                      memory_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
+                     query_pos: Optional[Tensor] = None,
+                     spatial_bias: Optional[Tensor] = None):
+        merged_mask = merge_memory_mask_and_spatial_bias(
+            memory_mask, spatial_bias, dtype=tgt.dtype, device=tgt.device
+        )
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                    key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
+                                   value=memory, attn_mask=merged_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
@@ -108,11 +135,15 @@ class CrossAttentionLayer(nn.Module):
                     memory_mask: Optional[Tensor] = None,
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+                    query_pos: Optional[Tensor] = None,
+                    spatial_bias: Optional[Tensor] = None):
         tgt2 = self.norm(tgt)
+        merged_mask = merge_memory_mask_and_spatial_bias(
+            memory_mask, spatial_bias, dtype=tgt2.dtype, device=tgt2.device
+        )
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
                                    key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
+                                   value=memory, attn_mask=merged_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
 
@@ -122,12 +153,15 @@ class CrossAttentionLayer(nn.Module):
                 memory_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                spatial_bias: Optional[Tensor] = None):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, memory_mask,
-                                    memory_key_padding_mask, pos, query_pos)
+                                    memory_key_padding_mask, pos, query_pos,
+                                    spatial_bias=spatial_bias)
         return self.forward_post(tgt, memory, memory_mask,
-                                 memory_key_padding_mask, pos, query_pos)
+                                 memory_key_padding_mask, pos, query_pos,
+                                 spatial_bias=spatial_bias)
 
 
 class FFNLayer(nn.Module):
@@ -478,12 +512,74 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+    def build_spim_bias(
+        self,
+        spim_prior,
+        target_size,
+        num_heads,
+        num_queries,
+        dtype,
+        device,
+        alpha,
+    ):
+        """
+        SPIM-v1: resize 2D prior to decoder key resolution and broadcast to heads / queries.
+        spim_prior: [B, 1, H0, W0]
+        return: [B * num_heads, Q, Ht * Wt]
+        """
+        assert spim_prior.dim() == 4, f"spim_prior must be 4D, got {spim_prior.dim()}"
+        assert spim_prior.shape[1] == 1, f"spim_prior channel must be 1, got {spim_prior.shape[1]}"
+        assert len(target_size) == 2, f"target_size must be length-2, got {target_size}"
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+        prior = F.interpolate(
+            spim_prior.float(),
+            size=tuple(target_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        hw = int(target_size[0]) * int(target_size[1])
+        prior = prior.flatten(2)
+        prior = prior * alpha
+        prior = prior.repeat(1, num_queries, 1)
+        prior = prior.unsqueeze(1).repeat(1, num_heads, 1, 1).flatten(0, 1)
+        assert prior.shape[-1] == hw, (
+            f"SPIM bias last dim {prior.shape[-1]} != HW {hw} for target_size {target_size}"
+        )
+        return prior.to(dtype=dtype, device=device)
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
+    def forward(
+        self,
+        x,
+        mask_features,
+        mask=None,
+        seg_query=None,
+        SEG_embedding=None,
+        spim_prior=None,
+        spim_alpha=0.0,
+        spim_debug=False,
+    ):
+        return self.forward_woconcat(
+            x,
+            mask_features,
+            mask,
+            seg_query,
+            SEG_embedding,
+            spim_prior=spim_prior,
+            spim_alpha=spim_alpha,
+            spim_debug=spim_debug,
+        )
 
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward_woconcat(
+        self,
+        x,
+        mask_features,
+        mask=None,
+        seg_query=None,
+        SEG_embedding=None,
+        spim_prior=None,
+        spim_alpha=0.0,
+        spim_debug=False,
+    ):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -549,12 +645,36 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
+            if spim_prior is not None and spim_alpha > 0:
+                spatial_bias = self.build_spim_bias(
+                    spim_prior=spim_prior,
+                    target_size=size_list[level_index],
+                    num_heads=self.num_heads,
+                    num_queries=output.shape[0],
+                    dtype=output.dtype,
+                    device=output.device,
+                    alpha=spim_alpha,
+                )
+                if spim_debug:
+                    pf = spim_prior.float()
+                    print(
+                        "[SPIM debug]",
+                        f"spim_prior.shape={tuple(spim_prior.shape)}",
+                        f"min={float(pf.min()):.6f} max={float(pf.max()):.6f}",
+                        f"mean={float(pf.mean()):.6f} std={float(pf.std()):.6f}",
+                        f"target_size={tuple(size_list[level_index])}",
+                        f"spatial_bias.shape={tuple(spatial_bias.shape)}",
+                    )
+            else:
+                spatial_bias = None
+
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index], query_pos=query_embed,
+                spatial_bias=spatial_bias,
             )
 
             output = self.transformer_self_attention_layers[i](

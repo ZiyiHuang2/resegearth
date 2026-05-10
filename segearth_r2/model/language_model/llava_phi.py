@@ -3,6 +3,7 @@ from addict import Dict
 from dataclasses import dataclass
 import torch.nn.functional as F
 import fvcore.nn.weight_init as weight_init
+import math
 import numpy as np
 import pickle
 import torch
@@ -601,7 +602,111 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
-           
+
+    def build_seg_spatial_prior(
+        self,
+        raw_attentions,
+        SEG_token_embedding_indices,
+        image_features_indices,
+        layer_idx=-1,
+        detach=True,
+        normalize=True,
+        seg_agg="mean",
+        near_zero_eps=1e-8,
+    ):
+        """
+        SPIM-v1: extract [SEG] -> image-token attention from one MLLM layer and form a 2D prior.
+
+        raw_attentions: outputs.attentions, tuple of [B, heads, T, T]
+        SEG_token_embedding_indices: [B, T]
+        image_features_indices: [B, T]
+        Returns:
+            prior_2d: [B, 1, H0, W0]
+            prior_stats: dict with min/max/mean/std/grid_size/near_zero_count
+        """
+        layer = raw_attentions[layer_idx]
+        if layer.dim() != 4:
+            raise ValueError(
+                f"SPIM expects attentions[layer_idx] to be 4D [B, heads, T, T], got dim={layer.dim()} shape={tuple(layer.shape)}"
+            )
+        attn = layer.float().mean(dim=1)
+        B = attn.shape[0]
+        spim_debug = getattr(self.config, "spim_debug", False)
+        rows = []
+        near_zero_count = 0
+        grid_ref = None
+
+        for b in range(B):
+            seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
+            img_pos = torch.where(image_features_indices[b].bool())[0]
+            n_img = int(img_pos.numel())
+            if n_img == 0:
+                raise ValueError(f"SPIM: batch index {b} has zero image tokens in image_features_indices.")
+            grid = int(round(math.sqrt(n_img)))
+            assert grid * grid == n_img, (
+                f"SPIM: batch {b}: N_img={n_img} is not a perfect square (sqrt grid={grid})."
+            )
+            if grid_ref is None:
+                grid_ref = grid
+            elif grid != grid_ref:
+                raise ValueError(
+                    f"SPIM: inconsistent image token grid in batch (got {grid_ref} vs {grid} at index {b})."
+                )
+
+            degraded = False
+            if seg_pos.numel() == 0:
+                degraded = True
+                if spim_debug:
+                    print(
+                        "SPIM: [SEG]->image attention is near-zero. Check causal ordering.",
+                        f"(batch {b}: no SEG positions)",
+                    )
+            else:
+                cur = attn[b, seg_pos][:, img_pos]
+                if seg_agg == "mean":
+                    vec = cur.mean(dim=0)
+                elif seg_agg == "first":
+                    vec = cur[0]
+                elif seg_agg == "max":
+                    vec = cur.max(dim=0).values
+                else:
+                    raise ValueError(f"seg_agg must be one of mean, first, max; got {seg_agg!r}")
+
+                if vec.abs().max() < near_zero_eps:
+                    degraded = True
+                    if spim_debug:
+                        print(
+                            "SPIM: [SEG]->image attention is near-zero. Check causal ordering.",
+                            f"(batch {b})",
+                        )
+
+            if degraded:
+                near_zero_count += 1
+                row = torch.zeros(1, grid, grid, device=attn.device, dtype=torch.float32)
+            else:
+                row = vec.view(1, grid, grid)
+                if normalize:
+                    row = row.unsqueeze(1)
+                    row = row - row.mean(dim=(-2, -1), keepdim=True)
+                    row = row / (row.std(dim=(-2, -1), keepdim=True) + 1e-6)
+                    row = row.squeeze(1)
+
+            rows.append(row)
+
+        prior_2d = torch.stack(rows, dim=0)
+        pf = prior_2d.float()
+        prior_stats = {
+            "spim_prior_min": float(pf.min().item()),
+            "spim_prior_max": float(pf.max().item()),
+            "spim_prior_mean": float(pf.mean().item()),
+            "spim_prior_std": float(pf.std().item()),
+            "spim_prior_grid_size": int(grid_ref),
+            "spim_near_zero_count": int(near_zero_count),
+        }
+        if detach:
+            prior_2d = prior_2d.detach()
+        return prior_2d, prior_stats
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -621,7 +726,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             global_step=None,
             mask_num=None,
             dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
-        
+        # SPIM-v1: spatial prior is only wired in this training forward path.
+        # eval_seg still uses output_attentions=False; SPIM at inference is deferred to a later phase.
+
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -632,6 +739,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        image_features_indices = None
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
             # for generative mode only the 1th stage need
@@ -657,18 +765,76 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+
+        spim_prior = None
+        if getattr(self.config, "use_spim", False):
+            if image_features_indices is None:
+                raise ValueError(
+                    "use_spim=True requires multimodal inputs with image_features_indices "
+                    "(SEG_token_embedding_indices must mark [SEG] and prepare_inputs must run)."
+                )
+            spim_prior, prior_stats = self.build_seg_spatial_prior(
+                outputs.attentions,
+                SEG_token_embedding_indices,
+                image_features_indices,
+                layer_idx=getattr(self.config, "spim_layer_idx", -1),
+                detach=getattr(self.config, "spim_detach", True),
+                normalize=getattr(self.config, "spim_norm", True),
+                seg_agg=getattr(self.config, "spim_seg_agg", "mean"),
+                near_zero_eps=getattr(self.config, "spim_near_zero_eps", 1e-8),
+            )
+            if getattr(self.config, "spim_debug", False):
+                print(
+                    "[SPIM debug] prior",
+                    f"shape={tuple(spim_prior.shape)}",
+                    f"min={prior_stats['spim_prior_min']:.6f} max={prior_stats['spim_prior_max']:.6f}",
+                    f"mean={prior_stats['spim_prior_mean']:.6f} std={prior_stats['spim_prior_std']:.6f}",
+                    f"near_zero_count={prior_stats['spim_near_zero_count']}",
+                )
+
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
         mask_num = torch.tensor(mask_num, device=mask_features.device)
+
+        if spim_prior is not None:
+            if spim_prior.shape[0] != mask_num.shape[0]:
+                raise ValueError(
+                    f"SPIM prior batch {spim_prior.shape[0]} must equal len(mask_num) {mask_num.shape[0]} "
+                    "before repeat_interleave."
+                )
+            spim_prior = torch.repeat_interleave(spim_prior, repeats=mask_num, dim=0)
+
         mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
         multi_scale_features = [
             torch.repeat_interleave(feat, repeats=mask_num, dim=0)
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        if spim_prior is not None:
+            if spim_prior.shape[0] != mask_features.shape[0]:
+                raise ValueError(
+                    f"SPIM prior batch {spim_prior.shape[0]} != mask_features batch {mask_features.shape[0]} "
+                    "after repeat_interleave."
+                )
+            if spim_prior.shape[0] != SEG_embedding.shape[0]:
+                raise ValueError(
+                    f"SPIM prior batch {spim_prior.shape[0]} != SEG_embedding batch {SEG_embedding.shape[0]}."
+                )
+
+        use_spim = getattr(self.config, "use_spim", False)
+        spim_alpha_cfg = getattr(self.config, "spim_alpha", 0.0) if use_spim else 0.0
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            None,
+            SEG_embedding,
+            spim_prior=spim_prior if use_spim else None,
+            spim_alpha=spim_alpha_cfg,
+            spim_debug=getattr(self.config, "spim_debug", False) if use_spim else False,
+        )
 
         # 开始计算loss
         loss = None
