@@ -24,6 +24,11 @@ def merge_memory_mask_and_spatial_bias(
     if memory_mask is None:
         return spatial_bias
 
+    if spatial_bias.shape != memory_mask.shape:
+        raise ValueError(
+            f"SPIM spatial_bias shape {tuple(spatial_bias.shape)} != memory_mask shape {tuple(memory_mask.shape)}"
+        )
+
     if memory_mask.dtype == torch.bool:
         float_mask = torch.zeros_like(memory_mask, dtype=dtype, device=device)
         float_mask = float_mask.masked_fill(memory_mask, -10000.0)

@@ -98,6 +98,16 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
 
+    # SPIM-v1 (training forward only); defaults preserve baseline behavior.
+    use_spim: bool = field(default=False)
+    spim_alpha: float = field(default=0.0)
+    spim_layer_idx: int = field(default=-1)
+    spim_detach: bool = field(default=True)
+    spim_norm: bool = field(default=True)
+    spim_seg_agg: str = field(default="mean")
+    spim_near_zero_eps: float = field(default=1e-8)
+    spim_debug: bool = field(default=False)
+
 
 def maybe_zero_3(param, ignore_status=False, name=None):
     from deepspeed import zero
@@ -268,6 +278,28 @@ def train():
         model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.config.use_cache = False
+
+    model.config.use_spim = training_args.use_spim
+    model.config.spim_alpha = training_args.spim_alpha
+    model.config.spim_layer_idx = training_args.spim_layer_idx
+    model.config.spim_detach = training_args.spim_detach
+    model.config.spim_norm = training_args.spim_norm
+    model.config.spim_seg_agg = training_args.spim_seg_agg
+    model.config.spim_near_zero_eps = training_args.spim_near_zero_eps
+    model.config.spim_debug = training_args.spim_debug
+
+    if training_args.local_rank in (-1, 0):
+        print(
+            "[SPIM config]",
+            f"use_spim={model.config.use_spim}",
+            f"alpha={model.config.spim_alpha}",
+            f"layer_idx={model.config.spim_layer_idx}",
+            f"detach={model.config.spim_detach}",
+            f"norm={model.config.spim_norm}",
+            f"seg_agg={model.config.spim_seg_agg}",
+            f"near_zero_eps={model.config.spim_near_zero_eps}",
+            f"debug={model.config.spim_debug}",
+        )
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
