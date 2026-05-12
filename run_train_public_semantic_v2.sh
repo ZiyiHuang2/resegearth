@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# RRSIS-D train — public_semantic_v2 (adds --concept_public_semantic_library only).
-# All other CLI hyperparameters match run_train_baseline_raw.sh (same MASTER_PORT default).
+# Same as run_train_baseline_raw.sh plus:
+#   --concept_public_semantic_library  -> v2 JSON (train-time grounding priors in user prompt only).
 set -euo pipefail
 
 export NCCL_P2P_DISABLE=1
@@ -55,7 +55,7 @@ MSTVA_LOSS_WEIGHT="0.01"
 MSTVA_SCALE_WEIGHTS="0.5,0.3,0.2"
 
 GPU_SLOT="${GPU_SLOT:-localhost:0}"
-MASTER_PORT="${MASTER_PORT:-29531}"
+MASTER_PORT="${MASTER_PORT:-29532}"
 
 mkdir -p "${OUTPUT_DIR}"
 

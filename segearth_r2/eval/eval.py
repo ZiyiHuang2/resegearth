@@ -52,6 +52,10 @@ class DataArguments:
     split: str = "val"             # for rrsisd: train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
+    # Text-FiLM：仅影响 eval 前向，不写回 checkpoint；由 model.config.use_text_film 决定是否启用分支
+    text_film_eval_mode: str = "normal"  # normal | bypass | force_alpha
+    text_film_force_alpha: float = 1.0
+
 
 def init_distributed_mode(args):
     # 多卡机器上直接 `python eval.py` 时不会设置 RANK/WORLD_SIZE；若仅按 device_count>1
@@ -151,6 +155,9 @@ def evaluation():
         mask_config=data_args.mask_config,
         device="cuda",
     )
+
+    model.config.text_film_eval_mode = getattr(data_args, "text_film_eval_mode", "normal")
+    model.config.text_film_force_alpha = float(getattr(data_args, "text_film_force_alpha", 1.0))
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
     model.to(dtype=torch.float32, device=device)

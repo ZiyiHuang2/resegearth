@@ -28,6 +28,63 @@ from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criteri
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
 
+
+class TextFiLMBranch(nn.Module):
+    """Channel-wise FiLM on spatial features: out = x + alpha * ((x * (1+gamma) + beta) - x)."""
+
+    def __init__(self, text_dim: int, visual_channels: int, init_std: float, branch_alpha_init: float):
+        super().__init__()
+        self.visual_channels = int(visual_channels)
+        self.gamma_linear = nn.Linear(int(text_dim), self.visual_channels)
+        self.beta_linear = nn.Linear(int(text_dim), self.visual_channels)
+        nn.init.normal_(self.gamma_linear.weight, mean=0.0, std=float(init_std))
+        nn.init.zeros_(self.gamma_linear.bias)
+        nn.init.zeros_(self.beta_linear.weight)
+        nn.init.zeros_(self.beta_linear.bias)
+        self.branch_alpha = nn.Parameter(torch.tensor(float(branch_alpha_init), dtype=torch.float32))
+        self._last_gamma_norm: Optional[torch.Tensor] = None
+        self._last_beta_norm: Optional[torch.Tensor] = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        text_cond: torch.Tensor,
+        eval_mode: str = "normal",
+        force_alpha: float = 1.0,
+    ) -> torch.Tensor:
+        self._last_gamma_norm = None
+        self._last_beta_norm = None
+        if text_cond is None:
+            return x
+        w_dtype = self.gamma_linear.weight.dtype
+        tc = text_cond.to(dtype=w_dtype, device=self.gamma_linear.weight.device)
+        gamma_vec = self.gamma_linear(tc)
+        beta_vec = self.beta_linear(tc)
+        B, C, _, _ = x.shape
+        if C != self.visual_channels or gamma_vec.shape[0] != B or gamma_vec.shape[1] != C:
+            return x
+        gamma = gamma_vec.to(dtype=x.dtype, device=x.device).view(B, C, 1, 1)
+        beta = beta_vec.to(dtype=x.dtype, device=x.device).view(B, C, 1, 1)
+        film = x * (1.0 + gamma) + beta
+        delta = film - x
+        if eval_mode not in ("normal", "bypass", "force_alpha"):
+            eval_mode = "normal"
+        if eval_mode == "bypass":
+            out = x
+        elif eval_mode == "force_alpha":
+            fa = torch.tensor(float(force_alpha), device=x.device, dtype=x.dtype)
+            out = x + fa * delta
+        else:
+            alpha_eff = self.branch_alpha.to(device=x.device, dtype=x.dtype)
+            out = x + alpha_eff * delta
+        with torch.no_grad():
+            gnm = gamma_vec.detach().float().norm(p=2, dim=-1).mean()
+            bnm = beta_vec.detach().float().norm(p=2, dim=-1).mean()
+            self._last_gamma_norm = gnm
+            self._last_beta_norm = bnm
+        return out
+
+
 @dataclass
 class CausalOutputWithMask(CausalLMOutputWithPast):
     loss: Optional[torch.FloatTensor] = None
@@ -45,6 +102,9 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     mstva_alpha3: Optional[torch.FloatTensor] = None
     mstva_alpha4: Optional[torch.FloatTensor] = None
     mstva_alpha5: Optional[torch.FloatTensor] = None
+    text_film_gamma_norm: Optional[torch.FloatTensor] = None
+    text_film_beta_norm: Optional[torch.FloatTensor] = None
+    text_film_branch_alpha: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -83,6 +143,8 @@ class SegEarthR2Model(MiphaPhiModel):
 
         if hasattr(config, "mm_vision_tower"):
             use_mstva = getattr(config, "use_mstva", False)
+            if getattr(config, "use_text_film", False) and use_mstva:
+                use_mstva = False
             mstva_align_dim = getattr(config, "mstva_align_dim", 256)
             mstva_scale_weights = getattr(config, "mstva_scale_weights", "0.5,0.3,0.2")
             if isinstance(mstva_scale_weights, str):
@@ -126,7 +188,15 @@ class SegEarthR2Model(MiphaPhiModel):
         vision_tower_mask = model_args.vision_tower_mask if hasattr(model_args, 'vision_tower_mask') else model_args.mm_vision_tower_mask
 
         self.config.mm_vision_tower = vision_tower
-        self.config.use_mstva = getattr(model_args, "use_mstva", False)
+        self.config.use_text_film = getattr(model_args, "use_text_film", False)
+        self.config.text_film_init_std = float(getattr(model_args, "text_film_init_std", 1e-3))
+        self.config.text_film_branch_alpha = float(getattr(model_args, "text_film_branch_alpha", 1.0))
+        self.config.text_film_visual_dim = int(getattr(model_args, "text_film_visual_dim", 512))
+        use_mstva_arg = getattr(model_args, "use_mstva", False)
+        if self.config.use_text_film and use_mstva_arg:
+            print("[initialize_vision_modules] use_text_film=True: forcing use_mstva=False for Swin.")
+            use_mstva_arg = False
+        self.config.use_mstva = use_mstva_arg
         self.config.mstva_align_dim = getattr(model_args, "mstva_align_dim", 256)
         self.config.mstva_scale_weights = getattr(model_args, "mstva_scale_weights", "0.5,0.3,0.2")
         mstva_scale_weights = self.config.mstva_scale_weights
@@ -140,7 +210,7 @@ class SegEarthR2Model(MiphaPhiModel):
             vision_tower_mask = build_swin_b(
                 vision_tower_mask,
                 text_cond_dim=self.config.hidden_size,
-                use_mstva=self.config.use_mstva,
+                use_mstva=use_mstva_arg,
                 mstva_align_dim=self.config.mstva_align_dim,
                 mstva_scale_weights=mstva_scale_weights,
             )
@@ -149,7 +219,7 @@ class SegEarthR2Model(MiphaPhiModel):
             vision_tower_mask = build_swin_l(
                 vision_tower_mask,
                 text_cond_dim=self.config.hidden_size,
-                use_mstva=self.config.use_mstva,
+                use_mstva=use_mstva_arg,
                 mstva_align_dim=self.config.mstva_align_dim,
                 mstva_scale_weights=mstva_scale_weights,
             )
@@ -165,12 +235,25 @@ class SegEarthR2Model(MiphaPhiModel):
 
 class SegEarthR2(MiphaPhiForCausalLM):
     def __init__(self, config, model_args=None, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None):
+        if getattr(config, "use_text_film", False) and getattr(config, "use_mstva", False):
+            print(
+                "[SegEarthR2] use_text_film=True and use_mstva=True: forcing config.use_mstva=False "
+                "(mutually exclusive; MSTVA module not built in Swin when use_text_film is on)."
+            )
+            config.use_mstva = False
         super(SegEarthR2, self).__init__(config)
 
         self.model = SegEarthR2Model(config, mask_decoder_cfg)
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
+
+        self.text_film_branch = None
+        self._warn_text_film_no_res4_key = False
+        self._warn_text_film_no_text_cond = False
+        self._warn_text_film_ch_mismatch = False
+        if getattr(self.config, "use_text_film", False):
+            self._init_text_film_branch_from_config()
 
         self.lm_head = nn.Linear(config.hidden_size, 51200, bias=False)
 
@@ -181,6 +264,23 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print('Mask Decoder has been trained, init directly')
             self.initial_mask_module()
         self.post_init()
+
+    def _init_text_film_branch_from_config(self):
+        if getattr(self, "text_film_branch", None) is not None:
+            return
+        td = int(self.config.hidden_size)
+        vd = int(getattr(self.config, "text_film_visual_dim", 512))
+        init_std = float(getattr(self.config, "text_film_init_std", 1e-3))
+        ba = float(getattr(self.config, "text_film_branch_alpha", 1.0))
+        self.text_film_branch = TextFiLMBranch(
+            text_dim=td, visual_channels=vd, init_std=init_std, branch_alpha_init=ba
+        )
+
+    def ensure_text_film_branch(self):
+        """If config enables TextFiLM but branch was not built at __init__ (e.g. config set after from_pretrained), create it."""
+        if not getattr(self.config, "use_text_film", False):
+            return
+        self._init_text_film_branch_from_config()
 
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
@@ -230,6 +330,35 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print(diff_predictor_msg)
             print(diff_pixel_msg)
 
+    def _apply_text_film_res4(self, features_dict, text_cond):
+        if not getattr(self.config, "use_text_film", False):
+            return
+        br = getattr(self, "text_film_branch", None)
+        if br is None:
+            return
+        if "res4" not in features_dict:
+            if not self._warn_text_film_no_res4_key:
+                self._warn_text_film_no_res4_key = True
+                print("[WARNING][TextFiLM] features_dict has no 'res4' key; bypass TextFiLM.")
+            return
+        if text_cond is None:
+            if not self._warn_text_film_no_text_cond:
+                self._warn_text_film_no_text_cond = True
+                print("[WARNING][TextFiLM] text_cond is None; bypass TextFiLM on res4.")
+            return
+        x = features_dict["res4"]
+        if x.shape[1] != br.visual_channels:
+            if not self._warn_text_film_ch_mismatch:
+                self._warn_text_film_ch_mismatch = True
+                print(
+                    f"[WARNING][TextFiLM] res4 channels {x.shape[1]} != text_film_visual_dim {br.visual_channels}; "
+                    "bypass TextFiLM."
+                )
+            return
+        eval_mode = str(getattr(self.config, "text_film_eval_mode", "normal"))
+        force_alpha = float(getattr(self.config, "text_film_force_alpha", 1.0))
+        features_dict["res4"] = br(x, text_cond, eval_mode=eval_mode, force_alpha=force_alpha)
+
     def get_vision_tower_feature(
         self,
         images,
@@ -260,9 +389,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
         features_dict = {
             'res2': features[0], # bs, 128, 256, 256
             'res3': features[1], # bs, 256, 128, 128
-            'res4': features[2], # bs, 512, 64, 64
+            'res4': features[2], # bs, 512, 64, 64  (Swin-B default; verify with x.shape[1])
             'res5': features[3], # bs, 1024, 32, 32
         }
+        self._apply_text_film_res4(features_dict, text_cond)
         if return_midstage_gate or return_mstva_maps:
             return features_dict, gate_info
         return features_dict
@@ -1232,6 +1362,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if use_mstva_loss and mstva_loss_weight > 0:
             loss = loss + mstva_loss_weight * loss_mstva_align
 
+        text_film_gamma_norm = torch.zeros_like(zero_base)
+        text_film_beta_norm = torch.zeros_like(zero_base)
+        text_film_branch_alpha_log = torch.zeros_like(zero_base)
+        if getattr(self.config, "use_text_film", False) and getattr(self, "text_film_branch", None) is not None:
+            br = self.text_film_branch
+            if getattr(br, "_last_gamma_norm", None) is not None:
+                text_film_gamma_norm = br._last_gamma_norm.detach().float().to(zero_base.device)
+            if getattr(br, "_last_beta_norm", None) is not None:
+                text_film_beta_norm = br._last_beta_norm.detach().float().to(zero_base.device)
+            text_film_branch_alpha_log = br.branch_alpha.detach().float().to(zero_base.device)
+
         return CausalOutputWithMask(
             loss=loss,
             logits=logits,
@@ -1248,6 +1389,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mstva_alpha3=mstva_alpha3.detach(),
             mstva_alpha4=mstva_alpha4.detach(),
             mstva_alpha5=mstva_alpha5.detach(),
+            text_film_gamma_norm=text_film_gamma_norm.detach(),
+            text_film_beta_norm=text_film_beta_norm.detach(),
+            text_film_branch_alpha=text_film_branch_alpha_log.detach(),
         )
     
     def eval_seg(

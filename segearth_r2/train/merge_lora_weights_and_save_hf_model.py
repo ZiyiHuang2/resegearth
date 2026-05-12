@@ -43,6 +43,13 @@ def parse_args(args):
     parser.add_argument("--mstva_loss_weight", default=0.0, type=float)
     parser.add_argument("--mstva_scale_weights", default="0.5,0.3,0.2", type=str)
 
+    parser.add_argument("--use_text_film", default=False, type=bool)
+    parser.add_argument("--text_film_init_std", default=1e-3, type=float)
+    parser.add_argument("--text_film_branch_alpha", default=1.0, type=float)
+    parser.add_argument("--text_film_visual_dim", default=512, type=int)
+    parser.add_argument("--text_film_eval_mode", default="normal", type=str)
+    parser.add_argument("--text_film_force_alpha", default=1.0, type=float)
+
     parser.add_argument("--lora_enable", default=True, type=bool)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
@@ -97,7 +104,17 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
-    model.config.use_mstva = bool(getattr(model_args, "use_mstva", False))
+    use_tf = bool(getattr(model_args, "use_text_film", False))
+    use_mv = bool(getattr(model_args, "use_mstva", False))
+    if use_tf and use_mv:
+        use_mv = False
+    model.config.use_text_film = use_tf
+    model.config.text_film_init_std = float(getattr(model_args, "text_film_init_std", 1e-3))
+    model.config.text_film_branch_alpha = float(getattr(model_args, "text_film_branch_alpha", 1.0))
+    model.config.text_film_visual_dim = int(getattr(model_args, "text_film_visual_dim", 512))
+    model.config.text_film_eval_mode = str(getattr(model_args, "text_film_eval_mode", "normal"))
+    model.config.text_film_force_alpha = float(getattr(model_args, "text_film_force_alpha", 1.0))
+    model.config.use_mstva = use_mv
     model.config.mstva_align_dim = int(getattr(model_args, "mstva_align_dim", 256))
     model.config.use_mstva_loss = bool(getattr(model_args, "use_mstva_loss", False))
     model.config.mstva_loss_weight = float(getattr(model_args, "mstva_loss_weight", 0.0))
@@ -115,6 +132,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.get_model().initialize_vision_modules(model_args)
+    model.ensure_text_film_branch()
 
     vision_tower = model.get_model().get_vision_tower_mask()
 
@@ -122,6 +140,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration", "mstva",
+        "text_film_branch",
     ]
 
     if model_args.lora_enable:

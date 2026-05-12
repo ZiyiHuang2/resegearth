@@ -215,7 +215,7 @@ class LLaVATrainer(Trainer):
         if not hasattr(self,'history_loss_dict'):
             self.history_loss_dict = {}
         for name, value in outputs.items():
-            if 'loss' in name and name != 'loss':
+            if ('loss' in name and name != 'loss') or name.startswith('text_film_'):
                 if name not in self.history_loss_dict:
                     self.history_loss_dict[name] = value.item()
                 else:
@@ -257,7 +257,7 @@ class LLaVATrainer(Trainer):
             if isinstance(outputs, dict) and 'loss_dice' in outputs:
                 loss_dict = {}
                 for name,value in outputs.items():
-                    if 'loss' in name and name != 'loss':
+                    if ('loss' in name and name != 'loss') or name.startswith('text_film_'):
                         loss_value = value.item()
                         if loss_value == 0 and hasattr(self,'history_loss_dict'):
                             loss_value = self.history_loss_dict[name]

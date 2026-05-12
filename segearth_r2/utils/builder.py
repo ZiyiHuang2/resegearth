@@ -53,12 +53,26 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.config.mstva_loss_weight = 0.0
     if not hasattr(model.config, "mstva_scale_weights"):
         model.config.mstva_scale_weights = "0.5,0.3,0.2"
-    
+    if not hasattr(model.config, "use_text_film"):
+        model.config.use_text_film = False
+    if not hasattr(model.config, "text_film_init_std"):
+        model.config.text_film_init_std = 1e-3
+    if not hasattr(model.config, "text_film_branch_alpha"):
+        model.config.text_film_branch_alpha = 1.0
+    if not hasattr(model.config, "text_film_visual_dim"):
+        model.config.text_film_visual_dim = 512
+    if not hasattr(model.config, "text_film_eval_mode"):
+        model.config.text_film_eval_mode = "normal"
+    if not hasattr(model.config, "text_film_force_alpha"):
+        model.config.text_film_force_alpha = 1.0
+
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor
 
     model.resize_token_embeddings(len(tokenizer))
+    if hasattr(model, "ensure_text_film_branch"):
+        model.ensure_text_film_branch()
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

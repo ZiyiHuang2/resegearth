@@ -96,6 +96,11 @@ def preprocess_image(image_path, pad_value = 128.0, short_edge_length = 1024, ma
 
 class RS_Base_Dataset(Dataset):
     
+    def preprocess_referring_seg_only(self, REFER_token="[SEG]"):
+        """Token ids for [SEG] only (used when raw expression is already in the user prompt as plain text)."""
+        tokenized = self.tokenizer.encode(REFER_token, add_special_tokens=False)
+        return torch.tensor(tokenized, dtype=torch.long)
+
     def tokenizer_special_tokens(self, prompt, tokenizer, image_token_index=IMAGE_TOKEN_INDEX, refer_token_index=REFER_TOKEN_INDEX, return_tensors=None):
         input_ids = []
         special_token_map = {'<image>': image_token_index, '<refer>':refer_token_index}
@@ -313,8 +318,10 @@ class RRSISDDataset(RS_Base_Dataset):
 
         prefix_inst = build_rrsisd_supervised_human_value(instruction, self.concept_public_semantic_library)
 
-        # Same refer strategy as legacy SegEarth-R2 RRSIS-D: instruction tokens + [SEG] at <refer> slot.
-        token_refer_id = self.preprocess_referring_instruction(instruction)
+        if self.concept_public_semantic_library:
+            token_refer_id = self.preprocess_referring_seg_only()
+        else:
+            token_refer_id = self.preprocess_referring_instruction(instruction)
 
         sources = [[
             {'from': 'human', 'value': prefix_inst},

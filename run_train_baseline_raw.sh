@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# RRSIS-D train — baseline_raw (no --concept_public_semantic_library).
-# All other CLI hyperparameters match run_train_public_semantic_v2.sh (same MASTER_PORT default).
+# Baseline RRSIS-D training: no --concept_public_semantic_library.
+# Hyper-parameters aligned with run_train_public_semantic_v2.sh except OUTPUT_DIR.
 set -euo pipefail
 
 export NCCL_P2P_DISABLE=1

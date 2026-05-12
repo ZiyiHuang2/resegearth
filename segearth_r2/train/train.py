@@ -6,6 +6,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
@@ -38,6 +39,10 @@ class ModelArguments:
     use_mstva_loss: bool = field(default=False)
     mstva_loss_weight: float = field(default=0.0)
     mstva_scale_weights: str = field(default="0.5,0.3,0.2")
+    use_text_film: bool = field(default=False)
+    text_film_init_std: float = field(default=1e-3)
+    text_film_branch_alpha: float = field(default=1.0)
+    text_film_visual_dim: int = field(default=512)
     train_midstage_recalibration: bool = field(default=True)
     stage3_norm_only: bool = field(default=False)
 
@@ -163,6 +168,29 @@ def _set_module_requires_grad(module, requires_grad=True):
         return
     for param in module.parameters():
         param.requires_grad = requires_grad
+
+
+def _enable_text_film_trainable(model):
+    raw_model = model.base_model.model if hasattr(model, "base_model") and hasattr(model.base_model, "model") else model
+    if not hasattr(raw_model, "text_film_branch") or raw_model.text_film_branch is None:
+        return
+    for p in raw_model.text_film_branch.parameters():
+        p.requires_grad = True
+
+
+def log_text_film_trainable_params(model, local_rank_value=0):
+    if not _is_rank0(local_rank_value):
+        return
+    raw_model = model.base_model.model if hasattr(model, "base_model") and hasattr(model.base_model, "model") else model
+    if not hasattr(raw_model, "text_film_branch") or raw_model.text_film_branch is None:
+        print("[TextFiLM trainable] text_film_branch not present")
+        return
+    names = [n for n, p in raw_model.named_parameters() if "text_film_branch" in n and p.requires_grad]
+    print(f"[TextFiLM trainable] trainable param count={len(names)}")
+    for n in names[:16]:
+        print(f"  {n}")
+    if len(names) > 16:
+        print(f"  ... ({len(names) - 16} more)")
 
 
 def _enable_midstage_text_recalibration_trainable(model, norm_only=False):
@@ -346,11 +374,17 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if model_args.use_text_film and model_args.use_mstva:
+        print("[train] use_text_film=True: forcing use_mstva=False (mutually exclusive).")
+        model_args.use_mstva = False
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
         training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
@@ -377,6 +411,13 @@ def train():
     model.config.use_mstva_loss = model_args.use_mstva_loss
     model.config.mstva_loss_weight = model_args.mstva_loss_weight
     model.config.mstva_scale_weights = model_args.mstva_scale_weights
+    model.config.use_text_film = model_args.use_text_film
+    model.config.text_film_init_std = model_args.text_film_init_std
+    model.config.text_film_branch_alpha = model_args.text_film_branch_alpha
+    model.config.text_film_visual_dim = model_args.text_film_visual_dim
+    model.config.text_film_eval_mode = "normal"
+    model.config.text_film_force_alpha = 1.0
+    model.ensure_text_film_branch()
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -420,6 +461,11 @@ def train():
         vision_tower_mask = model.model.get_vision_tower_mask()
         vision_tower.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
         vision_tower_mask.to(dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32), device=training_args.device)
+        if getattr(model, "text_film_branch", None) is not None:
+            model.text_film_branch.to(
+                dtype=torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32),
+                device=training_args.device,
+            )
         data_args.is_multimodal = True
 
         model.config.image_aspect_ratio = data_args.image_aspect_ratio
@@ -435,6 +481,8 @@ def train():
                 model,
                 norm_only=model_args.stage3_norm_only
             )
+        if model_args.use_text_film:
+            _enable_text_film_trainable(model)
 
         model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
         if training_args.freeze_mm_mlp_adapter:
@@ -445,6 +493,7 @@ def train():
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "mid_stage_text_recalibration", "mstva",
+        "text_film_branch",
     ]
 
     if model_args.train_swin_backbone:
@@ -480,9 +529,13 @@ def train():
                 model,
                 norm_only=model_args.stage3_norm_only
             )
+        if model_args.use_text_film:
+            _enable_text_film_trainable(model)
 
     if model_args.train_midstage_recalibration:
         log_midstage_recalibration_trainable_params(model, local_rank_value=training_args.local_rank)
+    if model_args.use_text_film:
+        log_text_film_trainable_params(model, local_rank_value=training_args.local_rank)
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
     

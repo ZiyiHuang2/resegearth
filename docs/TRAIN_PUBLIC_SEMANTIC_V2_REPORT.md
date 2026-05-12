@@ -29,7 +29,7 @@
 - **顺序（v2 开启时）**：`expression 文本` →（若有命中）**grounding JSON 附录** → `<|vision_bos|> <image> ...` → `<refer>` → assistant。满足「**在可见 raw 文本之后、image token 之前**」。
 - **无匹配**：`format_grounding_appendix` 返回空，不插入 prior 块。
 - **多概念 / 父子抑制**：沿用 `resegearth+source` 中 `retrieve_concept_semantics` 的 v2 逻辑。
-- **`token_refer_id`（与 baseline 一致）**：**baseline 与 v2 均使用** `RRSISDDataset.preprocess_referring_instruction(instruction)`，即 **instruction 的 tokenizer ids + `[SEG]`**，与原始 SegEarth-R2 RRSIS-D 行为一致；**仅 v2 在 human 串中额外注入** grounding JSON（可能同时出现明文 instruction，与 refer 嵌入中的词面重复属于有意保留的原始 refer 策略）。
+- **`<refer>` 与重复表达**：v2 模式下 **`token_refer_id` 仅含 `[SEG]`**，避免 raw 同时在明文与 refer 嵌入中双写；refer 仍占位在 **image 之后**（与旧版 `<refer>` 相对 `<image>` 的位置关系一致），**未**把 prior 放到 `[SEG]` 之后。
 - **eval / inference / merge**：**未修改**。
 
 ---
@@ -47,11 +47,8 @@
 ## 任务五：Smoke 脚本
 
 - 路径：`resegearth+tgi/tools/debug_train_prompt_with_v2.py`  
-- 依赖：`conda` 环境 **`reseg`**（含 `torch` / `transformers`）。  
-- 功能：baseline / v2 **human** 对比、unified diff、`matched_concepts`、**`token_refer_id` 两侧一致性**、`labels != -100` 计数、`visual_evidence` 子词 span 是否全 `-100`、`[SEG]` 是否在 assistant 可训练区、私域字段名扫描。  
-- **已执行（不训练）**：  
-  `conda run -n reseg python tools/debug_train_prompt_with_v2.py --help`  
-  `conda run -n reseg python tools/debug_train_prompt_with_v2.py --model-name-or-path ... --library-v2 ...`（4 条样例：water / river / lake / multi）。
+- 依赖：需 **已安装 `transformers` + `torch` 的环境**（本沙箱系统 Python 无该依赖，未在此执行 tokenizer 级断言）。  
+- 功能：对比 baseline / v2 human 串、diff、`matched_concepts`、`-100` 统计、`visual_evidence` 子串 span 检查、私域字段子串扫描。
 
 ---
 
@@ -79,45 +76,7 @@
 | 10 | 未调 API | 是 |
 | 11 | 未跑 `process_units_jsonl` | 是 |
 | 12 | 未生成 `enhanced_training.json` | 是 |
-| 13 | 两脚本除 v2 与 output 外一致 | 是（`MASTER_PORT` 默认已对齐；见下方 `diff -u`） |
-
----
-
-## 最终验收声明（必须项）
-
-1. **v2 prior 仅在 user/human 输入侧**：通过 `build_rrsisd_supervised_human_value` 写入 human 串；**不**写入 gpt/assistant 的 `value`。  
-2. **v2 prior 不在 assistant target**：gpt 轮仍为 `\n[SEG]`；prior JSON **仅**出现在 human。  
-3. **v2 prior 对应 token 的 `labels` 均为 -100**：`preprocess_llama2` 将 human 侧 mask；`visual_evidence` 子词 span 经验证 **全为 -100**（见 smoke 输出）。  
-4. **baseline 与 v2 的 `token_refer_id` 策略一致**：均为 **`encode(instruction) + [SEG]`**；**已移除**此前 v2 专用的「仅 `[SEG]`」分支。  
-5. **两训练脚本除 v2 参数与 `OUTPUT_DIR` 外 CLI 一致**：`diff -u` 仅体现 **文件头注释、`CONCEPT_LIB`、`OUTPUT_DIR`、多一行 `--concept_public_semantic_library`**（见下）。
-
-### `diff -u run_train_baseline_raw.sh run_train_public_semantic_v2.sh`
-
-```diff
---- run_train_baseline_raw.sh
-+++ run_train_public_semantic_v2.sh
-@@ -1,6 +1,6 @@
--# RRSIS-D train — baseline_raw (no --concept_public_semantic_library).
--# All other CLI hyperparameters match run_train_public_semantic_v2.sh (same MASTER_PORT default).
-+# RRSIS-D train — public_semantic_v2 (adds --concept_public_semantic_library only).
-+# All other CLI hyperparameters match run_train_baseline_raw.sh (same MASTER_PORT default).
-@@ -9,6 +9,8 @@
-+CONCEPT_LIB="/home/wangchengjun/huangziyi/reseg/resegearth+source/configs/concept_public_semantic_library_v2.json"
-@@ -16,7 +18,7 @@
--OUTPUT_DIR=".../rrsisd_baseline_raw"
-+OUTPUT_DIR=".../rrsisd_public_semantic_v2"
-@@ -64,6 +66,7 @@
-+  --concept_public_semantic_library "${CONCEPT_LIB}" \
-```
-
-（完整路径以仓库内脚本为准。）
-
-### Smoke 摘要（`conda run -n reseg`）
-
-- **`token_refer_id`**：各 case 下 baseline 与 v2 **张量相等**（例如 `find water` 为长度 3 的 id 序列）。  
-- **`labels != -100` 计数**：baseline 与 v2 **均为 5**（仅 assistant / `[SEG]` 等可训练片段；v2 仅增加 human 长度，不增加可训练 token 数）。  
-- **`[SEG]`**：仍在 **gpt 轮**可训练 decode 片段中。  
-- **未**：训练、API、`process_units_jsonl`、`enhanced_training.json`、inference/eval 修改。
+| 13 | 两脚本除 v2 与 output 外一致 | 是（刻意对齐同一变量块） |
 
 ---
 
