@@ -7,6 +7,7 @@ import fvcore.nn.weight_init as weight_init
 import numpy as np
 import pickle
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.nn import CrossEntropyLoss
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
@@ -192,18 +193,39 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.use_confidence_scaling = True
         self.debug_seg_input_alignment = False
         self._seg_align_debug_printed = False
+        self._eval_remoteclip_prior_once_logged = False
+        self.remoteclip_fail_fast = True
 
     def initialize_remoteclip_prior(self, model_args):
         self.use_remoteclip_prior = bool(getattr(model_args, "use_remoteclip_prior", False))
+        eff_fail_fast = bool(getattr(model_args, "remoteclip_fail_fast", True))
         self.use_confidence_scaling = bool(getattr(model_args, "use_confidence_scaling", True))
         self.prior_clip_input_size = int(getattr(model_args, "remoteclip_clip_input_size", 224))
         self.debug_seg_input_alignment = bool(getattr(model_args, "debug_seg_input_alignment", False))
         if not self.use_remoteclip_prior:
+            self.remoteclip_fail_fast = eff_fail_fast
             return
+        if not eff_fail_fast:
+            raise RuntimeError(
+                "remoteclip_fail_fast=False is forbidden when use_remoteclip_prior=True "
+                "(controlled blast: no silent skips; do not pass --remoteclip_fail_fast false)."
+            )
+        self.remoteclip_fail_fast = True
 
         weight_path = getattr(model_args, "remoteclip_weight_path", None)
         if not weight_path:
             raise ValueError("use_remoteclip_prior=True but remoteclip_weight_path is empty")
+        if self.seg_visual_prior_gate is not None:
+            if self.remoteclip_prior is None:
+                self.remoteclip_prior = RemoteCLIPPriorBranch(
+                    model_name=getattr(model_args, "remoteclip_model_name", "ViT-B-32"),
+                    weight_path=weight_path,
+                    device=getattr(model_args, "remoteclip_device", "cuda"),
+                    unfreeze_last_layer=bool(getattr(model_args, "unfreeze_remoteclip_last_layer", False)),
+                    temperature=float(getattr(model_args, "remoteclip_temperature", 1.0)),
+                )
+            return
+
         self.remoteclip_prior = RemoteCLIPPriorBranch(
             model_name=getattr(model_args, "remoteclip_model_name", "ViT-B-32"),
             weight_path=weight_path,
@@ -226,10 +248,32 @@ class SegEarthR2(MiphaPhiForCausalLM):
             rid = rid[:-1]
         return self.runtime_tokenizer.decode(rid, skip_special_tokens=True).strip()
 
+    def _apply_remoteclip_prior_to_inputs_embeds(
+        self,
+        inputs_embeds,
+        SEG_token_embedding_indices,
+        image_features_indices,
+        token_refer_id,
+        seg_info,
+    ):
+        """Shared entry: train `forward` 与 `eval_seg` 复用，避免两套注入逻辑。"""
+        if not self.use_remoteclip_prior or inputs_embeds is None or image_features_indices is None:
+            return inputs_embeds, {}
+        if self.remoteclip_prior is None or self.seg_visual_prior_gate is None:
+            return inputs_embeds, {}
+        return self._build_prior_and_apply_gate(
+            inputs_embeds,
+            SEG_token_embedding_indices,
+            image_features_indices,
+            token_refer_id,
+            seg_info,
+        )
+
     def _build_prior_and_apply_gate(self, inputs_embeds, SEG_token_embedding_indices, image_features_indices, token_refer_id, seg_info):
         if self.remoteclip_prior is None or self.seg_visual_prior_gate is None:
             return inputs_embeds, {}
         bs, seq_len, hidden_dim = inputs_embeds.shape
+        ff = bool(self.remoteclip_fail_fast)
         diag = {
             "remoteclip/global_conf_mean": 0.0,
             "remoteclip/global_conf_min": 0.0,
@@ -251,43 +295,100 @@ class SegEarthR2(MiphaPhiForCausalLM):
             "gate/original_visual_norm": 0.0,
             "gate/seg_delta_ratio": 0.0,
             "gate/visual_delta_ratio": 0.0,
+            "remoteclip/skip_count": 0.0,
+            "remoteclip/skip_missing_image_path": 0.0,
+            "remoteclip/skip_empty_expression": 0.0,
+            "remoteclip/skip_seg_not_found": 0.0,
+            "remoteclip/skip_multi_seg": 0.0,
+            "remoteclip/skip_grid_mismatch": 0.0,
         }
         conf_vals, ent_vals, peak_vals = [], [], []
         seg_gate_vals, vis_gate_vals = [], []
         seg_delta_norms, vis_delta_norms = [], []
         seg_norms, vis_norms = [], []
 
+        def _bump_skip(key: str) -> None:
+            diag[key] += 1.0
+            diag["remoteclip/skip_count"] += 1.0
+
         for b in range(bs):
             seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
             img_pos = torch.where(image_features_indices[b].bool())[0]
-            if seg_pos.numel() == 0 or img_pos.numel() == 0:
+
+            if seg_pos.numel() == 0:
+                if ff:
+                    raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: no [SEG] input position in SEG_token_embedding_indices")
+                _bump_skip("remoteclip/skip_seg_not_found")
                 continue
+            if seg_pos.numel() > 1:
+                if ff:
+                    raise RuntimeError(
+                        f"[RemoteCLIP fail-fast] batch={b}: multiple [SEG] tokens unsupported (count={int(seg_pos.numel())})"
+                    )
+                _bump_skip("remoteclip/skip_multi_seg")
+                continue
+            if img_pos.numel() == 0:
+                if ff:
+                    raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: no image feature tokens in inputs_embeds")
+                _bump_skip("remoteclip/skip_grid_mismatch")
+                continue
+
             if self.debug_seg_input_alignment and (not self._seg_align_debug_printed):
                 print(f"[SEG_ALIGN] sample={b} seq_len={seq_len} seg_positions={seg_pos.tolist()} image_token_count={int(img_pos.numel())}")
             seg_idx = seg_pos[0].item()
             if not (0 <= seg_idx < seq_len):
                 raise RuntimeError(f"[SEG_ALIGN] invalid seg idx={seg_idx} for seq_len={seq_len}")
 
-            if seg_info is None or len(seg_info) <= b or "image_path" not in seg_info[b]:
+            if seg_info is None or len(seg_info) <= b:
+                if ff:
+                    raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: seg_info missing or too short")
+                _bump_skip("remoteclip/skip_missing_image_path")
+                continue
+            if "image_path" not in seg_info[b] or not seg_info[b]["image_path"]:
+                if ff:
+                    raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: seg_info missing image_path")
+                _bump_skip("remoteclip/skip_missing_image_path")
                 continue
             image_path = seg_info[b]["image_path"]
+
             text = self._decode_refer_text(token_refer_id[b]) if token_refer_id is not None else ""
             if not text:
+                if ff:
+                    raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: empty expression after decoding token_refer_id")
+                _bump_skip("remoteclip/skip_empty_expression")
                 continue
 
-            prior_out = self.remoteclip_prior.forward_image_expression(image_path=image_path, expression=text, clip_input_size=self.prior_clip_input_size)
-            sim = prior_out.patch_text_sim[0] if prior_out.patch_text_sim.ndim == 2 else prior_out.patch_text_sim
+            prior_out = self.remoteclip_prior.forward_image_expression(
+                image_path=image_path, expression=text, clip_input_size=self.prior_clip_input_size
+            )
+            pts = prior_out.patch_text_sim
+            if pts is None or pts.numel() == 0:
+                raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: RemoteCLIP patch_text_sim is empty")
+            if prior_out.global_conf is None or prior_out.global_conf.numel() < 1:
+                raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: RemoteCLIP global_conf is empty")
+
+            sim = pts[0] if pts.ndim == 2 else pts
+            if sim.dim() != 1:
+                raise RuntimeError(f"[RemoteCLIP fail-fast] batch={b}: patch_text_sim must be 1-D per sample, got shape {tuple(sim.shape)}")
             patch_prior = sim
             n_img = int(img_pos.numel())
             if patch_prior.numel() != n_img:
                 g = int(round(math.sqrt(patch_prior.numel())))
                 vg = int(round(math.sqrt(n_img)))
                 if g * g != patch_prior.numel() or vg * vg != n_img:
+                    if ff:
+                        raise RuntimeError(
+                            f"[RemoteCLIP fail-fast] batch={b}: patch_prior numel={patch_prior.numel()} cannot align to "
+                            f"image tokens n_img={n_img} (sqrt grids g={g}, vg={vg})"
+                        )
+                    _bump_skip("remoteclip/skip_grid_mismatch")
                     continue
                 patch_prior = F.interpolate(patch_prior.view(1, 1, g, g), size=(vg, vg), mode="bilinear", align_corners=False).view(-1)
 
-            visual_tokens = inputs_embeds[b:b+1, img_pos, :]
-            seg_token = inputs_embeds[b:b+1, seg_idx, :]
+            # 必须用 clone：seg_idx 为 int 时 seg_token 是 inputs_embeds 的 view；
+            # 后面 inputs_embeds[...] = ... 原地写入会破坏 AsStridedBackward 的版本计数。
+            visual_tokens = inputs_embeds[b:b+1, img_pos, :].clone()
+            seg_token = inputs_embeds[b:b+1, seg_idx, :].clone()
             conf = prior_out.global_conf.view(1, 1).to(inputs_embeds.device, dtype=inputs_embeds.dtype)
             patch_prior = patch_prior.view(1, -1).to(inputs_embeds.device, dtype=inputs_embeds.dtype)
 
@@ -308,6 +409,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             vis_norms.append(float(visual_tokens.norm().item()))
 
         self._seg_align_debug_printed = True
+        if ff and bs > 0 and len(conf_vals) != bs:
+            raise RuntimeError(
+                f"[RemoteCLIP fail-fast] expected RemoteCLIP prior on all {bs} batch elements, "
+                f"but only {len(conf_vals)} succeeded (check skip reasons or seg_info coverage)."
+            )
+
         if len(conf_vals) == 0:
             return inputs_embeds, diag
 
@@ -837,14 +944,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
                 token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
-            if self.use_remoteclip_prior and inputs_embeds is not None and image_features_indices is not None:
-                inputs_embeds, diag_metrics = self._build_prior_and_apply_gate(
-                    inputs_embeds=inputs_embeds,
-                    SEG_token_embedding_indices=SEG_token_embedding_indices,
-                    image_features_indices=image_features_indices,
-                    token_refer_id=token_refer_id,
-                    seg_info=seg_info,
-                )
+            inputs_embeds, diag_metrics = self._apply_remoteclip_prior_to_inputs_embeds(
+                inputs_embeds,
+                SEG_token_embedding_indices,
+                image_features_indices,
+                token_refer_id,
+                seg_info,
+            )
 
         outputs = self.model(
             input_ids=input_ids,
@@ -1007,7 +1113,26 @@ class SegEarthR2(MiphaPhiForCausalLM):
         input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
             token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
-    
+
+        if (
+            getattr(self, "use_remoteclip_prior", False)
+            and self.remoteclip_prior is not None
+            and self.seg_visual_prior_gate is not None
+            and not getattr(self, "_eval_remoteclip_prior_once_logged", False)
+        ):
+            _rank0 = (not dist.is_available()) or (not dist.is_initialized()) or dist.get_rank() == 0
+            if _rank0:
+                print("[Eval RemoteCLIP] prior injection path enabled")
+            self._eval_remoteclip_prior_once_logged = True
+
+        inputs_embeds, _ = self._apply_remoteclip_prior_to_inputs_embeds(
+            inputs_embeds,
+            SEG_token_embedding_indices,
+            image_features_indices,
+            token_refer_id,
+            seg_info,
+        )
+
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

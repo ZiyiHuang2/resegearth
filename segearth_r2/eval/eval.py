@@ -52,6 +52,21 @@ class DataArguments:
     split: str = "val"             # for rrsisd: train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
+    # RemoteCLIP V1 prior（与 train.py ModelArguments 对齐；默认关闭以保持 baseline eval 等价）
+    use_remoteclip_prior: bool = field(default=False)
+    remoteclip_fail_fast: bool = field(default=True)
+    remoteclip_weight_path: Optional[str] = field(default=None)
+    remoteclip_model_name: str = field(default="ViT-B-32")
+    remoteclip_device: str = field(default="cuda")
+    remoteclip_temperature: float = field(default=1.0)
+    remoteclip_clip_input_size: int = field(default=224)
+    unfreeze_remoteclip_last_layer: bool = field(default=False)
+    use_confidence_scaling: bool = field(default=True)
+    use_weak_residual: bool = field(default=True)
+    prior_alpha: float = field(default=0.05)
+    prior_beta: float = field(default=0.05)
+    debug_seg_input_alignment: bool = field(default=False)
+
 
 def init_distributed_mode(args):
     args.distributed = True

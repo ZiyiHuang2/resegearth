@@ -95,6 +95,31 @@ class RemoteCLIPPriorBranch(torch.nn.Module):
             remapped[nk] = v
         return remapped
 
+    def _assert_critical_remoteclip_loaded(self, final_missing: List[str]) -> None:
+        """Fail if OpenCLIP skeleton would still be missing RemoteCLIP-critical weights."""
+        miss = set(final_missing)
+        model_sd = self.model.state_dict()
+        critical_keys = [
+            "visual.conv1.weight",
+            "visual.transformer.resblocks.0.attn.in_proj_weight",
+            "token_embedding.weight",
+            "text_projection",
+            "visual.proj",
+        ]
+        for k in critical_keys:
+            if k in miss:
+                raise RuntimeError(
+                    f"Critical RemoteCLIP weight still listed in missing_keys after load: {k}. "
+                    f"(missing_keys_count={len(final_missing)})"
+                )
+            if k not in model_sd:
+                raise RuntimeError(f"Critical key absent from model.state_dict(): {k}")
+            t = model_sd[k]
+            if not torch.isfinite(t).all():
+                raise RuntimeError(f"Critical tensor has non-finite values: {k}")
+            if float(t.detach().abs().sum()) <= 1e-12:
+                raise RuntimeError(f"Critical tensor is all-zero (likely not loaded): {k}")
+
     def _load_remoteclip_weights(self, weight_path: str) -> None:
         p = Path(weight_path)
         if not p.exists():
@@ -104,21 +129,28 @@ class RemoteCLIPPriorBranch(torch.nn.Module):
         if not isinstance(sd, dict):
             raise RuntimeError("Unexpected RemoteCLIP checkpoint format: expected dict/state_dict")
 
+        def _report(tag: str, r) -> Tuple[List[str], List[str]]:
+            mk, uk = list(r.missing_keys), list(r.unexpected_keys)
+            print(f"[RemoteCLIP] {tag} missing_keys_count={len(mk)} unexpected_keys_count={len(uk)}")
+            print(f"[RemoteCLIP] {tag} missing_keys_first10={mk[:10]}")
+            print(f"[RemoteCLIP] {tag} unexpected_keys_first10={uk[:10]}")
+            return mk, uk
+
         r1 = self.model.load_state_dict(sd, strict=False)
-        missing = list(r1.missing_keys)
-        unexpected = list(r1.unexpected_keys)
-        if missing or unexpected:
-            print("[INFO] Initial load_state_dict mismatch detected")
-            print("[INFO] missing_keys(first3)=", missing[:3])
-            print("[INFO] unexpected_keys(first3)=", unexpected[:3])
-            r2 = self.model.load_state_dict(self._remap_state_dict_keys(sd), strict=False)
-            m2 = list(r2.missing_keys)
-            u2 = list(r2.unexpected_keys)
-            print("[INFO] After key remap missing_keys(first3)=", m2[:3])
-            print("[INFO] After key remap unexpected_keys(first3)=", u2[:3])
-            critical_missing = [k for k in m2 if k.startswith("visual.") or k.startswith("transformer.") or k.startswith("token_embedding")]
-            if critical_missing:
-                raise RuntimeError("Critical RemoteCLIP weights mismatch after remap. missing visual/text keys sample: " + str(critical_missing[:3]))
+        mk1, uk1 = _report("initial_strict_false", r1)
+        final_missing, final_unexpected = mk1, uk1
+
+        if final_missing or final_unexpected:
+            print(
+                "[RemoteCLIP] Key mapping rule: checkpoint keys prefixed with 'visual.trunk.' "
+                "are remapped to 'visual.transformer.' for OpenCLIP ViT layout compatibility."
+            )
+            sd2 = self._remap_state_dict_keys(sd)
+            r2 = self.model.load_state_dict(sd2, strict=False)
+            final_missing, final_unexpected = _report("after_key_remap_strict_false", r2)
+
+        self._assert_critical_remoteclip_loaded(final_missing)
+        print("[RemoteCLIP] remoteclip_weight_loaded=True")
 
     def _build_pos_embed(self, visual, x):
         pe = visual.positional_embedding.to(x.dtype)

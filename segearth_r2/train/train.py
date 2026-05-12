@@ -4,6 +4,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
@@ -52,6 +53,12 @@ class ModelArguments:
     prior_beta: float = field(default=0.05)
     prior_alpha: float = field(default=0.05)
     debug_seg_input_alignment: bool = field(default=False)
+    remoteclip_fail_fast: bool = field(
+        default=True,
+        metadata={
+            "help": "When use_remoteclip_prior=True, must stay True (enforced); False is rejected at init.",
+        },
+    )
 
 @dataclass
 class DataArguments:
@@ -258,6 +265,9 @@ def train():
     if training_args.data_seed is None:
         training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
