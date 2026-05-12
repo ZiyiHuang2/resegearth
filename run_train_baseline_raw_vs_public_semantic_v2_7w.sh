@@ -10,8 +10,8 @@ export WANDB_PROJECT="${WANDB_PROJECT:-segearth-source}"
 export WANDB_INIT_TIMEOUT=300
 unset CUDA_VISIBLE_DEVICES
 
-GPU_SLOT="${GPU_SLOT:-localhost:1}"
-GPU_ID="${GPU_ID:-1}"
+GPU_SLOT="${GPU_SLOT:-localhost:2}"
+GPU_ID="${GPU_ID:-2}"
 
 MASTER_PORT="${MASTER_PORT:-29500}"
 
@@ -43,7 +43,7 @@ CONCEPT_PUBLIC_SEMANTIC_LIBRARY="${CONCEPT_PUBLIC_SEMANTIC_LIBRARY:-configs/conc
 ########################################
 # Train config（两组相同）
 ########################################
-MAX_STEPS="${MAX_STEPS:-70000}"
+MAX_STEPS="${MAX_STEPS:-280000}"
 PER_DEVICE_TRAIN_BATCH_SIZE="1"
 GRADIENT_ACCUMULATION_STEPS="1"
 
@@ -77,11 +77,11 @@ DATA_SEED="42"
 ########################################
 # Output（A baseline raw → B public v2）
 ########################################
-BASELINE_OUTPUT_DIR="${BASELINE_OUTPUT_DIR:-${RESEG_ROOT}/output/source/rrsisd_baseline_raw_7w}"
+BASELINE_OUTPUT_DIR="${BASELINE_OUTPUT_DIR:-${RESEG_ROOT}/output/source/rrsisd_baseline_raw_28w}"
 BASELINE_MERGED_DIR="${BASELINE_OUTPUT_DIR}/merged_model"
 BASELINE_TEST_OUTPUT_DIR="${BASELINE_OUTPUT_DIR}/test_results"
 
-PUBLIC_OUTPUT_DIR="${PUBLIC_OUTPUT_DIR:-${RESEG_ROOT}/output/source/rrsisd_public_semantic_v2_7w}"
+PUBLIC_OUTPUT_DIR="${PUBLIC_OUTPUT_DIR:-${RESEG_ROOT}/output/source/rrsisd_public_semantic_v2_28w}"
 PUBLIC_MERGED_DIR="${PUBLIC_OUTPUT_DIR}/merged_model"
 PUBLIC_TEST_OUTPUT_DIR="${PUBLIC_OUTPUT_DIR}/test_results"
 

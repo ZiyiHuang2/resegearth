@@ -1,0 +1,108 @@
+{
+  "field_aliases_used": {
+    "idx": "sample_index",
+    "ref_id": "ref_id",
+    "category_name": "category_name",
+    "expression": "expression",
+    "baseline_iou": "baseline_iou",
+    "v2_iou": "public_v2_iou",
+    "v2_precision": "public_v2_precision",
+    "v2_recall": "public_v2_recall",
+    "v2_pred_area": "public_v2_pred_area"
+  },
+  "library_match_policy": {
+    "matching": "word_boundary",
+    "multi_word": "continuous_phrase",
+    "selection": "longest_first_non_overlapping",
+    "hierarchy": "child_suppresses_parent",
+    "multi_concept": "inject_all_non_overlapping_matches",
+    "fallback": "empty"
+  },
+  "retrieval_backend": "rrsisd_explicitization_pipeline.retrieve_concept_semantics",
+  "enriched_warnings": [],
+  "total_samples": 3480,
+  "all_mean_delta_iou": 0.005535536783294799,
+  "has_matched_prior_sample_count": 1327,
+  "no_matched_prior_sample_count": 2153,
+  "has_matched_prior_mean_delta_iou": 0.009142576764317767,
+  "no_matched_prior_mean_delta_iou": 0.003464272276798512,
+  "category_out_library_but_hit_prior_count": 95,
+  "category_out_library_but_hit_prior_mean_delta_iou": -0.014798992466452133,
+  "overpass_hit_prior_count": 35,
+  "overpass_hit_prior_mean_delta_iou": -0.054699037187579784,
+  "chimney_hit_prior_count": 0,
+  "chimney_hit_prior_mean_delta_iou": null,
+  "improved_precision_vs_recall_summary": {
+    "global_mean_delta_precision": 0.0072859443257767215,
+    "global_mean_delta_recall": 0.0026820957480546332,
+    "interpretation": "precision_delta > recall_delta suggests cleaner masks / less spill if paired with pred-area shrink"
+  },
+  "shrinkage_summary": {
+    "global_mean_delta_pred_area": -187.30056179787766,
+    "note": "negative means average predicted foreground pixels decreased vs baseline"
+  },
+  "area_bucket_summary": {
+    "tiny": 986,
+    "small": 554,
+    "medium": 1001,
+    "large": 609,
+    "unknown": 330
+  },
+  "top_positive_concepts": [
+    {
+      "concept": "harbor",
+      "mean_delta_iou": 0.03424076761039356,
+      "hit_sample_count": 32
+    },
+    {
+      "concept": "ship",
+      "mean_delta_iou": 0.02244223039438675,
+      "hit_sample_count": 190
+    },
+    {
+      "concept": "vehicle",
+      "mean_delta_iou": 0.009716829930580591,
+      "hit_sample_count": 626
+    },
+    {
+      "concept": "bridge",
+      "mean_delta_iou": 0.003869104717300403,
+      "hit_sample_count": 290
+    },
+    {
+      "concept": "airport",
+      "mean_delta_iou": -0.0006438757075707043,
+      "hit_sample_count": 219
+    }
+  ],
+  "top_negative_concepts": [
+    {
+      "concept": "airport",
+      "mean_delta_iou": -0.0006438757075707043,
+      "hit_sample_count": 219
+    },
+    {
+      "concept": "bridge",
+      "mean_delta_iou": 0.003869104717300403,
+      "hit_sample_count": 290
+    },
+    {
+      "concept": "vehicle",
+      "mean_delta_iou": 0.009716829930580591,
+      "hit_sample_count": 626
+    },
+    {
+      "concept": "ship",
+      "mean_delta_iou": 0.02244223039438675,
+      "hit_sample_count": 190
+    },
+    {
+      "concept": "harbor",
+      "mean_delta_iou": 0.03424076761039356,
+      "hit_sample_count": 32
+    }
+  ],
+  "concept_level_counting_note": "Each sample with k matched concepts contributes k times to per-concept hit_sample_count / means.",
+  "recommended_next_step": "C",
+  "recommended_next_step_reason": "out-of-library but prior-hit stratum harmful or overpass hits align with drops → match audit"
+}

@@ -1,0 +1,113 @@
+{
+  "top50_improved_category_counts": {
+    "vehicle": 11,
+    "groundtrackfield": 5,
+    "bridge": 4,
+    "ship": 4,
+    "Expressway-toll-station": 3,
+    "basketballcourt": 3,
+    "overpass": 3,
+    "storagetank": 3,
+    "tenniscourt": 3,
+    "Expressway-Service-area": 2,
+    "baseballfield": 2,
+    "chimney": 2,
+    "golffield": 2,
+    "trainstation": 2,
+    "airplane": 1
+  },
+  "top50_degraded_category_counts": {
+    "bridge": 8,
+    "vehicle": 7,
+    "groundtrackfield": 6,
+    "overpass": 6,
+    "chimney": 4,
+    "ship": 3,
+    "tenniscourt": 3,
+    "airport": 2,
+    "baseballfield": 2,
+    "Expressway-Service-area": 1,
+    "airplane": 1,
+    "basketballcourt": 1,
+    "dam": 1,
+    "golffield": 1,
+    "stadium": 1,
+    "storagetank": 1,
+    "trainstation": 1,
+    "windmill": 1
+  },
+  "mapping_notes": {
+    "refs_order": "refs(unc).p entries with split==test, same order as RRSISDDataset.__getitem__ index.",
+    "metrics_idx": "rrsisd_test_metrics.json details[].idx equals that dataset index; one index skipped for empty GT.",
+    "ref_id": "details[].id == ref_id == eval_seg output id == data_id in dataset annotations.",
+    "pred_masks": "{image_stem}_{ref_id}_test_0.tif uint8 {0,255} per segearth_r2/eval/eval.py"
+  },
+  "counts": {
+    "per_sample_rows": 3480,
+    "test_refs_total": 3481
+  },
+  "verdict": {
+    "verdict_code": "D",
+    "rationale_lines": [
+      "样本或类别集中：top50 正增益样本占正增益总和 36.26%；前三类别 |Δ| 占比 44.44%。"
+    ],
+    "stats": {
+      "n_samples": 3480,
+      "sum_delta_iou": 17.785679684726187,
+      "mean_delta_iou": 0.005110827495610973,
+      "group_A_mean_delta_iou": 0.006949759125231358,
+      "group_B_mean_delta_iou": 0.005961957340120469,
+      "other_mean_delta_iou": -0.0006236334051295343,
+      "group_A_n": 1695,
+      "group_B_n": 1081,
+      "top50_positive_gain_share": 0.36260752384610934,
+      "top3_category_abs_delta_share": 0.4443786754792617,
+      "per_category_delta_iou_std": 0.009894160294322342,
+      "mean_delta_precision": 0.00672693652836799,
+      "mean_delta_recall": 0.002450109880191287,
+      "mean_delta_pred_area": -172.44568965528737
+    },
+    "top_categories_by_sum_delta_iou": [
+      {
+        "category_name": "vehicle",
+        "sum_delta_iou": 6.338497535343717,
+        "sample_count": 558
+      },
+      {
+        "category_name": "ship",
+        "sum_delta_iou": 3.762767196794,
+        "sample_count": 182
+      },
+      {
+        "category_name": "golffield",
+        "sum_delta_iou": 2.2790421219201558,
+        "sample_count": 112
+      },
+      {
+        "category_name": "basketballcourt",
+        "sum_delta_iou": 2.259125804021177,
+        "sample_count": 121
+      },
+      {
+        "category_name": "bridge",
+        "sum_delta_iou": 1.2666834067419623,
+        "sample_count": 269
+      },
+      {
+        "category_name": "storagetank",
+        "sum_delta_iou": 1.2544695463138984,
+        "sample_count": 110
+      },
+      {
+        "category_name": "Expressway-Service-area",
+        "sum_delta_iou": 0.9915693575381778,
+        "sample_count": 123
+      },
+      {
+        "category_name": "windmill",
+        "sum_delta_iou": 0.7679884526575645,
+        "sample_count": 260
+      }
+    ]
+  }
+}

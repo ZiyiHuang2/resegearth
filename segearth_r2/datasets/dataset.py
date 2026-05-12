@@ -1,5 +1,6 @@
 import os
 import random
+import sys
 import re
 import glob
 from dataclasses import dataclass, field
@@ -21,7 +22,12 @@ from PIL import Image
 from fvcore.common.config import CfgNode
 import warnings
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
-from segearth_r2.utils.concept_public_grounding_train import build_rrsisd_supervised_human_value
+from segearth_r2.utils.concept_public_grounding_train import (
+    build_rrsisd_supervised_human_value,
+    filter_matched_concepts_by_category,
+    format_grounding_appendix,
+    retrieve_matched_public_grounding,
+)
 from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
@@ -224,6 +230,14 @@ class RRSISDDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.concept_public_semantic_library = getattr(data_args, "concept_public_semantic_library", None) or None
+        self.concept_match_strict = bool(getattr(data_args, "concept_match_strict", False))
+        self.debug_concept_match_strict = bool(getattr(data_args, "debug_concept_match_strict", False))
+        self.debug_concept_match_strict_max_samples = int(
+            getattr(data_args, "debug_concept_match_strict_max_samples", 50) or 50
+        )
+        self._strict_debug_printed = 0
+        self._strict_missing_category_count = 0
+        self._strict_missing_category_printed = 0
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
 
         # 官方目录结构
@@ -311,7 +325,77 @@ class RRSISDDataset(RS_Base_Dataset):
             'image_id': os.path.basename(image_path).split(".")[0],
         })
 
-        human_value = build_rrsisd_supervised_human_value(instruction, self.concept_public_semantic_library)
+        category_name_str = None
+        cid = ref.get("category_id")
+        if cid is None:
+            ann_probe = self.ann_dict.get(ref.get("ann_id"))
+            if isinstance(ann_probe, dict):
+                cid = ann_probe.get("categories_id")
+                if cid is None:
+                    cid = ann_probe.get("category_id")
+        try:
+            cid_int = int(cid) if cid is not None else None
+        except (TypeError, ValueError):
+            cid_int = None
+        if cid_int is not None:
+            category_name_str = self.category_dict.get(cid_int)
+
+        lib = self.concept_public_semantic_library
+        if lib and self.concept_match_strict:
+            matched_before = retrieve_matched_public_grounding(instruction, lib)
+            if not category_name_str or not str(category_name_str).strip():
+                matched_after = []
+                self._strict_missing_category_count += 1
+                if self._strict_missing_category_printed < 10:
+                    print(
+                        "[RRSISD][concept_match_strict] missing category_name "
+                        f"idx={idx} ref_id={data_id} ann_id={ref.get('ann_id')}",
+                        file=sys.stderr,
+                    )
+                    self._strict_missing_category_printed += 1
+            else:
+                matched_after = filter_matched_concepts_by_category(
+                    matched_before, str(category_name_str).strip()
+                )
+
+            if self.debug_concept_match_strict:
+                mb_names = [
+                    str(r.get("concept")).strip()
+                    for r in matched_before
+                    if isinstance(r, dict) and str(r.get("concept") or "").strip()
+                ]
+                ma_names = [
+                    str(r.get("concept")).strip()
+                    for r in matched_after
+                    if isinstance(r, dict) and str(r.get("concept") or "").strip()
+                ]
+                is_over = str(category_name_str).strip() == "overpass"
+                narrowed = len(matched_before) > 0 and len(matched_after) == 0
+                changed = mb_names != ma_names
+                if (
+                    self._strict_debug_printed < self.debug_concept_match_strict_max_samples
+                    and (is_over or narrowed or changed)
+                ):
+                    preview = format_grounding_appendix(matched_after)
+                    preview = preview.replace("\n", " ")[:500]
+                    print(
+                        "[RRSISD][debug_concept_match_strict] "
+                        f"ref_id={data_id} idx={idx} category_name={category_name_str!r} "
+                        f"expression={instruction[:200]!r} "
+                        f"matched_concepts_before_strict={mb_names} "
+                        f"matched_concepts_after_strict={ma_names} "
+                        f"whether_prior_injected={bool(matched_after)} "
+                        f"prior_text_preview={preview!r}",
+                        file=sys.stderr,
+                    )
+                    self._strict_debug_printed += 1
+
+            human_value = build_rrsisd_supervised_human_value(
+                instruction, lib, matched_precalc=matched_after
+            )
+        else:
+            human_value = build_rrsisd_supervised_human_value(instruction, lib)
+
         token_refer_id = self.preprocess_referring_instruction(instruction)
 
         sources = [[

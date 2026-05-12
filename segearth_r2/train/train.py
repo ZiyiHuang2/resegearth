@@ -4,6 +4,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
@@ -58,6 +59,22 @@ class DataArguments:
         metadata={
             "help": "Optional path to concept_public_semantic_library_v2.json; RRSIS-D injects matched grounding priors in the human message (expression first, then priors, then image, then refer)."
         },
+    )
+    concept_match_strict: bool = field(
+        default=False,
+        metadata={
+            "help": "RRSIS-D only: after retrieval, keep grounding priors whose concept matches GT category_name (normalized); out-of-library categories yield empty priors. Default False preserves public_semantic_v2 behavior."
+        },
+    )
+    debug_concept_match_strict: bool = field(
+        default=False,
+        metadata={
+            "help": "RRSIS-D only: when concept_match_strict is True, print a small number of before/after retrieval debug lines to stderr (see debug_concept_match_strict_max_samples)."
+        },
+    )
+    debug_concept_match_strict_max_samples: int = field(
+        default=50,
+        metadata={"help": "RRSIS-D only: max debug lines for debug_concept_match_strict."},
     )
 
 @dataclass
@@ -247,11 +264,22 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    _lr = getattr(training_args, "local_rank", -1)
+    if _lr in (-1, 0) and getattr(data_args, "dataset_name", "").lower() == "rrsisd":
+        if getattr(data_args, "concept_match_strict", False):
+            print(
+                "[RRSISD] concept_match_strict=True "
+                f"debug={getattr(data_args, 'debug_concept_match_strict', False)} "
+                f"debug_max={getattr(data_args, 'debug_concept_match_strict_max_samples', 50)}"
+            )
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
         training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)

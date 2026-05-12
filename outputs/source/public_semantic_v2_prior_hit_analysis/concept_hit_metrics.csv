@@ -1,0 +1,6 @@
+concept,hit_sample_count,mean_delta_iou,mean_delta_precision,mean_delta_recall,mean_delta_pred_area,positive_sample_count,negative_sample_count,positive_ratio,top_categories_by_count
+vehicle,626,0.009717,0.012237,0.011298,-181.874296,283,255,0.452077,vehicle:558|overpass:33|Expressway-Service-area:14|basketballcourt:7|bridge:4|storagetank:3|tenniscourt:3|ship:2
+bridge,290,0.003869,-0.005988,0.006372,405.772000,133,117,0.458621,bridge:269|vehicle:8|Expressway-Service-area:2|ship:2|groundtrackfield:2|tenniscourt:1|stadium:1|Expressway-toll-station:1
+airport,219,-0.000644,0.002564,-0.006115,-1294.727700,112,101,0.511416,airport:196|groundtrackfield:12|golffield:6|bridge:1|airplane:1|stadium:1|baseballfield:1|Expressway-toll-station:1
+ship,190,0.022442,0.027780,0.022459,-519.826590,95,79,0.500000,ship:182|harbor:4|vehicle:3|bridge:1
+harbor,32,0.034241,0.018259,0.099568,545.920000,16,9,0.500000,harbor:27|ship:2|bridge:2|overpass:1
