@@ -66,6 +66,21 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     if not hasattr(model.config, "text_film_force_alpha"):
         model.config.text_film_force_alpha = 1.0
 
+    if not hasattr(model.config, "use_decoder_attn_bias"):
+        model.config.use_decoder_attn_bias = False
+    if not hasattr(model.config, "decoder_attn_bias_dim"):
+        model.config.decoder_attn_bias_dim = 128
+    if not hasattr(model.config, "decoder_attn_bias_init_std"):
+        model.config.decoder_attn_bias_init_std = 1e-3
+    if not hasattr(model.config, "decoder_attn_bias_max_abs"):
+        model.config.decoder_attn_bias_max_abs = 0.01
+    if not hasattr(model.config, "decoder_attn_bias_apply_layers"):
+        model.config.decoder_attn_bias_apply_layers = "last3"
+    if not hasattr(model.config, "decoder_attn_bias_eval_mode"):
+        model.config.decoder_attn_bias_eval_mode = "normal"
+    if not hasattr(model.config, "decoder_attn_bias_force_scale"):
+        model.config.decoder_attn_bias_force_scale = 1.0
+
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor
@@ -73,6 +88,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     model.resize_token_embeddings(len(tokenizer))
     if hasattr(model, "ensure_text_film_branch"):
         model.ensure_text_film_branch()
+    if hasattr(model, "ensure_decoder_attn_bias_branch"):
+        model.ensure_decoder_attn_bias_branch()
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

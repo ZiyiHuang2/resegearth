@@ -17,7 +17,10 @@ from ..mipha.model.language_model.mipha_phi import (MiphaPhiForCausalLM, MiphaPh
 
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
 
-from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
+from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import (
+    MultiScaleMaskedTransformerDecoderForOPTPreTrain,
+    DecoderTokenAttnBias,
+)
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
 
@@ -105,6 +108,11 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     text_film_gamma_norm: Optional[torch.FloatTensor] = None
     text_film_beta_norm: Optional[torch.FloatTensor] = None
     text_film_branch_alpha: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_abs_mean: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_raw_std: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_max: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_min: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_enabled: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -145,6 +153,15 @@ class SegEarthR2Model(MiphaPhiModel):
             use_mstva = getattr(config, "use_mstva", False)
             if getattr(config, "use_text_film", False) and use_mstva:
                 use_mstva = False
+            if getattr(config, "use_decoder_attn_bias", False):
+                if use_mstva or getattr(config, "use_text_film", False):
+                    print(
+                        "[SegEarthR2Model] use_decoder_attn_bias=True: forcing use_mstva=False and use_text_film=False "
+                        "for Swin (mutually exclusive)."
+                    )
+                use_mstva = False
+                config.use_mstva = False
+                config.use_text_film = False
             mstva_align_dim = getattr(config, "mstva_align_dim", 256)
             mstva_scale_weights = getattr(config, "mstva_scale_weights", "0.5,0.3,0.2")
             if isinstance(mstva_scale_weights, str):
@@ -192,10 +209,20 @@ class SegEarthR2Model(MiphaPhiModel):
         self.config.text_film_init_std = float(getattr(model_args, "text_film_init_std", 1e-3))
         self.config.text_film_branch_alpha = float(getattr(model_args, "text_film_branch_alpha", 1.0))
         self.config.text_film_visual_dim = int(getattr(model_args, "text_film_visual_dim", 512))
+        use_dac = getattr(model_args, "use_decoder_attn_bias", False)
+        self.config.use_decoder_attn_bias = bool(use_dac)
         use_mstva_arg = getattr(model_args, "use_mstva", False)
         if self.config.use_text_film and use_mstva_arg:
             print("[initialize_vision_modules] use_text_film=True: forcing use_mstva=False for Swin.")
             use_mstva_arg = False
+        if use_dac:
+            if use_mstva_arg or getattr(model_args, "use_text_film", False):
+                print(
+                    "[initialize_vision_modules] use_decoder_attn_bias=True: forcing use_mstva=False and "
+                    "use_text_film=False for Swin."
+                )
+            use_mstva_arg = False
+            self.config.use_text_film = False
         self.config.use_mstva = use_mstva_arg
         self.config.mstva_align_dim = getattr(model_args, "mstva_align_dim", 256)
         self.config.mstva_scale_weights = getattr(model_args, "mstva_scale_weights", "0.5,0.3,0.2")
@@ -241,6 +268,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "(mutually exclusive; MSTVA module not built in Swin when use_text_film is on)."
             )
             config.use_mstva = False
+        if getattr(config, "use_decoder_attn_bias", False):
+            if getattr(config, "use_mstva", False) or getattr(config, "use_text_film", False):
+                print(
+                    "[SegEarthR2] use_decoder_attn_bias=True: forcing config.use_mstva=False and "
+                    "config.use_text_film=False (mutually exclusive)."
+                )
+            config.use_mstva = False
+            config.use_text_film = False
         super(SegEarthR2, self).__init__(config)
 
         self.model = SegEarthR2Model(config, mask_decoder_cfg)
@@ -281,6 +316,29 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if not getattr(self.config, "use_text_film", False):
             return
         self._init_text_film_branch_from_config()
+
+    def ensure_decoder_attn_bias_branch(self):
+        """If config enables decoder attn bias but predictor has no submodule (e.g. config toggled after load), attach it."""
+        if not getattr(self.config, "use_decoder_attn_bias", False):
+            return
+        if not hasattr(self, "predictor") or self.predictor is None:
+            return
+        spec = str(getattr(self.config, "decoder_attn_bias_apply_layers", "last3"))
+        if getattr(self.predictor, "decoder_attn_bias_apply_layers", None) is None:
+            self.predictor.decoder_attn_bias_apply_layers = spec
+        if getattr(self.predictor, "decoder_token_attn_bias", None) is not None:
+            return
+        hidden_dim = int(self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.predictor.register_module(
+            "decoder_token_attn_bias",
+            DecoderTokenAttnBias(
+                text_dim=int(self.config.hidden_size),
+                memory_dim=hidden_dim,
+                bias_dim=int(getattr(self.config, "decoder_attn_bias_dim", 128)),
+                init_std=float(getattr(self.config, "decoder_attn_bias_init_std", 1e-3)),
+                max_abs=float(getattr(self.config, "decoder_attn_bias_max_abs", 0.01)),
+            ),
+        )
 
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
@@ -447,6 +505,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
+    def _repeat_text_tokens_for_mask_num(self, text_tokens, text_mask, mask_num_tensor):
+        if text_tokens is None or text_mask is None:
+            return None, None
+        mn = torch.as_tensor(mask_num_tensor, device=text_tokens.device, dtype=torch.long).flatten()
+        if mn.numel() == 0:
+            return text_tokens, text_mask
+        return torch.repeat_interleave(text_tokens, mn, dim=0), torch.repeat_interleave(text_mask, mn, dim=0)
+
     def predictor_init(self, cfg):
         in_channels = cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         hidden_dim = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
@@ -461,18 +527,35 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
 
-        predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(in_channels,
-                                                                     hidden_dim,
-                                                                     num_queries,
-                                                                     nheads,
-                                                                     dim_feedforward,
-                                                                     dec_layers,
-                                                                     pre_norm,
-                                                                     mask_dim,
-                                                                     enforce_input_project,
-                                                                     seg_norm,
-                                                                     seg_proj,
-                                                                     seg_fuse_score,)
+        use_dac = getattr(self.config, "use_decoder_attn_bias", False)
+        dac_apply = str(getattr(self.config, "decoder_attn_bias_apply_layers", "last3")) if use_dac else None
+
+        predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(
+            in_channels,
+            hidden_dim,
+            num_queries,
+            nheads,
+            dim_feedforward,
+            dec_layers,
+            pre_norm,
+            mask_dim,
+            enforce_input_project,
+            seg_norm,
+            seg_proj,
+            seg_fuse_score,
+            decoder_attn_bias_apply_layers=dac_apply,
+        )
+        if use_dac:
+            predictor.register_module(
+                "decoder_token_attn_bias",
+                DecoderTokenAttnBias(
+                    text_dim=int(self.config.hidden_size),
+                    memory_dim=int(hidden_dim),
+                    bias_dim=int(getattr(self.config, "decoder_attn_bias_dim", 128)),
+                    init_std=float(getattr(self.config, "decoder_attn_bias_init_std", 1e-3)),
+                    max_abs=float(getattr(self.config, "decoder_attn_bias_max_abs", 0.01)),
+                ),
+            )
         return predictor
 
 
@@ -1112,6 +1195,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 use_midstage_gate_loss = getattr(self.config, "use_midstage_gate_loss", False)
                 use_mstva = getattr(self.config, "use_mstva", False)
                 use_mstva_loss = getattr(self.config, "use_mstva_loss", False)
+                use_decoder_attn_bias = getattr(self.config, "use_decoder_attn_bias", False)
                 text_cond = self.build_text_condition(
                     token_refer_id=token_refer_id,
                     batch_size=input_ids.shape[0],
@@ -1119,7 +1203,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 )
                 text_tokens = None
                 text_mask = None
-                if use_mstva or use_mstva_loss:
+                if use_mstva or use_mstva_loss or use_decoder_attn_bias:
                     text_tokens, text_mask = self.build_text_tokens(
                         token_refer_id=token_refer_id,
                         batch_size=input_ids.shape[0],
@@ -1173,7 +1257,29 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        dac_mode = str(getattr(self.config, "decoder_attn_bias_eval_mode", "normal"))
+        dac_fscale = float(getattr(self.config, "decoder_attn_bias_force_scale", 1.0))
+        tt_rep, tm_rep = self._repeat_text_tokens_for_mask_num(text_tokens, text_mask, mask_num)
+        if tt_rep is not None:
+            if tt_rep.shape[0] != SEG_embedding.shape[0]:
+                raise AssertionError(
+                    f"[DecoderAttnBias] text batch {tt_rep.shape[0]} != SEG_embedding batch {SEG_embedding.shape[0]}"
+                )
+            if tt_rep.shape[0] != mask_features.shape[0]:
+                raise AssertionError(
+                    f"[DecoderAttnBias] text batch {tt_rep.shape[0]} != mask_features batch {mask_features.shape[0]}"
+                )
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            None,
+            SEG_embedding,
+            text_tokens=tt_rep,
+            text_mask=tm_rep,
+            dac_eval_mode=dac_mode,
+            dac_force_scale=dac_fscale,
+        )
 
         # 开始计算loss
         loss = None
@@ -1373,6 +1479,21 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 text_film_beta_norm = br._last_beta_norm.detach().float().to(zero_base.device)
             text_film_branch_alpha_log = br.branch_alpha.detach().float().to(zero_base.device)
 
+        dac_log = getattr(self.predictor, "_last_decoder_attn_bias_log", None)
+        z0 = zero_base * 0
+        if dac_log is not None:
+            dac_abs_mean = z0 + dac_log["decoder_attn_bias_abs_mean"].detach().float().to(zero_base.device)
+            dac_raw_std = z0 + dac_log["decoder_attn_bias_raw_std"].detach().float().to(zero_base.device)
+            dac_max = z0 + dac_log["decoder_attn_bias_max"].detach().float().to(zero_base.device)
+            dac_min = z0 + dac_log["decoder_attn_bias_min"].detach().float().to(zero_base.device)
+            dac_enabled = z0 + dac_log["decoder_attn_bias_enabled"].detach().float().to(zero_base.device)
+        else:
+            dac_abs_mean = z0
+            dac_raw_std = z0
+            dac_max = z0
+            dac_min = z0
+            dac_enabled = z0
+
         return CausalOutputWithMask(
             loss=loss,
             logits=logits,
@@ -1392,6 +1513,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             text_film_gamma_norm=text_film_gamma_norm.detach(),
             text_film_beta_norm=text_film_beta_norm.detach(),
             text_film_branch_alpha=text_film_branch_alpha_log.detach(),
+            decoder_attn_bias_abs_mean=dac_abs_mean.detach(),
+            decoder_attn_bias_raw_std=dac_raw_std.detach(),
+            decoder_attn_bias_max=dac_max.detach(),
+            decoder_attn_bias_min=dac_min.detach(),
+            decoder_attn_bias_enabled=dac_enabled.detach(),
         )
     
     def eval_seg(
@@ -1423,22 +1549,30 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
 
         use_mstva = getattr(self.config, "use_mstva", False)
+        use_decoder_attn_bias = getattr(self.config, "use_decoder_attn_bias", False)
         text_tokens = None
         text_mask = None
-        if use_mstva:
+        if use_mstva or use_decoder_attn_bias:
             text_tokens, text_mask = self.build_text_tokens(
                 token_refer_id,
                 batch_size=input_ids.shape[0] if input_ids is not None else None,
                 device=images.device if images is not None else None,
             )
-            if text_tokens is None:
+            if text_tokens is None and use_mstva:
                 if not getattr(self, "_eval_seg_mstva_bypass_warned", False):
                     self._eval_seg_mstva_bypass_warned = True
                     print(
                         "[WARNING][eval_seg] use_mstva=True but text_tokens is None "
                         "(token_refer_id is None or yielded no valid tokens); MSTVA bypassed in eval."
                     )
-            elif not getattr(self, "_eval_seg_mstva_debug_logged", False):
+            elif text_tokens is None and use_decoder_attn_bias:
+                if not getattr(self, "_eval_seg_dac_bypass_warned", False):
+                    self._eval_seg_dac_bypass_warned = True
+                    print(
+                        "[WARNING][eval_seg][DecoderAttnBias] use_decoder_attn_bias=True but text_tokens is None "
+                        "(token_refer_id is None or yielded no valid tokens); decoder attention bias bypassed."
+                    )
+            elif use_mstva and text_tokens is not None and not getattr(self, "_eval_seg_mstva_debug_logged", False):
                 self._eval_seg_mstva_debug_logged = True
                 print("[DEBUG][eval_seg] use_mstva=True")
                 print(f"[DEBUG][eval_seg] text_tokens shape={tuple(text_tokens.shape)}")
@@ -1491,7 +1625,29 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        dac_mode = str(getattr(self.config, "decoder_attn_bias_eval_mode", "normal"))
+        dac_fscale = float(getattr(self.config, "decoder_attn_bias_force_scale", 1.0))
+        tt_rep, tm_rep = self._repeat_text_tokens_for_mask_num(text_tokens, text_mask, mask_num)
+        if tt_rep is not None:
+            if tt_rep.shape[0] != SEG_embedding.shape[0]:
+                raise AssertionError(
+                    f"[DecoderAttnBias] text batch {tt_rep.shape[0]} != SEG_embedding batch {SEG_embedding.shape[0]}"
+                )
+            if tt_rep.shape[0] != mask_features.shape[0]:
+                raise AssertionError(
+                    f"[DecoderAttnBias] text batch {tt_rep.shape[0]} != mask_features batch {mask_features.shape[0]}"
+                )
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            None,
+            SEG_embedding,
+            text_tokens=tt_rep,
+            text_mask=tm_rep,
+            dac_eval_mode=dac_mode,
+            dac_force_scale=dac_fscale,
+        )
 
         
         mask_pred_results = mask_outputs["pred_masks"]

@@ -1,5 +1,6 @@
 # Copyright (c) Facebook, Inc. and its affiliates.
 # Modified by Bowen Cheng from: https://github.com/facebookresearch/detr/blob/master/models/detr.py
+import math
 import fvcore.nn.weight_init as weight_init
 from typing import Optional
 import torch
@@ -94,10 +95,29 @@ class CrossAttentionLayer(nn.Module):
                      memory_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
+                     query_pos: Optional[Tensor] = None,
+                     attn_bias: Optional[Tensor] = None):
+        effective_mask = memory_mask
+        if attn_bias is not None:
+            if memory_mask is None:
+                effective_mask = attn_bias
+            elif memory_mask.dtype == torch.bool:
+                if attn_bias.shape != memory_mask.shape:
+                    raise ValueError(
+                        f"attn_bias shape {tuple(attn_bias.shape)} != memory_mask shape {tuple(memory_mask.shape)}"
+                    )
+                bias = attn_bias.float()
+                mask_float = torch.zeros_like(bias, dtype=torch.float32)
+                mask_float = mask_float.masked_fill(memory_mask, float("-inf"))
+                effective_mask = mask_float + bias
+                effective_mask = effective_mask.masked_fill(memory_mask, float("-inf"))
+                effective_mask = effective_mask.to(dtype=tgt.dtype)
+            else:
+                # Mask2Former cross-attn uses bool memory_mask; float path kept for API completeness.
+                effective_mask = memory_mask.to(dtype=attn_bias.dtype) + attn_bias
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                    key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
+                                   value=memory, attn_mask=effective_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
@@ -108,11 +128,30 @@ class CrossAttentionLayer(nn.Module):
                     memory_mask: Optional[Tensor] = None,
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+                    query_pos: Optional[Tensor] = None,
+                    attn_bias: Optional[Tensor] = None):
         tgt2 = self.norm(tgt)
+        effective_mask = memory_mask
+        if attn_bias is not None:
+            if memory_mask is None:
+                effective_mask = attn_bias
+            elif memory_mask.dtype == torch.bool:
+                if attn_bias.shape != memory_mask.shape:
+                    raise ValueError(
+                        f"attn_bias shape {tuple(attn_bias.shape)} != memory_mask shape {tuple(memory_mask.shape)}"
+                    )
+                bias = attn_bias.float()
+                mask_float = torch.zeros_like(bias, dtype=torch.float32)
+                mask_float = mask_float.masked_fill(memory_mask, float("-inf"))
+                effective_mask = mask_float + bias
+                effective_mask = effective_mask.masked_fill(memory_mask, float("-inf"))
+                effective_mask = effective_mask.to(dtype=tgt2.dtype)
+            else:
+                # Mask2Former cross-attn uses bool memory_mask; float path kept for API completeness.
+                effective_mask = memory_mask.to(dtype=attn_bias.dtype) + attn_bias
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
                                    key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
+                                   value=memory, attn_mask=effective_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
 
@@ -122,12 +161,13 @@ class CrossAttentionLayer(nn.Module):
                 memory_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                attn_bias: Optional[Tensor] = None):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, memory_mask,
-                                    memory_key_padding_mask, pos, query_pos)
+                                    memory_key_padding_mask, pos, query_pos, attn_bias)
         return self.forward_post(tgt, memory, memory_mask,
-                                 memory_key_padding_mask, pos, query_pos)
+                                 memory_key_padding_mask, pos, query_pos, attn_bias)
 
 
 class FFNLayer(nn.Module):
@@ -199,7 +239,95 @@ class MLP(nn.Module):
         return x
 
 
+class DecoderTokenAttnBias(nn.Module):
+    """Token-level text-guided soft bias for decoder cross-attention (additive on attention logits)."""
 
+    def __init__(
+        self,
+        text_dim: int,
+        memory_dim: int = 256,
+        bias_dim: int = 128,
+        init_std: float = 1e-3,
+        max_abs: float = 0.01,
+    ):
+        super().__init__()
+        self.bias_dim = int(bias_dim)
+        self.init_std = float(init_std)
+        self.max_abs = float(max_abs)
+        self.visual_proj = nn.Linear(int(memory_dim), self.bias_dim)
+        self.text_proj = nn.Linear(int(text_dim), self.bias_dim)
+        hid = max(self.bias_dim, 32)
+        self.bias_mlp = nn.Sequential(
+            nn.Linear(3 * self.bias_dim, hid),
+            nn.ReLU(),
+            nn.Linear(hid, 1),
+        )
+        nn.init.normal_(self.bias_mlp[-1].weight, mean=0.0, std=float(init_std))
+        nn.init.zeros_(self.bias_mlp[-1].bias)
+
+    def forward(
+        self,
+        memory: Tensor,
+        text_tokens: Tensor,
+        text_mask: Tensor,
+        num_heads: int,
+        num_queries: int,
+        eval_mode: str = "normal",
+        force_scale: float = 1.0,
+    ):
+        """
+        memory: [S, B, C]
+        text_tokens: [B, L, D]
+        text_mask: [B, L] True = valid token
+        returns attn_bias [B * num_heads, num_queries, S] or None
+        """
+        if text_tokens is None or text_mask is None:
+            return None, {}
+        if memory.dim() != 3 or text_tokens.dim() != 3:
+            return None, {}
+        S, B, Cm = memory.shape
+        B2, L, Dt = text_tokens.shape
+        if B != B2:
+            return None, {}
+        d = self.bias_dim
+        M = memory.permute(1, 0, 2)
+        V = self.visual_proj(M)
+        T = self.text_proj(text_tokens)
+        logits = torch.matmul(V, T.transpose(-1, -2)) / math.sqrt(float(d))
+        logits = logits.masked_fill(~text_mask[:, None, :], -1e4)
+        A = torch.softmax(logits, dim=-1)
+        Ctxt = torch.matmul(A, T)
+        Z = torch.cat([V, Ctxt, V * Ctxt], dim=-1)
+        raw = self.bias_mlp(Z).squeeze(-1)
+        raw_std = raw.float().std(dim=-1).mean() if raw.numel() > 0 else raw.new_zeros(())
+        raw = raw - raw.mean(dim=-1, keepdim=True)
+        P = torch.clamp(raw, -self.max_abs, self.max_abs)
+        # fp16: keep max_abs small so bias cannot numerically overwhelm hard -inf masks after merge
+        # (CrossAttentionLayer re-applies masked_fill(memory_mask, -inf); large max_abs is still discouraged.)
+        ma = float(self.max_abs)
+        if P.dtype == torch.float16 and ma >= 0.1:
+            raise AssertionError(
+                f"decoder_attn_bias_max_abs={ma} is too large for fp16 hard-mask safety in this PoC; "
+                "use <=0.01 or run bias path in bf32/fp32."
+            )
+        if eval_mode == "bypass":
+            P = torch.zeros_like(P)
+        elif eval_mode == "force_scale":
+            fs = float(force_scale)
+            P = P * torch.tensor(fs, device=P.device, dtype=P.dtype)
+        elif eval_mode != "normal":
+            pass
+        bias = P[:, None, :].expand(B, num_queries, S).contiguous()
+        bias = bias[:, None, :, :].expand(B, num_heads, num_queries, S).contiguous()
+        attn_bias = bias.reshape(B * num_heads, num_queries, S)
+        stats = {
+            "decoder_attn_bias_abs_mean": P.detach().abs().mean(),
+            "decoder_attn_bias_raw_std": raw_std.detach() if torch.is_tensor(raw_std) else raw_std,
+            "decoder_attn_bias_max": P.detach().max(),
+            "decoder_attn_bias_min": P.detach().min(),
+            "decoder_attn_bias_enabled": memory.new_tensor(1.0),
+        }
+        return attn_bias, stats
 
 
 class MultiScaleMaskedTransformerDecoder(nn.Module):
@@ -327,7 +455,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index], query_pos=query_embed,
+                attn_bias=None,
             )
 
             output = self.transformer_self_attention_layers[i](
@@ -407,6 +536,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             seg_proj=True,
             seg_fuse_score=False,
             use_seg_query=False,
+            decoder_attn_bias_apply_layers=None,
     ):
         nn.Module.__init__(self)
         # positional encoding
@@ -420,6 +550,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
         self.use_seg_query = use_seg_query
+        self.decoder_attn_bias_apply_layers = decoder_attn_bias_apply_layers
+        self._warn_decoder_attn_bias_no_tokens = False
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -478,12 +610,51 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+    def _decoder_bias_layer_active(self, layer_idx: int) -> bool:
+        spec = self.decoder_attn_bias_apply_layers
+        if spec is None:
+            return False
+        if spec == "last3":
+            return layer_idx >= self.num_layers - 3
+        return False
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward(
+        self,
+        x,
+        mask_features,
+        mask=None,
+        seg_query=None,
+        SEG_embedding=None,
+        text_tokens=None,
+        text_mask=None,
+        dac_eval_mode: str = "normal",
+        dac_force_scale: float = 1.0,
+    ):
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
+        return self.forward_woconcat(
+            x,
+            mask_features,
+            mask,
+            seg_query,
+            SEG_embedding,
+            text_tokens=text_tokens,
+            text_mask=text_mask,
+            dac_eval_mode=dac_eval_mode,
+            dac_force_scale=dac_force_scale,
+        )
 
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward_woconcat(
+        self,
+        x,
+        mask_features,
+        mask=None,
+        seg_query=None,
+        SEG_embedding=None,
+        text_tokens=None,
+        text_mask=None,
+        dac_eval_mode: str = "normal",
+        dac_force_scale: float = 1.0,
+    ):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -545,16 +716,52 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         
         predictions_mask.append(outputs_mask)
 
+        dac_mod = getattr(self, "decoder_token_attn_bias", None)
+        dac_stats_accum = []
+        self._last_decoder_attn_bias_log = None
+        if dac_mod is not None and self.decoder_attn_bias_apply_layers:
+            if text_tokens is None or text_mask is None:
+                if not self._warn_decoder_attn_bias_no_tokens:
+                    self._warn_decoder_attn_bias_no_tokens = True
+                    print(
+                        "[WARNING][DecoderAttnBias] text_tokens/text_mask unavailable; "
+                        "decoder attention bias bypassed for this run."
+                    )
+
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+
+            layer_attn_bias = None
+            if (
+                dac_mod is not None
+                and self._decoder_bias_layer_active(i)
+                and text_tokens is not None
+                and text_mask is not None
+            ):
+                attn_bias_t, st = dac_mod(
+                    src[level_index],
+                    text_tokens,
+                    text_mask,
+                    self.num_heads,
+                    output.shape[0],
+                    eval_mode=str(dac_eval_mode),
+                    force_scale=float(dac_force_scale),
+                )
+                if attn_bias_t is not None:
+                    assert attn_bias_t.shape == attn_mask.shape, (
+                        f"attn_bias shape {tuple(attn_bias_t.shape)} != attn_mask shape {tuple(attn_mask.shape)}"
+                    )
+                    layer_attn_bias = attn_bias_t
+                    dac_stats_accum.append(st)
 
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index], query_pos=query_embed,
+                attn_bias=layer_attn_bias,
             )
 
             output = self.transformer_self_attention_layers[i](
@@ -589,6 +796,19 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             predictions_mask.append(outputs_mask)
 
         assert len(predictions_SEG_class) == self.num_layers + 1
+
+        if dac_stats_accum:
+            self._last_decoder_attn_bias_log = dac_stats_accum[-1]
+        elif dac_mod is not None and self.decoder_attn_bias_apply_layers:
+            zv = predictions_mask[-1].new_zeros(())
+            zo = predictions_mask[-1].new_tensor(0.0)
+            self._last_decoder_attn_bias_log = {
+                "decoder_attn_bias_abs_mean": zv,
+                "decoder_attn_bias_raw_std": zv,
+                "decoder_attn_bias_max": zv,
+                "decoder_attn_bias_min": zv,
+                "decoder_attn_bias_enabled": zo,
+            }
 
         out = {
             'pred_SEG_logits': predictions_SEG_class[-1],

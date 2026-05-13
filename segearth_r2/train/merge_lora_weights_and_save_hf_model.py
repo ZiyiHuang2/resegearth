@@ -20,6 +20,18 @@ from segearth_r2.datasets.dataset import get_mask_config
 from segearth_r2.model.language_model.llava_phi import SegEarthR2
 
 
+def _str2bool(v):
+    """argparse-safe bool: ``type=bool`` treats non-empty strings (including 'False') as True."""
+    if isinstance(v, bool):
+        return v
+    s = str(v).lower().strip()
+    if s in ("1", "true", "t", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "f", "no", "n", "off", ""):
+        return False
+    raise argparse.ArgumentTypeError(f"invalid boolean value: {v!r}")
+
+
 def parse_args(args):
     parser = argparse.ArgumentParser(
         description="merge lora weights and save model with hf format"
@@ -37,20 +49,28 @@ def parse_args(args):
     parser.add_argument(
         "--mask_config", default="./segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
     )
-    parser.add_argument("--use_mstva", default=False, type=bool)
+    parser.add_argument("--use_mstva", default=False, type=_str2bool)
     parser.add_argument("--mstva_align_dim", default=256, type=int)
-    parser.add_argument("--use_mstva_loss", default=False, type=bool)
+    parser.add_argument("--use_mstva_loss", default=False, type=_str2bool)
     parser.add_argument("--mstva_loss_weight", default=0.0, type=float)
     parser.add_argument("--mstva_scale_weights", default="0.5,0.3,0.2", type=str)
 
-    parser.add_argument("--use_text_film", default=False, type=bool)
+    parser.add_argument("--use_text_film", default=False, type=_str2bool)
     parser.add_argument("--text_film_init_std", default=1e-3, type=float)
     parser.add_argument("--text_film_branch_alpha", default=1.0, type=float)
     parser.add_argument("--text_film_visual_dim", default=512, type=int)
     parser.add_argument("--text_film_eval_mode", default="normal", type=str)
     parser.add_argument("--text_film_force_alpha", default=1.0, type=float)
 
-    parser.add_argument("--lora_enable", default=True, type=bool)
+    parser.add_argument("--use_decoder_attn_bias", default=False, type=_str2bool)
+    parser.add_argument("--decoder_attn_bias_dim", default=128, type=int)
+    parser.add_argument("--decoder_attn_bias_init_std", default=1e-3, type=float)
+    parser.add_argument("--decoder_attn_bias_max_abs", default=0.01, type=float)
+    parser.add_argument("--decoder_attn_bias_apply_layers", default="last3", type=str)
+    parser.add_argument("--decoder_attn_bias_eval_mode", default="normal", type=str)
+    parser.add_argument("--decoder_attn_bias_force_scale", default=1.0, type=float)
+
+    parser.add_argument("--lora_enable", default=True, type=_str2bool)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
@@ -124,6 +144,21 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     if hasattr(model_args, "mstva_pool_large_scale"):
         model.config.mstva_pool_large_scale = bool(getattr(model_args, "mstva_pool_large_scale"))
 
+    use_dac = bool(getattr(model_args, "use_decoder_attn_bias", False))
+    model.config.use_decoder_attn_bias = use_dac
+    model.config.decoder_attn_bias_dim = int(getattr(model_args, "decoder_attn_bias_dim", 128))
+    model.config.decoder_attn_bias_init_std = float(getattr(model_args, "decoder_attn_bias_init_std", 1e-3))
+    model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.01))
+    model.config.decoder_attn_bias_apply_layers = str(getattr(model_args, "decoder_attn_bias_apply_layers", "last3"))
+    model.config.decoder_attn_bias_eval_mode = str(getattr(model_args, "decoder_attn_bias_eval_mode", "normal"))
+    model.config.decoder_attn_bias_force_scale = float(getattr(model_args, "decoder_attn_bias_force_scale", 1.0))
+    if use_dac:
+        model.config.use_mstva = False
+        model.config.use_text_film = False
+        setattr(model_args, "use_mstva", False)
+        setattr(model_args, "use_text_film", False)
+        setattr(model_args, "use_mstva_loss", False)
+
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
     
@@ -133,6 +168,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     model.get_model().initialize_vision_modules(model_args)
     model.ensure_text_film_branch()
+    if hasattr(model, "ensure_decoder_attn_bias_branch"):
+        model.ensure_decoder_attn_bias_branch()
 
     vision_tower = model.get_model().get_vision_tower_mask()
 

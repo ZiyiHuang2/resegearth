@@ -56,6 +56,10 @@ class DataArguments:
     text_film_eval_mode: str = "normal"  # normal | bypass | force_alpha
     text_film_force_alpha: float = 1.0
 
+    # Decoder cross-attn token bias：eval 临时覆盖，不写回 checkpoint
+    decoder_attn_bias_eval_mode: str = "normal"  # normal | bypass | force_scale
+    decoder_attn_bias_force_scale: float = 1.0
+
 
 def init_distributed_mode(args):
     # 多卡机器上直接 `python eval.py` 时不会设置 RANK/WORLD_SIZE；若仅按 device_count>1
@@ -156,53 +160,65 @@ def evaluation():
         device="cuda",
     )
 
-    model.config.text_film_eval_mode = getattr(data_args, "text_film_eval_mode", "normal")
-    model.config.text_film_force_alpha = float(getattr(data_args, "text_film_force_alpha", 1.0))
+    orig_tf_mode = getattr(model.config, "text_film_eval_mode", "normal")
+    orig_tf_alpha = float(getattr(model.config, "text_film_force_alpha", 1.0))
+    orig_dac_mode = getattr(model.config, "decoder_attn_bias_eval_mode", "normal")
+    orig_dac_force = float(getattr(model.config, "decoder_attn_bias_force_scale", 1.0))
+    try:
+        model.config.text_film_eval_mode = getattr(data_args, "text_film_eval_mode", "normal")
+        model.config.text_film_force_alpha = float(getattr(data_args, "text_film_force_alpha", 1.0))
+        model.config.decoder_attn_bias_eval_mode = getattr(data_args, "decoder_attn_bias_eval_mode", "normal")
+        model.config.decoder_attn_bias_force_scale = float(getattr(data_args, "decoder_attn_bias_force_scale", 1.0))
 
-    device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
-    model.to(dtype=torch.float32, device=device)
+        device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
+        model.to(dtype=torch.float32, device=device)
 
-    data_args.is_multimodal = True
-    conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
+        data_args.is_multimodal = True
+        conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
 
-    clip_image_processor = SiglipImageProcessor.from_pretrained(data_args.vision_tower)
-    data_collator = DataCollatorForCOCODatasetV2(
-        tokenizer=tokenizer,
-        clip_image_processor=clip_image_processor,
-    )
-
-    save_folder = data_args.output_dir
-    os.makedirs(save_folder, exist_ok=True)
-
-    eval_sets = build_eval_datasets(data_args, tokenizer)
-
-    for split, eval_dataset in eval_sets:
-        if data_args.local_rank == 0:
-            print(f"[Eval] split={split}, dataset_len={len(eval_dataset)}")
-
-        if not data_args.distributed:
-            val_sampler = None
-        else:
-            val_sampler = torch.utils.data.distributed.DistributedSampler(
-                eval_dataset,
-                shuffle=False,
-                drop_last=False,
-            )
-
-        eval_dataloader = torch.utils.data.DataLoader(
-            eval_dataset,
-            batch_size=data_args.eval_batch_size,
-            shuffle=False,
-            num_workers=data_args.dataloader_num_workers,
-            pin_memory=False,
-            sampler=val_sampler,
-            collate_fn=data_collator,
+        clip_image_processor = SiglipImageProcessor.from_pretrained(data_args.vision_tower)
+        data_collator = DataCollatorForCOCODatasetV2(
+            tokenizer=tokenizer,
+            clip_image_processor=clip_image_processor,
         )
 
-        do_eval(model, eval_dataloader, save_folder, split, data_args, device)
+        save_folder = data_args.output_dir
+        os.makedirs(save_folder, exist_ok=True)
 
-    if data_args.local_rank == 0 and data_args.zip_results:
-        zip_folder(save_folder)
+        eval_sets = build_eval_datasets(data_args, tokenizer)
+
+        for split, eval_dataset in eval_sets:
+            if data_args.local_rank == 0:
+                print(f"[Eval] split={split}, dataset_len={len(eval_dataset)}")
+
+            if not data_args.distributed:
+                val_sampler = None
+            else:
+                val_sampler = torch.utils.data.distributed.DistributedSampler(
+                    eval_dataset,
+                    shuffle=False,
+                    drop_last=False,
+                )
+
+            eval_dataloader = torch.utils.data.DataLoader(
+                eval_dataset,
+                batch_size=data_args.eval_batch_size,
+                shuffle=False,
+                num_workers=data_args.dataloader_num_workers,
+                pin_memory=False,
+                sampler=val_sampler,
+                collate_fn=data_collator,
+            )
+
+            do_eval(model, eval_dataloader, save_folder, split, data_args, device)
+
+        if data_args.local_rank == 0 and data_args.zip_results:
+            zip_folder(save_folder)
+    finally:
+        model.config.text_film_eval_mode = orig_tf_mode
+        model.config.text_film_force_alpha = orig_tf_alpha
+        model.config.decoder_attn_bias_eval_mode = orig_dac_mode
+        model.config.decoder_attn_bias_force_scale = orig_dac_force
 
 
 def do_eval(model, eval_dataloader, save_folder, split, data_args, device):

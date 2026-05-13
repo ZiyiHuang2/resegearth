@@ -43,6 +43,11 @@ class ModelArguments:
     text_film_init_std: float = field(default=1e-3)
     text_film_branch_alpha: float = field(default=1.0)
     text_film_visual_dim: int = field(default=512)
+    use_decoder_attn_bias: bool = field(default=False)
+    decoder_attn_bias_dim: int = field(default=128)
+    decoder_attn_bias_init_std: float = field(default=1e-3)
+    decoder_attn_bias_max_abs: float = field(default=0.01)
+    decoder_attn_bias_apply_layers: str = field(default="last3")
     train_midstage_recalibration: bool = field(default=True)
     stage3_norm_only: bool = field(default=False)
 
@@ -377,6 +382,14 @@ def train():
     if model_args.use_text_film and model_args.use_mstva:
         print("[train] use_text_film=True: forcing use_mstva=False (mutually exclusive).")
         model_args.use_mstva = False
+    if getattr(model_args, "use_decoder_attn_bias", False):
+        if model_args.use_text_film:
+            print("[train] use_decoder_attn_bias=True: forcing use_text_film=False (mutually exclusive).")
+            model_args.use_text_film = False
+        if model_args.use_mstva or model_args.use_mstva_loss:
+            print("[train] use_decoder_attn_bias=True: forcing use_mstva=False and use_mstva_loss=False.")
+            model_args.use_mstva = False
+            model_args.use_mstva_loss = False
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
@@ -398,10 +411,6 @@ def train():
         **bnb_model_from_pretrained_args
                 )
 
-    if not model.is_train_mask_decode:
-        mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
-        model.initial_mask_module(mask2former_ckpt, model_args)
-
     model.config.use_cache = False
     model.config.use_attention_loss = model_args.use_attention_loss
     model.config.use_midstage_gate_loss = model_args.use_midstage_gate_loss
@@ -417,7 +426,21 @@ def train():
     model.config.text_film_visual_dim = model_args.text_film_visual_dim
     model.config.text_film_eval_mode = "normal"
     model.config.text_film_force_alpha = 1.0
+    model.config.use_decoder_attn_bias = bool(getattr(model_args, "use_decoder_attn_bias", False))
+    model.config.decoder_attn_bias_dim = int(getattr(model_args, "decoder_attn_bias_dim", 128))
+    model.config.decoder_attn_bias_init_std = float(getattr(model_args, "decoder_attn_bias_init_std", 1e-3))
+    model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.01))
+    model.config.decoder_attn_bias_apply_layers = str(getattr(model_args, "decoder_attn_bias_apply_layers", "last3"))
+    model.config.decoder_attn_bias_eval_mode = "normal"
+    model.config.decoder_attn_bias_force_scale = 1.0
+
+    if not model.is_train_mask_decode:
+        mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
+        model.initial_mask_module(mask2former_ckpt, model_args)
+
     model.ensure_text_film_branch()
+    if hasattr(model, "ensure_decoder_attn_bias_branch"):
+        model.ensure_decoder_attn_bias_branch()
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
