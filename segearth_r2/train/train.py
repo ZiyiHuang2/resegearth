@@ -76,6 +76,25 @@ class DataArguments:
         default=50,
         metadata={"help": "RRSIS-D only: max debug lines for debug_concept_match_strict."},
     )
+    concept_refaware_prior: bool = field(
+        default=False,
+        metadata={
+            "help": "RRSIS-D only: split matched library concepts into target (category match) vs reference; "
+            "inject full v2 JSON only for targets and exclusion_rule-only lines for references. "
+            "Incompatible with concept_match_strict."
+        },
+    )
+    debug_concept_refaware_prior: bool = field(
+        default=False,
+        metadata={
+            "help": "RRSIS-D only: when concept_refaware_prior is True, print ref/target split debug lines to stderr "
+            "(see debug_concept_refaware_prior_max_samples)."
+        },
+    )
+    debug_concept_refaware_prior_max_samples: int = field(
+        default=50,
+        metadata={"help": "RRSIS-D only: max debug lines for debug_concept_refaware_prior."},
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -264,6 +283,10 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if getattr(data_args, "concept_match_strict", False) and getattr(data_args, "concept_refaware_prior", False):
+        raise ValueError(
+            "concept_match_strict and concept_refaware_prior cannot both be True."
+        )
     _lr = getattr(training_args, "local_rank", -1)
     if _lr in (-1, 0) and getattr(data_args, "dataset_name", "").lower() == "rrsisd":
         if getattr(data_args, "concept_match_strict", False):
@@ -271,6 +294,12 @@ def train():
                 "[RRSISD] concept_match_strict=True "
                 f"debug={getattr(data_args, 'debug_concept_match_strict', False)} "
                 f"debug_max={getattr(data_args, 'debug_concept_match_strict_max_samples', 50)}"
+            )
+        if getattr(data_args, "concept_refaware_prior", False):
+            print(
+                "[RRSISD] concept_refaware_prior=True "
+                f"debug={getattr(data_args, 'debug_concept_refaware_prior', False)} "
+                f"debug_max={getattr(data_args, 'debug_concept_refaware_prior_max_samples', 50)}"
             )
     if training_args.seed is None:
         training_args.seed = 42

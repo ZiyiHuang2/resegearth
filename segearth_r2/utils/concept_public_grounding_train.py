@@ -67,6 +67,29 @@ def _concept_label_from_matched_row(row: Any) -> str:
     return ""
 
 
+def split_matched_concepts_target_and_reference(
+    matched_concepts: List[Any],
+    category_name: Optional[str],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """
+    Split retrieval rows by normalized GT category_name (same equality as filter_matched_concepts_by_category).
+
+    If category_name is empty / unknown, no row counts as target; all matched rows are references
+    (exclusion-only in ref-aware prior mode).
+    """
+    want = normalize_concept_name(category_name)
+    target_concepts: List[Dict[str, Any]] = []
+    reference_concepts: List[Dict[str, Any]] = []
+    for row in matched_concepts or []:
+        if not isinstance(row, dict):
+            continue
+        if want and normalize_concept_name(_concept_label_from_matched_row(row)) == want:
+            target_concepts.append(row)
+        else:
+            reference_concepts.append(row)
+    return target_concepts, reference_concepts
+
+
 def filter_matched_concepts_by_category(
     matched_concepts: List[Any],
     category_name: Optional[str],
@@ -96,6 +119,67 @@ def format_grounding_appendix(matched: List[Dict[str, Any]]) -> str:
         "do not recite or restate as model output targets):\n"
     )
     return header + json.dumps(matched, ensure_ascii=False, indent=2)
+
+
+def format_reference_exclusion_prior_section(reference_concepts: List[Dict[str, Any]]) -> str:
+    """
+    Minimal exclusion block for reference concepts only (no visual_evidence / mask_scope).
+    """
+    if not reference_concepts:
+        return ""
+    lines: List[str] = ["[Exclusion Prior]"]
+    for row in reference_concepts:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("concept") or "").strip()
+        if not name:
+            continue
+        rule = str(row.get("exclusion_rule") or "").strip()
+        if rule:
+            lines.append(f"- {name}: {rule}")
+        else:
+            lines.append(f"- {name}: Exclude {name}.")
+    if len(lines) <= 1:
+        return ""
+    return "\n".join(lines)
+
+
+def build_rrsisd_refaware_exclusion_only_human_value(
+    instruction: str,
+    concept_public_library_path: str,
+    category_name: Optional[str],
+    *,
+    matched_precalc: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """
+    public_semantic_v2 + ref-aware exclusion-only: target rows get full v2 JSON prior; other matched
+    rows contribute only exclusion_rule (or ``Exclude {{concept}}.`` when the library field is empty).
+    """
+    if matched_precalc is not None:
+        matched = list(matched_precalc)
+    else:
+        matched = retrieve_matched_public_grounding(instruction, concept_public_library_path)
+    target_concepts, reference_concepts = split_matched_concepts_target_and_reference(
+        matched, category_name
+    )
+    blocks: List[str] = []
+    if target_concepts:
+        tgt = format_grounding_appendix(target_concepts)
+        if tgt:
+            blocks.append(tgt.rstrip())
+    excl = format_reference_exclusion_prior_section(reference_concepts)
+    if excl:
+        blocks.append(excl)
+    appendix = "\n\n".join(blocks) if blocks else ""
+    parts: List[str] = [
+        "This is an image <|sep|> <|user|>\n",
+        "Please do Reasoning Segmentation according to the following expression.\n",
+        (instruction or "").strip() + "\n",
+    ]
+    if appendix:
+        parts.append(appendix + "\n")
+    parts.append("<|vision_bos|> <image> <|vision_eos|>\n<refer> <|assistant|>")
+    return "".join(parts)
 
 
 def build_rrsisd_supervised_human_value(

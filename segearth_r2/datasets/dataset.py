@@ -23,10 +23,13 @@ from fvcore.common.config import CfgNode
 import warnings
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
 from segearth_r2.utils.concept_public_grounding_train import (
+    build_rrsisd_refaware_exclusion_only_human_value,
     build_rrsisd_supervised_human_value,
     filter_matched_concepts_by_category,
     format_grounding_appendix,
+    format_reference_exclusion_prior_section,
     retrieve_matched_public_grounding,
+    split_matched_concepts_target_and_reference,
 )
 from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
@@ -238,6 +241,12 @@ class RRSISDDataset(RS_Base_Dataset):
         self._strict_debug_printed = 0
         self._strict_missing_category_count = 0
         self._strict_missing_category_printed = 0
+        self.concept_refaware_prior = bool(getattr(data_args, "concept_refaware_prior", False))
+        self.debug_concept_refaware_prior = bool(getattr(data_args, "debug_concept_refaware_prior", False))
+        self.debug_concept_refaware_prior_max_samples = int(
+            getattr(data_args, "debug_concept_refaware_prior_max_samples", 50) or 50
+        )
+        self._refaware_debug_printed = 0
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
 
         # 官方目录结构
@@ -393,6 +402,54 @@ class RRSISDDataset(RS_Base_Dataset):
             human_value = build_rrsisd_supervised_human_value(
                 instruction, lib, matched_precalc=matched_after
             )
+        elif lib and self.concept_refaware_prior:
+            matched_all = retrieve_matched_public_grounding(instruction, lib)
+            tgt_rows, ref_rows = split_matched_concepts_target_and_reference(
+                matched_all, str(category_name_str).strip() if category_name_str else None
+            )
+            human_value = build_rrsisd_refaware_exclusion_only_human_value(
+                instruction,
+                lib,
+                str(category_name_str).strip() if category_name_str else None,
+                matched_precalc=matched_all,
+            )
+            if self.debug_concept_refaware_prior and (
+                self._refaware_debug_printed < self.debug_concept_refaware_prior_max_samples
+            ):
+                mb_names = [
+                    str(r.get("concept")).strip()
+                    for r in matched_all
+                    if isinstance(r, dict) and str(r.get("concept") or "").strip()
+                ]
+                tn = [str(r.get("concept")).strip() for r in tgt_rows if isinstance(r, dict)]
+                rn = [str(r.get("concept")).strip() for r in ref_rows if isinstance(r, dict)]
+                low = (instruction or "").lower()
+                keyword_hit = any(
+                    w in low for w in ("ship", "harbor", "vehicle", "road", "overpass", " near ", " on ")
+                )
+                split_happened = bool(ref_rows) or (len(tn) != len(mb_names))
+                if split_happened or (not tn and mb_names) or keyword_hit:
+                    tgt_prev = format_grounding_appendix(tgt_rows).replace("\n", " ")[:500]
+                    ex_prev = format_reference_exclusion_prior_section(ref_rows).replace("\n", " ")[:500]
+                    appendix_full = []
+                    if tgt_rows:
+                        tblk = format_grounding_appendix(tgt_rows)
+                        if tblk:
+                            appendix_full.append(tblk.rstrip())
+                    exblk = format_reference_exclusion_prior_section(ref_rows)
+                    if exblk:
+                        appendix_full.append(exblk)
+                    final_prev = "\n\n".join(appendix_full).replace("\n", " ")[:600]
+                    print(
+                        "[RRSISD][debug_concept_refaware_prior] "
+                        f"ref_id={data_id} idx={idx} category_name={category_name_str!r} "
+                        f"expression={instruction[:200]!r} "
+                        f"matched_concepts={mb_names} target_concepts={tn} reference_concepts={rn} "
+                        f"target_prior_preview={tgt_prev!r} exclusion_prior_preview={ex_prev!r} "
+                        f"final_prior_preview={final_prev!r}",
+                        file=sys.stderr,
+                    )
+                    self._refaware_debug_printed += 1
         else:
             human_value = build_rrsisd_supervised_human_value(instruction, lib)
 
