@@ -211,16 +211,28 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
 
+    @staticmethod
+    def _decoder_attn_bias_log_value(value):
+        if isinstance(value, str):
+            return value
+        if hasattr(value, "item"):
+            return value.item()
+        return value
+
     def update_history_loss_dict(self,outputs):
         if not hasattr(self,'history_loss_dict'):
             self.history_loss_dict = {}
         for name, value in outputs.items():
             if ('loss' in name and name != 'loss') or name.startswith('text_film_') or name.startswith('decoder_attn_bias'):
+                log_v = self._decoder_attn_bias_log_value(value)
                 if name not in self.history_loss_dict:
-                    self.history_loss_dict[name] = value.item()
+                    self.history_loss_dict[name] = log_v
                 else:
-                    if value != 0:
-                        self.history_loss_dict[name] = value.item()
+                    if isinstance(log_v, str):
+                        if log_v:
+                            self.history_loss_dict[name] = log_v
+                    elif log_v != 0:
+                        self.history_loss_dict[name] = log_v
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -258,8 +270,13 @@ class LLaVATrainer(Trainer):
                 loss_dict = {}
                 for name,value in outputs.items():
                     if ('loss' in name and name != 'loss') or name.startswith('text_film_') or name.startswith('decoder_attn_bias'):
-                        loss_value = value.item()
-                        if loss_value == 0 and hasattr(self,'history_loss_dict'):
+                        loss_value = self._decoder_attn_bias_log_value(value)
+                        if (
+                            not isinstance(loss_value, str)
+                            and loss_value == 0
+                            and hasattr(self, 'history_loss_dict')
+                            and name in self.history_loss_dict
+                        ):
                             loss_value = self.history_loss_dict[name]
                         loss_dict[name] = loss_value
                 self.update_history_loss_dict(outputs)

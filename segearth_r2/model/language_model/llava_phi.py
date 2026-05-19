@@ -113,6 +113,16 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     decoder_attn_bias_max: Optional[torch.FloatTensor] = None
     decoder_attn_bias_min: Optional[torch.FloatTensor] = None
     decoder_attn_bias_enabled: Optional[torch.FloatTensor] = None
+    loss_decoder_attn_bias_rank: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_rank_loss_raw: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_inside_mean: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_outside_mean: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_inside_outside_gap: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_rank_fg_access_ratio: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_rank_bg_access_ratio: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_rank_valid_count: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_rank_num_layers: Optional[torch.FloatTensor] = None
+    decoder_attn_bias_rank_layer_indices: Optional[str] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -918,6 +928,107 @@ class SegEarthR2(MiphaPhiForCausalLM):
             gt = gt.unsqueeze(1)
         return gt
 
+    def _decoder_attn_bias_ranking_loss(
+        self,
+        bias_maps,
+        seg_info,
+        margin: float,
+        zero_base: torch.Tensor,
+    ) -> Tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """
+        逐层（如 last3）在 P_bias [B,H,W] 上：仅在 cross-attn hard mask 允许 attend 的 memory 格点上
+        比较 GT 前景/背景内 P 的均值；relu(margin - inside + outside)；最后对层平均。
+
+        inside/outside/gap 在 float32 下统计（日志用，已 detach）。
+
+        返回：loss_mean, fg_access, bg_access, valid_layer_count, inside_mean, outside_mean, gap_mean
+        """
+        z0 = zero_base * 0.0
+        if bias_maps is None or len(bias_maps) == 0 or seg_info is None:
+            return z0, z0, z0, z0, z0, z0, z0
+        ref = bias_maps[0]["P"]
+        gt = self._build_binary_gt_mask(seg_info=seg_info, ref_tensor=ref)
+        if gt is None:
+            return (ref * 0.0).sum(), z0, z0, z0, z0, z0, z0
+        B = ref.shape[0]
+        if gt.shape[0] != B:
+            return (ref * 0.0).sum(), z0, z0, z0, z0, z0, z0
+        m = float(margin)
+        layer_losses = []
+        fg_ratio_layers = []
+        bg_ratio_layers = []
+        inside_means = []
+        outside_means = []
+        gap_means = []
+        eps = 1e-6
+        for entry in bias_maps:
+            P = entry["P"]
+            H, W = int(entry["H"]), int(entry["W"])
+            if P.shape[0] != B or P.shape[1] != H or P.shape[2] != W:
+                continue
+            acc = entry.get("spatial_allowed", None)
+            if acc is None or acc.shape != P.shape:
+                if self.training:
+                    raise ValueError(
+                        "[DecoderAttnBiasRank] bias_maps entry missing spatial_allowed or shape mismatch "
+                        f"layer_idx={entry.get('layer_idx', '?')}: acc="
+                        f"{None if acc is None else tuple(acc.shape)} P={tuple(P.shape)}"
+                    )
+                acc = torch.ones(P.shape, device=P.device, dtype=torch.bool)
+            else:
+                acc = acc.to(device=P.device, dtype=torch.bool)
+            gt_s = F.interpolate(gt.float(), size=(H, W), mode="nearest")
+            fg = (gt_s > 0.5).squeeze(1)
+            if fg.sum() < eps:
+                continue
+            P32 = P.float()
+            fg32 = fg.float()
+            acc32 = acc.float()
+            fg_eff = fg32 * acc32
+            bg_eff = (1.0 - fg32) * acc32
+            denom_in = fg_eff.sum(dim=(1, 2)) + eps
+            denom_out = bg_eff.sum(dim=(1, 2)) + eps
+            inside = (P32 * fg_eff).sum(dim=(1, 2)) / denom_in
+            outside = (P32 * bg_eff).sum(dim=(1, 2)) / denom_out
+            gap = inside - outside
+            per_sample = F.relu(torch.tensor(m, device=gap.device, dtype=gap.dtype) - gap)
+            valid = (fg_eff.sum(dim=(1, 2)) > eps) & (bg_eff.sum(dim=(1, 2)) > eps)
+            if not valid.any():
+                continue
+            layer_losses.append(per_sample[valid].mean())
+            inside_means.append(inside[valid].mean().detach())
+            outside_means.append(outside[valid].mean().detach())
+            gap_means.append(gap[valid].mean().detach())
+            with torch.no_grad():
+                fg_ratio_layers.append((fg_eff.sum() / (fg32.sum() + eps)).detach())
+                bg_ratio_layers.append((bg_eff.sum() / ((1.0 - fg32).sum() + eps)).detach())
+        if not layer_losses:
+            return (ref * 0.0).sum(), z0, z0, z0, z0, z0, z0
+        loss_mean = sum(layer_losses) / float(len(layer_losses))
+        fg_r = torch.stack(fg_ratio_layers).mean() if fg_ratio_layers else z0
+        bg_r = torch.stack(bg_ratio_layers).mean() if bg_ratio_layers else z0
+        vn = ref.new_tensor(float(len(layer_losses)))
+        in_m = torch.stack(inside_means).mean() if inside_means else z0
+        out_m = torch.stack(outside_means).mean() if outside_means else z0
+        gap_m = torch.stack(gap_means).mean() if gap_means else z0
+        return (
+            loss_mean,
+            fg_r.to(dtype=loss_mean.dtype, device=loss_mean.device),
+            bg_r.to(dtype=loss_mean.dtype, device=loss_mean.device),
+            vn,
+            in_m.to(dtype=torch.float32, device=loss_mean.device),
+            out_m.to(dtype=torch.float32, device=loss_mean.device),
+            gap_m.to(dtype=torch.float32, device=loss_mean.device),
+        )
+
     def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
         assert len(image_token_indices) == 1, 'not supporting multi image index'
@@ -1460,6 +1571,48 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 if alpha5_item is not None:
                     mstva_alpha5 = alpha5_item.detach().float().view(-1)[0].to(zero_base.device)
 
+        loss_dac_rank_weighted = torch.zeros_like(zero_base)
+        dac_rank_lr_raw = torch.zeros_like(zero_base)
+        dac_rank_fg_acc = torch.zeros_like(zero_base)
+        dac_rank_bg_acc = torch.zeros_like(zero_base)
+        dac_rank_valid = torch.zeros_like(zero_base)
+        dac_rank_num_layers = torch.zeros_like(zero_base)
+        dac_rank_inside = torch.zeros_like(zero_base)
+        dac_rank_outside = torch.zeros_like(zero_base)
+        dac_rank_gap = torch.zeros_like(zero_base)
+        dac_rank_layer_indices_str = ""
+        use_dac_rank = (
+            bool(getattr(self.config, "use_decoder_attn_bias_rank_loss", False))
+            and bool(getattr(self.config, "use_decoder_attn_bias", False))
+            and self.training
+        )
+        dac_rank_w = float(getattr(self.config, "decoder_attn_bias_rank_loss_weight", 0.001))
+        dac_rank_margin = float(getattr(self.config, "decoder_attn_bias_rank_margin", 0.1))
+        bias_maps = getattr(self.predictor, "_last_decoder_attn_bias_maps_for_rank", None)
+        if bias_maps:
+            dac_rank_num_layers = zero_base + float(len(bias_maps))
+            dac_rank_layer_indices_str = ",".join(str(int(x["layer_idx"])) for x in bias_maps)
+        if use_dac_rank and dac_rank_w > 0.0 and seg_info is not None:
+            lr, dac_rank_fg_acc, dac_rank_bg_acc, dac_rank_valid, dac_rank_inside, dac_rank_outside, dac_rank_gap = (
+                self._decoder_attn_bias_ranking_loss(bias_maps, seg_info, dac_rank_margin, zero_base)
+            )
+            dac_rank_lr_raw = lr.detach().float().to(zero_base.device)
+            dac_rank_inside = zero_base + dac_rank_inside.detach().float().to(zero_base.device)
+            dac_rank_outside = zero_base + dac_rank_outside.detach().float().to(zero_base.device)
+            dac_rank_gap = zero_base + dac_rank_gap.detach().float().to(zero_base.device)
+            loss_dac_rank_weighted = dac_rank_w * lr
+            if not torch.isfinite(lr).all() or not torch.isfinite(loss_dac_rank_weighted).all():
+                raise ValueError("[DecoderAttnBiasRank] non-finite ranking loss (NaN/Inf).")
+            if not getattr(self, "_decoder_attn_bias_rank_meta_logged", False):
+                if bias_maps and len(bias_maps) > 0 and float(dac_rank_valid.detach().item()) > 0.0:
+                    print(
+                        f"[DecoderAttnBiasRank] rank_num_layers={len(bias_maps)} "
+                        f"layer_indices={dac_rank_layer_indices_str} "
+                        f"decoder_attn_bias_rank_valid_count={float(dac_rank_valid.detach().item())}",
+                        flush=True,
+                    )
+                    self._decoder_attn_bias_rank_meta_logged = True
+
         loss = llm_loss + mask_loss
         if use_attention_loss:
             loss = loss + 0.01 * loss_attention
@@ -1467,6 +1620,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss = loss + midstage_gate_loss_weight * loss_midstage_gate
         if use_mstva_loss and mstva_loss_weight > 0:
             loss = loss + mstva_loss_weight * loss_mstva_align
+        loss = loss + loss_dac_rank_weighted
 
         text_film_gamma_norm = torch.zeros_like(zero_base)
         text_film_beta_norm = torch.zeros_like(zero_base)
@@ -1518,6 +1672,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
             decoder_attn_bias_max=dac_max.detach(),
             decoder_attn_bias_min=dac_min.detach(),
             decoder_attn_bias_enabled=dac_enabled.detach(),
+            loss_decoder_attn_bias_rank=loss_dac_rank_weighted.detach(),
+            decoder_attn_bias_rank_loss_raw=dac_rank_lr_raw.detach(),
+            decoder_attn_bias_inside_mean=dac_rank_inside.detach(),
+            decoder_attn_bias_outside_mean=dac_rank_outside.detach(),
+            decoder_attn_bias_inside_outside_gap=dac_rank_gap.detach(),
+            decoder_attn_bias_rank_fg_access_ratio=dac_rank_fg_acc.detach(),
+            decoder_attn_bias_rank_bg_access_ratio=dac_rank_bg_acc.detach(),
+            decoder_attn_bias_rank_valid_count=dac_rank_valid.detach(),
+            decoder_attn_bias_rank_num_layers=dac_rank_num_layers.detach(),
+            decoder_attn_bias_rank_layer_indices=dac_rank_layer_indices_str,
         )
     
     def eval_seg(

@@ -80,6 +80,12 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.config.decoder_attn_bias_eval_mode = "normal"
     if not hasattr(model.config, "decoder_attn_bias_force_scale"):
         model.config.decoder_attn_bias_force_scale = 1.0
+    if not hasattr(model.config, "use_decoder_attn_bias_rank_loss"):
+        model.config.use_decoder_attn_bias_rank_loss = False
+    if not hasattr(model.config, "decoder_attn_bias_rank_margin"):
+        model.config.decoder_attn_bias_rank_margin = 0.1
+    if not hasattr(model.config, "decoder_attn_bias_rank_loss_weight"):
+        model.config.decoder_attn_bias_rank_loss_weight = 0.001
 
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)

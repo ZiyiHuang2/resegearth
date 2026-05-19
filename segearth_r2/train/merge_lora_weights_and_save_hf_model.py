@@ -69,6 +69,9 @@ def parse_args(args):
     parser.add_argument("--decoder_attn_bias_apply_layers", default="last3", type=str)
     parser.add_argument("--decoder_attn_bias_eval_mode", default="normal", type=str)
     parser.add_argument("--decoder_attn_bias_force_scale", default=1.0, type=float)
+    parser.add_argument("--use_decoder_attn_bias_rank_loss", default=False, type=_str2bool)
+    parser.add_argument("--decoder_attn_bias_rank_margin", default=0.1, type=float)
+    parser.add_argument("--decoder_attn_bias_rank_loss_weight", default=0.001, type=float)
 
     parser.add_argument("--lora_enable", default=True, type=_str2bool)
     parser.add_argument("--lora_r", default=8, type=int)
@@ -152,6 +155,9 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     model.config.decoder_attn_bias_apply_layers = str(getattr(model_args, "decoder_attn_bias_apply_layers", "last3"))
     model.config.decoder_attn_bias_eval_mode = str(getattr(model_args, "decoder_attn_bias_eval_mode", "normal"))
     model.config.decoder_attn_bias_force_scale = float(getattr(model_args, "decoder_attn_bias_force_scale", 1.0))
+    model.config.use_decoder_attn_bias_rank_loss = bool(getattr(model_args, "use_decoder_attn_bias_rank_loss", False))
+    model.config.decoder_attn_bias_rank_margin = float(getattr(model_args, "decoder_attn_bias_rank_margin", 0.1))
+    model.config.decoder_attn_bias_rank_loss_weight = float(getattr(model_args, "decoder_attn_bias_rank_loss_weight", 0.001))
     if use_dac:
         model.config.use_mstva = False
         model.config.use_text_film = False

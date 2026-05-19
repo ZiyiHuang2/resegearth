@@ -48,6 +48,9 @@ class ModelArguments:
     decoder_attn_bias_init_std: float = field(default=1e-3)
     decoder_attn_bias_max_abs: float = field(default=0.01)
     decoder_attn_bias_apply_layers: str = field(default="last3")
+    use_decoder_attn_bias_rank_loss: bool = field(default=False)
+    decoder_attn_bias_rank_margin: float = field(default=0.1)
+    decoder_attn_bias_rank_loss_weight: float = field(default=0.001)
     train_midstage_recalibration: bool = field(default=True)
     stage3_norm_only: bool = field(default=False)
 
@@ -433,6 +436,17 @@ def train():
     model.config.decoder_attn_bias_apply_layers = str(getattr(model_args, "decoder_attn_bias_apply_layers", "last3"))
     model.config.decoder_attn_bias_eval_mode = "normal"
     model.config.decoder_attn_bias_force_scale = 1.0
+    # Ranking：CLI / ModelArguments 唯一真源，强制覆盖旧 checkpoint config.json（例如 0.1）
+    model.config.use_decoder_attn_bias_rank_loss = bool(model_args.use_decoder_attn_bias_rank_loss)
+    model.config.decoder_attn_bias_rank_margin = float(model_args.decoder_attn_bias_rank_margin)
+    model.config.decoder_attn_bias_rank_loss_weight = float(model_args.decoder_attn_bias_rank_loss_weight)
+    assert float(model.config.decoder_attn_bias_rank_loss_weight) == float(
+        model_args.decoder_attn_bias_rank_loss_weight
+    ), (
+        "decoder_attn_bias_rank_loss_weight: model.config vs model_args mismatch after CLI override."
+    )
+    assert float(model.config.decoder_attn_bias_rank_margin) == float(model_args.decoder_attn_bias_rank_margin)
+    assert bool(model.config.use_decoder_attn_bias_rank_loss) == bool(model_args.use_decoder_attn_bias_rank_loss)
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None

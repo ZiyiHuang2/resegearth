@@ -239,6 +239,9 @@ class MLP(nn.Module):
         return x
 
 
+_DECODER_ATTN_BIAS_DEBUG_PRINTED = False
+
+
 class DecoderTokenAttnBias(nn.Module):
     """Token-level text-guided soft bias for decoder cross-attention (additive on attention logits)."""
 
@@ -310,13 +313,14 @@ class DecoderTokenAttnBias(nn.Module):
                 f"decoder_attn_bias_max_abs={ma} is too large for fp16 hard-mask safety in this PoC; "
                 "use <=0.01 or run bias path in bf32/fp32."
             )
-        if eval_mode == "bypass":
+        em = str(eval_mode if eval_mode is not None else "normal").strip().lower()
+        if em not in ("normal", "bypass", "force_scale"):
+            em = "normal"
+        if em == "bypass":
             P = torch.zeros_like(P)
-        elif eval_mode == "force_scale":
+        elif em == "force_scale":
             fs = float(force_scale)
             P = P * torch.tensor(fs, device=P.device, dtype=P.dtype)
-        elif eval_mode != "normal":
-            pass
         bias = P[:, None, :].expand(B, num_queries, S).contiguous()
         bias = bias[:, None, :, :].expand(B, num_heads, num_queries, S).contiguous()
         attn_bias = bias.reshape(B * num_heads, num_queries, S)
@@ -326,7 +330,23 @@ class DecoderTokenAttnBias(nn.Module):
             "decoder_attn_bias_max": P.detach().max(),
             "decoder_attn_bias_min": P.detach().min(),
             "decoder_attn_bias_enabled": memory.new_tensor(1.0),
+            # [B, S] 未 expand 到 head/query；供 last3 等多层 ranking loss（每层单独一条，勿只取 last）
+            "P_bias_flat": P,
         }
+        global _DECODER_ATTN_BIAS_DEBUG_PRINTED
+        if not _DECODER_ATTN_BIAS_DEBUG_PRINTED:
+            _DECODER_ATTN_BIAS_DEBUG_PRINTED = True
+            p_mean = float(P.detach().abs().mean().item())
+            p_max = float(P.detach().max().item())
+            p_min = float(P.detach().min().item())
+            ab_mean = float(attn_bias.detach().abs().mean().item())
+            print(
+                "[DEBUG][DecoderAttnBias] "
+                f"eval_mode={eval_mode!r} em={em!r} force_scale={float(force_scale):.6g} "
+                f"P_abs_mean={p_mean:.6g} P_max={p_max:.6g} P_min={p_min:.6g} "
+                f"attn_bias_abs_mean={ab_mean:.6g}",
+                flush=True,
+            )
         return attn_bias, stats
 
 
@@ -719,6 +739,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         dac_mod = getattr(self, "decoder_token_attn_bias", None)
         dac_stats_accum = []
         self._last_decoder_attn_bias_log = None
+        # 每次前向清空：收集所有启用 bias 的层的 P 与空间尺寸，供 ranking loss 逐层监督（勿只存最后一层）
+        self._last_decoder_attn_bias_maps_for_rank = []
         if dac_mod is not None and self.decoder_attn_bias_apply_layers:
             if text_tokens is None or text_mask is None:
                 if not self._warn_decoder_attn_bias_no_tokens:
@@ -739,6 +761,24 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 and text_tokens is not None
                 and text_mask is not None
             ):
+                # 与即将进入的 cross-attn 使用同一 memory_mask：True=禁止 attend。
+                # ranking loss 只应在「至少一个 query 仍可 attend」的 memory 位置上统计 P_bias。
+                nh = self.num_heads
+                hl, wl = size_list[level_index]
+                Ssz = hl * wl
+                Qn = attn_mask.shape[1]
+                spatial_allowed_flat = None
+                if (
+                    attn_mask.dim() == 3
+                    and nh > 0
+                    and attn_mask.shape[0] % nh == 0
+                    and attn_mask.shape[2] == Ssz
+                ):
+                    B_attn = attn_mask.shape[0] // nh
+                    am = attn_mask.view(B_attn, nh, Qn, Ssz)
+                    # PyTorch <2.0: Tensor.any() does not accept dim as a tuple.
+                    spatial_allowed_flat = (~am).any(dim=1).any(dim=1)
+
                 attn_bias_t, st = dac_mod(
                     src[level_index],
                     text_tokens,
@@ -748,6 +788,60 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                     eval_mode=str(dac_eval_mode),
                     force_scale=float(dac_force_scale),
                 )
+                P_flat = st.pop("P_bias_flat", None) if isinstance(st, dict) else None
+                if P_flat is not None:
+                    if P_flat.dim() != 2 or P_flat.shape[1] != Ssz:
+                        msg = (
+                            f"[DecoderAttnBiasRank] P_flat shape {tuple(P_flat.shape)} invalid for "
+                            f"layer={i} expected (*,{Ssz}). Fallback to all-accessible is FORBIDDEN during training."
+                        )
+                        if self.training:
+                            raise ValueError(msg)
+                        print("[WARNING]" + msg + " Skip rank map append in eval.", flush=True)
+                    else:
+                        if spatial_allowed_flat is None:
+                            msg = (
+                                f"[DecoderAttnBiasRank] cannot derive spatial_allowed from attn_mask "
+                                f"shape={tuple(attn_mask.shape)} nh={nh} Ssz={Ssz} for P_flat={tuple(P_flat.shape)} "
+                                f"layer={i}. Fallback to all-accessible is FORBIDDEN during training."
+                            )
+                            if self.training:
+                                raise ValueError(msg)
+                            print(
+                                "[WARNING]" + msg + " Use all-accessible fallback only in eval.",
+                                flush=True,
+                            )
+                            spatial_allowed_flat = torch.ones(
+                                P_flat.shape, device=P_flat.device, dtype=torch.bool
+                            )
+                        elif spatial_allowed_flat.shape != P_flat.shape:
+                            msg = (
+                                f"[DecoderAttnBiasRank] spatial_allowed_flat shape {tuple(spatial_allowed_flat.shape)} "
+                                f"mismatch P_flat {tuple(P_flat.shape)} at layer {i}. "
+                                f"attn_mask shape {tuple(attn_mask.shape)}. "
+                                f"Fallback to all-accessible is FORBIDDEN during training."
+                            )
+                            if self.training:
+                                raise ValueError(msg)
+                            print(
+                                "[WARNING]" + msg + " Use all-accessible fallback only in eval.",
+                                flush=True,
+                            )
+                            spatial_allowed_flat = torch.ones(
+                                P_flat.shape, device=P_flat.device, dtype=torch.bool
+                            )
+                        spatial_allowed_hw = spatial_allowed_flat.view(P_flat.shape[0], hl, wl).detach()
+                        P_store = P_flat if self.training else P_flat.detach()
+                        P_map = P_store.view(P_flat.shape[0], hl, wl)
+                        self._last_decoder_attn_bias_maps_for_rank.append(
+                            {
+                                "P": P_map,
+                                "H": hl,
+                                "W": wl,
+                                "layer_idx": i,
+                                "spatial_allowed": spatial_allowed_hw,
+                            }
+                        )
                 if attn_bias_t is not None:
                     assert attn_bias_t.shape == attn_mask.shape, (
                         f"attn_bias shape {tuple(attn_bias_t.shape)} != attn_mask shape {tuple(attn_mask.shape)}"
