@@ -1,96 +1,67 @@
 #!/usr/bin/env bash
-# 仅训练 public_semantic_v2（--concept_public_semantic_library），不含 baseline_raw。
+# 7w：public_semantic_v2 + --concept_match_strict；流程与 run_train_baseline_raw_vs_public_semantic_v2_7w.sh 中 public v2 段一致：
+# train → best checkpoint → merge LoRA → eval → eval metrics。
+# 依赖：conda run -n reseg bash 本脚本（或已激活 reseg 且含 deepspeed / transformers）
 set -euo pipefail
 
-########################################
-# Environment
-########################################
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export WANDB_PROJECT="${WANDB_PROJECT:-segearth-source}"
 export WANDB_INIT_TIMEOUT=300
 unset CUDA_VISIBLE_DEVICES
 
-GPU_SLOT="${GPU_SLOT:-localhost:2}"
-GPU_ID="${GPU_ID:-2}"
+GPU_SLOT="${GPU_SLOT:-localhost:1}"
+GPU_ID="${GPU_ID:-1}"
+MASTER_PORT="${MASTER_PORT:-29111}"
 
-MASTER_PORT="${MASTER_PORT:-29500}"
-
-########################################
-# Project dir
-########################################
 REPO_DIR="/home/wangchengjun/huangziyi/reseg/resegearth+source"
 RESEG_ROOT="/home/wangchengjun/huangziyi/reseg"
 cd "${REPO_DIR}"
 
-########################################
-# Common paths
-########################################
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-/home/wangchengjun/huangziyi/reseg/output/bseg/baseline_standard-base_5w/merged_model}"
-
 VISION_TOWER="${VISION_TOWER:-/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip2-so400m-patch14-384}"
 VISION_TOWER_MASK="${VISION_TOWER_MASK:-/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl}"
 MASK_CONFIG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml}"
 
-########################################
-# Dataset config
-########################################
 BASE_DATA_PATH="${BASE_DATA_PATH:-/home/wangchengjun/huangziyi/data/RRSISD}"
 DATASET_NAME="rrsisd"
 TEST_SPLIT="test"
-
 CONCEPT_PUBLIC_SEMANTIC_LIBRARY="${CONCEPT_PUBLIC_SEMANTIC_LIBRARY:-configs/concept_public_semantic_library_v2.json}"
 
-########################################
-# Train config
-########################################
-MAX_STEPS="${MAX_STEPS:-280000}"
-PER_DEVICE_TRAIN_BATCH_SIZE="1"
-GRADIENT_ACCUMULATION_STEPS="1"
-
-SAVE_STEPS="2000"
-SAVE_TOTAL_LIMIT="2"
-
-LEARNING_RATE="1e-4"
-WEIGHT_DECAY="0.0"
-WARMUP_RATIO="0.03"
-LR_SCHEDULER_TYPE="cosine"
-
-LOGGING_STEPS="10"
-
-BF16="True"
-TF32="False"
-
-MODEL_MAX_LENGTH="2048"
-GRADIENT_CHECKPOINTING="False"
-DATALOADER_NUM_WORKERS="4"
-
-LORA_R="8"
-LORA_ALPHA="16"
-LORA_DROPOUT="0.05"
-
-DATA_RATIO="1"
-SWITCH_BS="4"
-
-SEED="42"
-DATA_SEED="42"
-
-########################################
-# Output（public_semantic_v2）
-########################################
-PUBLIC_OUTPUT_DIR="${PUBLIC_OUTPUT_DIR:-${RESEG_ROOT}/output/source/rrsisd_public_semantic_v2_28w}"
-PUBLIC_MERGED_DIR="${PUBLIC_OUTPUT_DIR}/merged_model"
-PUBLIC_TEST_OUTPUT_DIR="${PUBLIC_OUTPUT_DIR}/test_results"
-
-########################################
-# Eval metrics config (auto upload)
-########################################
 EVAL_METRICS_SCRIPT="${EVAL_METRICS_SCRIPT:-${RESEG_ROOT}/eval_val_metrics.py}"
 EVAL_USE_WANDB="${EVAL_USE_WANDB:-True}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-source-val}"
 
+MAX_STEPS="${MAX_STEPS:-280000}"
+PER_DEVICE_TRAIN_BATCH_SIZE="1"
+GRADIENT_ACCUMULATION_STEPS="1"
+SAVE_STEPS="2000"
+SAVE_TOTAL_LIMIT="2"
+LEARNING_RATE="1e-4"
+WEIGHT_DECAY="0.0"
+WARMUP_RATIO="0.03"
+LR_SCHEDULER_TYPE="cosine"
+LOGGING_STEPS="10"
+BF16="True"
+TF32="False"
+MODEL_MAX_LENGTH="2048"
+GRADIENT_CHECKPOINTING="False"
+DATALOADER_NUM_WORKERS="4"
+LORA_R="8"
+LORA_ALPHA="16"
+LORA_DROPOUT="0.05"
+DATA_RATIO="1"
+SWITCH_BS="4"
+SEED="42"
+DATA_SEED="42"
+
+OUTPUT_DIR="${OUTPUT_DIR:-${RESEG_ROOT}/output/source/rrsisd_public_semantic_v2_match_strict_28w}"
+MERGED_DIR="${OUTPUT_DIR}/merged_model"
+TEST_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
+export WANDB_NAME="match_strict_28w"
+
 ########################################
-# Helpers
+# Helpers（与 run_train_baseline_raw_vs_public_semantic_v2_7w.sh 一致）
 ########################################
 read_best_checkpoint () {
   local out_dir="$1"
@@ -198,69 +169,17 @@ run_eval_metrics () {
 ########################################
 # Preflight
 ########################################
-echo "========================================"
-echo "[0/6] Preflight checks"
-echo "========================================"
+echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] MERGED_DIR=${MERGED_DIR}"
+echo "[INFO] TEST_OUTPUT_DIR=${TEST_OUTPUT_DIR}"
 
-echo "[INFO] REPO_DIR=${REPO_DIR}"
-echo "[INFO] MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}"
-echo "[INFO] VISION_TOWER=${VISION_TOWER}"
-echo "[INFO] VISION_TOWER_MASK=${VISION_TOWER_MASK}"
-echo "[INFO] MASK_CONFIG=${MASK_CONFIG}"
-echo "[INFO] BASE_DATA_PATH=${BASE_DATA_PATH}"
-echo "[INFO] PUBLIC_OUTPUT_DIR=${PUBLIC_OUTPUT_DIR}"
-echo "[INFO] CONCEPT_PUBLIC_SEMANTIC_LIBRARY=${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}"
-echo "[INFO] GPU_SLOT=${GPU_SLOT}"
-echo "[INFO] MAX_STEPS=${MAX_STEPS}"
-echo "[INFO] LEARNING_RATE=${LEARNING_RATE}"
+if ! python segearth_r2/train/train.py --help 2>&1 | grep -q "concept_match_strict"; then
+  echo "[ERROR] train.py --help 未包含 concept_match_strict，请在正确 conda 环境中运行。"
+  exit 1
+fi
 
 if [[ ! -d "${MODEL_NAME_OR_PATH}" ]]; then
   echo "[ERROR] model path not found: ${MODEL_NAME_OR_PATH}"
-  exit 1
-fi
-
-if [[ ! -d "${VISION_TOWER}" ]]; then
-  echo "[ERROR] vision tower not found: ${VISION_TOWER}"
-  exit 1
-fi
-
-if [[ ! -f "${VISION_TOWER_MASK}" ]]; then
-  echo "[ERROR] vision tower mask not found: ${VISION_TOWER_MASK}"
-  exit 1
-fi
-
-if [[ ! -f "${MASK_CONFIG}" ]]; then
-  echo "[ERROR] mask config not found: ${MASK_CONFIG}"
-  exit 1
-fi
-
-if [[ ! -f "${BASE_DATA_PATH}/rrsisd/refs(unc).p" ]]; then
-  echo "[ERROR] refs file not found: ${BASE_DATA_PATH}/rrsisd/refs(unc).p"
-  exit 1
-fi
-
-if [[ ! -f "${BASE_DATA_PATH}/rrsisd/instances.json" ]]; then
-  echo "[ERROR] instances file not found: ${BASE_DATA_PATH}/rrsisd/instances.json"
-  exit 1
-fi
-
-if [[ ! -d "${BASE_DATA_PATH}/images" ]]; then
-  echo "[ERROR] images dir not found: ${BASE_DATA_PATH}/images"
-  exit 1
-fi
-
-if [[ "${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}" == /* ]]; then
-  CONCEPT_ABS="${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}"
-else
-  CONCEPT_ABS="${REPO_DIR}/${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}"
-fi
-if [[ ! -f "${CONCEPT_ABS}" ]]; then
-  echo "[ERROR] concept library not found: ${CONCEPT_ABS}"
-  exit 1
-fi
-
-if [[ ! -f "scripts/zero1.json" ]]; then
-  echo "[ERROR] DeepSpeed config not found: ${REPO_DIR}/scripts/zero1.json"
   exit 1
 fi
 
@@ -269,28 +188,23 @@ if [[ ! -f "${EVAL_METRICS_SCRIPT}" ]]; then
   exit 1
 fi
 
-if ! python segearth_r2/train/train.py --help 2>&1 | grep -q "concept_public_semantic_library"; then
-  echo "[ERROR] train.py --help 未包含 concept_public_semantic_library（请在 reseg 环境下运行：conda run -n reseg bash 本脚本）"
+CONCEPT_ABS="${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}"
+if [[ ! "${CONCEPT_ABS}" = /* ]]; then
+  CONCEPT_ABS="${REPO_DIR}/${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}"
+fi
+if [[ ! -f "${CONCEPT_ABS}" ]]; then
+  echo "[ERROR] concept library not found: ${CONCEPT_ABS}"
   exit 1
 fi
 
-if python segearth_r2/train/train.py --help 2>&1 | grep -qE '(^|[[:space:]])--use_mstva([[:space:]]|=|$)'; then
-  echo "[ERROR] train.py --help 不应暴露 MSTVA 开关（source 仓库）"
-  exit 1
-fi
-
-mkdir -p "${PUBLIC_OUTPUT_DIR}"
-
-echo "[OK] preflight passed"
+mkdir -p "${OUTPUT_DIR}"
 
 ########################################
-# rrsisd_public_semantic_v2（多 --concept_public_semantic_library）
+# [1/6] Train
 ########################################
 echo "========================================"
-echo "[1/6] Training public_semantic_v2 (+ concept library)"
+echo "[1/6] Training rrsisd_public_semantic_v2_match_strict_7w"
 echo "========================================"
-
-export WANDB_NAME="rrsisd_public_semantic_v2_28w"
 
 deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/train/train.py \
   --model_name_or_path "${MODEL_NAME_OR_PATH}" \
@@ -298,7 +212,7 @@ deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/tra
   --vision_tower_mask "${VISION_TOWER_MASK}" \
   --base_data_path "${BASE_DATA_PATH}" \
   --dataset_name "${DATASET_NAME}" \
-  --output_dir "${PUBLIC_OUTPUT_DIR}" \
+  --output_dir "${OUTPUT_DIR}" \
   --max_steps "${MAX_STEPS}" \
   --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}" \
   --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}" \
@@ -325,54 +239,70 @@ deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/tra
   --seed "${SEED}" \
   --data_seed "${DATA_SEED}" \
   --report_to wandb \
-  --concept_public_semantic_library "${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}"
+  --concept_public_semantic_library "${CONCEPT_PUBLIC_SEMANTIC_LIBRARY}" \
+  --concept_match_strict True
 
+########################################
+# [2/6] Best checkpoint
+########################################
 echo "========================================"
-echo "[2/6] Select checkpoint (public_semantic_v2)"
+echo "[2/6] Select checkpoint (match_strict)"
 echo "========================================"
 
-PUBLIC_BEST_CHECKPOINT=$(read_best_checkpoint "${PUBLIC_OUTPUT_DIR}")
+BEST_CHECKPOINT=$(read_best_checkpoint "${OUTPUT_DIR}")
 
-if [[ -z "${PUBLIC_BEST_CHECKPOINT}" ]]; then
+if [[ -z "${BEST_CHECKPOINT}" ]]; then
   echo "[WARN] best_model_checkpoint not found; fallback to last checkpoint"
-  PUBLIC_BEST_CHECKPOINT=$(read_last_checkpoint "${PUBLIC_OUTPUT_DIR}")
+  BEST_CHECKPOINT=$(read_last_checkpoint "${OUTPUT_DIR}")
 fi
 
-if [[ -z "${PUBLIC_BEST_CHECKPOINT}" ]]; then
-  echo "[ERROR] no checkpoint found under ${PUBLIC_OUTPUT_DIR}"
+if [[ -z "${BEST_CHECKPOINT}" ]]; then
+  echo "[ERROR] no checkpoint found under ${OUTPUT_DIR}"
   exit 1
 fi
 
-echo "[OK] PUBLIC_CHECKPOINT=${PUBLIC_BEST_CHECKPOINT}"
+echo "[OK] BEST_CHECKPOINT=${BEST_CHECKPOINT}"
 
+########################################
+# [3/6] Merge
+########################################
 echo "========================================"
-echo "[3/6] Merge public_semantic_v2"
-echo "========================================"
-
-merge_ckpt "${PUBLIC_BEST_CHECKPOINT}" "${PUBLIC_MERGED_DIR}"
-
-echo "========================================"
-echo "[4/6] Check merged config (public_semantic_v2)"
+echo "[3/6] Merge LoRA → merged_model"
 echo "========================================"
 
-if [[ ! -f "${PUBLIC_MERGED_DIR}/config.json" ]]; then
-  echo "[ERROR] merged config.json not found: ${PUBLIC_MERGED_DIR}/config.json"
+merge_ckpt "${BEST_CHECKPOINT}" "${MERGED_DIR}"
+
+########################################
+# [4/6] Check merged
+########################################
+echo "========================================"
+echo "[4/6] Check merged config"
+echo "========================================"
+
+if [[ ! -f "${MERGED_DIR}/config.json" ]]; then
+  echo "[ERROR] merged config.json not found: ${MERGED_DIR}/config.json"
   exit 1
 fi
 
 echo "[OK] merged config.json present"
 
+########################################
+# [5/6] Eval + metrics
+########################################
 echo "========================================"
-echo "[5/6] Eval + metrics (public_semantic_v2)"
+echo "[5/6] Eval + metrics (test)"
 echo "========================================"
 
-eval_model "${PUBLIC_MERGED_DIR}" "${PUBLIC_TEST_OUTPUT_DIR}"
-run_eval_metrics "${PUBLIC_TEST_OUTPUT_DIR}" "rrsisd_public_semantic_v2_28w"
+eval_model "${MERGED_DIR}" "${TEST_OUTPUT_DIR}"
+run_eval_metrics "${TEST_OUTPUT_DIR}" "rrsisd_public_semantic_v2_match_strict_7w"
 
+########################################
+# [6/6] Done
+########################################
 echo "========================================"
-echo "[6/6] DONE public_semantic_v2"
-echo "Output dir       : ${PUBLIC_OUTPUT_DIR}"
-echo "Selected ckpt    : ${PUBLIC_BEST_CHECKPOINT}"
-echo "Merged model     : ${PUBLIC_MERGED_DIR}"
-echo "Test output      : ${PUBLIC_TEST_OUTPUT_DIR}"
+echo "[6/6] DONE rrsisd_public_semantic_v2_match_strict_7w"
+echo "Output dir       : ${OUTPUT_DIR}"
+echo "Selected ckpt    : ${BEST_CHECKPOINT}"
+echo "Merged model     : ${MERGED_DIR}"
+echo "Test output      : ${TEST_OUTPUT_DIR}"
 echo "========================================"

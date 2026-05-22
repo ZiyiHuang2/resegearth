@@ -1,5 +1,6 @@
 import os
 import random
+import sys
 import re
 import glob
 from dataclasses import dataclass, field
@@ -21,7 +22,12 @@ from PIL import Image
 from fvcore.common.config import CfgNode
 import warnings
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
-from segearth_r2.utils.concept_public_grounding_train import build_rrsisd_supervised_human_value
+from segearth_r2.utils.concept_public_grounding_train import (
+    build_rrsisd_supervised_human_value,
+    filter_matched_concepts_by_category,
+    format_grounding_appendix,
+    retrieve_matched_public_grounding,
+)
 from segearth_r2.model.mipha import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
@@ -224,6 +230,14 @@ class RRSISDDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.concept_public_semantic_library = getattr(data_args, "concept_public_semantic_library", None) or None
+        self.concept_match_strict = bool(getattr(data_args, "concept_match_strict", False))
+        self.debug_concept_match_strict = bool(getattr(data_args, "debug_concept_match_strict", False))
+        self.debug_concept_match_strict_max_samples = int(
+            getattr(data_args, "debug_concept_match_strict_max_samples", 50) or 50
+        )
+        self._strict_debug_printed = 0
+        self._strict_missing_category_count = 0
+        self._strict_missing_category_printed = 0
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
 
         # 官方目录结构
@@ -311,7 +325,77 @@ class RRSISDDataset(RS_Base_Dataset):
             'image_id': os.path.basename(image_path).split(".")[0],
         })
 
-        human_value = build_rrsisd_supervised_human_value(instruction, self.concept_public_semantic_library)
+        category_name_str = None
+        cid = ref.get("category_id")
+        if cid is None:
+            ann_probe = self.ann_dict.get(ref.get("ann_id"))
+            if isinstance(ann_probe, dict):
+                cid = ann_probe.get("categories_id")
+                if cid is None:
+                    cid = ann_probe.get("category_id")
+        try:
+            cid_int = int(cid) if cid is not None else None
+        except (TypeError, ValueError):
+            cid_int = None
+        if cid_int is not None:
+            category_name_str = self.category_dict.get(cid_int)
+
+        lib = self.concept_public_semantic_library
+        if lib and self.concept_match_strict:
+            matched_before = retrieve_matched_public_grounding(instruction, lib)
+            if not category_name_str or not str(category_name_str).strip():
+                matched_after = []
+                self._strict_missing_category_count += 1
+                if self._strict_missing_category_printed < 10:
+                    print(
+                        "[RRSISD][concept_match_strict] missing category_name "
+                        f"idx={idx} ref_id={data_id} ann_id={ref.get('ann_id')}",
+                        file=sys.stderr,
+                    )
+                    self._strict_missing_category_printed += 1
+            else:
+                matched_after = filter_matched_concepts_by_category(
+                    matched_before, str(category_name_str).strip()
+                )
+
+            if self.debug_concept_match_strict:
+                mb_names = [
+                    str(r.get("concept")).strip()
+                    for r in matched_before
+                    if isinstance(r, dict) and str(r.get("concept") or "").strip()
+                ]
+                ma_names = [
+                    str(r.get("concept")).strip()
+                    for r in matched_after
+                    if isinstance(r, dict) and str(r.get("concept") or "").strip()
+                ]
+                is_over = str(category_name_str).strip() == "overpass"
+                narrowed = len(matched_before) > 0 and len(matched_after) == 0
+                changed = mb_names != ma_names
+                if (
+                    self._strict_debug_printed < self.debug_concept_match_strict_max_samples
+                    and (is_over or narrowed or changed)
+                ):
+                    preview = format_grounding_appendix(matched_after)
+                    preview = preview.replace("\n", " ")[:500]
+                    print(
+                        "[RRSISD][debug_concept_match_strict] "
+                        f"ref_id={data_id} idx={idx} category_name={category_name_str!r} "
+                        f"expression={instruction[:200]!r} "
+                        f"matched_concepts_before_strict={mb_names} "
+                        f"matched_concepts_after_strict={ma_names} "
+                        f"whether_prior_injected={bool(matched_after)} "
+                        f"prior_text_preview={preview!r}",
+                        file=sys.stderr,
+                    )
+                    self._strict_debug_printed += 1
+
+            human_value = build_rrsisd_supervised_human_value(
+                instruction, lib, matched_precalc=matched_after
+            )
+        else:
+            human_value = build_rrsisd_supervised_human_value(instruction, lib)
+
         token_refer_id = self.preprocess_referring_instruction(instruction)
 
         sources = [[
@@ -452,6 +536,237 @@ class LaSeRSDataset(RS_Base_Dataset):
         
         data_dict['mask_num'] = mask_num
         
+        return data_dict
+
+class RefSegRSDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split='train'):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+
+        split = split.lower()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unsupported RefSegRS split: {split}")
+
+        self.image_dir = os.path.join(base_data_path, "images")
+        self.mask_dir = os.path.join(base_data_path, "masks")
+        self.phrase_path = os.path.join(base_data_path, f"output_phrase_{split}.txt")
+
+        if not os.path.isfile(self.phrase_path):
+            raise FileNotFoundError(f"RefSegRS phrase file not found: {self.phrase_path}")
+
+        self.reason_file = []
+        with open(self.phrase_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                sid, phrase = parts[0].strip(), parts[1].strip()
+                self.reason_file.append({"sample_id": sid, "description": phrase})
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        sid = rec["sample_id"]
+        instruction = rec["description"]
+
+        image_path = os.path.join(self.image_dir, f"{sid}.tif")
+        mask_path = os.path.join(self.mask_dir, f"{sid}.tif")
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"RefSegRS image missing: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(f"RefSegRS mask missing: {mask_path}")
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to read RefSegRS mask: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = (mask > 0).astype(np.uint8)
+        masks = np.expand_dims(mask, axis=0)
+
+        data_dict = {}
+        data_dict["file_name"] = image_path
+
+        image_BGR = cv2.imread(image_path)
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = sid
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        data_dict["annotations"] = [{
+            "data_id": int(sid),
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": sid,
+        }]
+
+        prefix_inst = "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:"
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"}
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict["input_ids"][0]
+
+        SEG_token_embedding_indices = torch.zeros_like(input_ids)
+        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
+        return data_dict
+
+
+class RISBenchDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split='train'):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+
+        split = split.lower()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unsupported RISBench split: {split}")
+
+        self.image_dir = os.path.join(base_data_path, "img_rgb")
+        self.mask_dir = os.path.join(base_data_path, "mask")
+        self.phrase_path = os.path.join(base_data_path, f"output_phrase_{split}.txt")
+
+        if not os.path.isfile(self.phrase_path):
+            raise FileNotFoundError(f"RISBench phrase file not found: {self.phrase_path}")
+
+        self.reason_file = []
+        with open(self.phrase_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line_idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                fname, phrase = parts[0].strip(), parts[1].strip()
+                stem = os.path.splitext(fname)[0]
+                self.reason_file.append({
+                    "line_idx": line_idx,
+                    "file_name": fname,
+                    "stem": stem,
+                    "description": phrase,
+                })
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        fname = rec["file_name"]
+        stem = rec["stem"]
+        instruction = rec["description"]
+
+        image_path = os.path.join(self.image_dir, fname)
+        mask_path = os.path.join(self.mask_dir, fname)
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"RISBench image missing: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(f"RISBench mask missing: {mask_path}")
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to read RISBench mask: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = (mask > 0).astype(np.uint8)
+        masks = np.expand_dims(mask, axis=0)
+
+        data_dict = {}
+        data_dict["file_name"] = image_path
+
+        image_BGR = cv2.imread(image_path)
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = stem
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        # Use idx as unique id to avoid occasional duplicate keys in phrase files.
+        data_dict["annotations"] = [{
+            "data_id": int(idx),
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": stem,
+        }]
+
+        prefix_inst = "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:"
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"}
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict["input_ids"][0]
+
+        SEG_token_embedding_indices = torch.zeros_like(input_ids)
+        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
         return data_dict
 
 @dataclass

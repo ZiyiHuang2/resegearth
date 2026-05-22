@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -42,6 +43,51 @@ def retrieve_matched_public_grounding(raw_expression: str, library_path: str) ->
     return [r for r in rows if isinstance(r, dict)]
 
 
+def normalize_concept_name(s: Optional[str]) -> str:
+    """
+    Canonical string for comparing RRSISD category_name to library / matched concept labels.
+
+    Rules: lower, strip, treat underscore and hyphen as spaces, collapse whitespace, then drop
+    all non-alphanumeric characters so e.g. "parking lot", "parking-lot", "parking_lot" match.
+    """
+    if s is None:
+        return ""
+    t = str(s).strip().lower()
+    t = t.replace("_", " ").replace("-", " ")
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"[^a-z0-9]+", "", t)
+    return t
+
+
+def _concept_label_from_matched_row(row: Any) -> str:
+    if isinstance(row, str):
+        return row.strip()
+    if isinstance(row, dict):
+        return str(row.get("concept") or "").strip()
+    return ""
+
+
+def filter_matched_concepts_by_category(
+    matched_concepts: List[Any],
+    category_name: Optional[str],
+) -> List[Dict[str, Any]]:
+    """
+    Strict target-only filter: keep rows whose public `concept` normalizes equal to category_name.
+
+    If category_name is empty / unknown, returns [] (caller should treat as no prior injection).
+    """
+    want = normalize_concept_name(category_name)
+    if not want:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in matched_concepts or []:
+        if not isinstance(row, dict):
+            continue
+        if normalize_concept_name(_concept_label_from_matched_row(row)) == want:
+            out.append(row)
+    return out
+
+
 def format_grounding_appendix(matched: List[Dict[str, Any]]) -> str:
     if not matched:
         return ""
@@ -52,20 +98,32 @@ def format_grounding_appendix(matched: List[Dict[str, Any]]) -> str:
     return header + json.dumps(matched, ensure_ascii=False, indent=2)
 
 
-def build_rrsisd_supervised_human_value(instruction: str, concept_public_library_path: Optional[str]) -> str:
+def build_rrsisd_supervised_human_value(
+    instruction: str,
+    concept_public_library_path: Optional[str] = None,
+    *,
+    matched_precalc: Optional[List[Dict[str, Any]]] = None,
+) -> str:
     """
     Full human-side string up to (and including) the <|assistant|> handoff token, before gpt adds [SEG].
 
     - No library: identical layout to legacy RRSIS-D in this repo (image first, then <refer>).
     - With v2 library: raw expression, optional grounding JSON, then image tokens, then <refer>; same
       token_refer_id as baseline (encode(instruction)+[SEG]) is applied in Dataset separately.
+
+    If ``matched_precalc`` is provided (non-None), it must be the already-retrieved (and optionally
+    strict-filtered) public rows; this path skips a second retrieval call and must only be used when
+    ``concept_public_library_path`` is set.
     """
     if not concept_public_library_path:
         return (
             "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:\n"
             "<refer> <|assistant|>"
         )
-    matched = retrieve_matched_public_grounding(instruction, concept_public_library_path)
+    if matched_precalc is not None:
+        matched = list(matched_precalc)
+    else:
+        matched = retrieve_matched_public_grounding(instruction, concept_public_library_path)
     appendix = format_grounding_appendix(matched)
     parts: List[str] = [
         "This is an image <|sep|> <|user|>\n",
