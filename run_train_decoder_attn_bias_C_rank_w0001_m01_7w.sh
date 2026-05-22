@@ -20,6 +20,18 @@
 #
 # 覆盖已有 merged：
 #   OVERWRITE_MERGE=1 bash run_train_decoder_attn_bias_7w.sh
+#
+# 仅对已 merge 的模型做 eval + metrics（跳过 train / pick / merge）：
+#   EVAL_ONLY_FROM_MERGED=1 bash run_train_decoder_attn_bias_C_rank_w0001_m01_7w.sh
+#
+# 当前文件已改成 C 实验默认配置：
+#   max_abs=0.03
+#   apply_layers=last3
+#   use_decoder_attn_bias_rank_loss=True
+#   rank_loss_weight=0.001
+#   rank_margin=0.1
+#   max_steps=70000
+#
 
 set -euo pipefail
 
@@ -41,15 +53,15 @@ MAX_STEPS="${MAX_STEPS:-70000}"
 SEED="${SEED:-42}"
 DATA_SEED="${DATA_SEED:-42}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-${RESEG_ROOT}/output/tgi/decoder_attn_bias_last3_7w}"
+OUTPUT_DIR="${OUTPUT_DIR:-${RESEG_ROOT}/output/tgi/decoder_attn_bias_last3_max003_7w_C_rank_w0001_m01}"
 MERGED_DIR="${MERGED_DIR:-${OUTPUT_DIR}/merged_best}"
 TEST_NORMAL_DIR="${TEST_NORMAL_DIR:-${OUTPUT_DIR}/eval_best/test_results_normal}"
 TEST_BYPASS_DIR="${TEST_BYPASS_DIR:-${OUTPUT_DIR}/eval_best/test_results_bypass}"
-TRAIN_LOG="${TRAIN_LOG:-${OUTPUT_DIR}/train_decoder_attn_bias_7w.log}"
+TRAIN_LOG="${TRAIN_LOG:-${OUTPUT_DIR}/train_decoder_attn_bias_C_rank_w0001_m01_7w.log}"
 BEST_INFO_JSON="${BEST_INFO_JSON:-${OUTPUT_DIR}/best_checkpoint_info.json}"
 
 export WANDB_PROJECT="${WANDB_PROJECT:-segearth-tgi}"
-export WANDB_NAME="${WANDB_NAME:-decoder_attn_bias_last3_7w}"
+export WANDB_NAME="${WANDB_NAME:-decoder_attn_bias_last3_max003_7w_C_rank_w0001_m01}"
 
 MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-${RESEG_ROOT}/output/standard-base-siglip11/merged_model}"
 VISION_TOWER="${VISION_TOWER:-${RESEG_ROOT}/pretrained_model/CLIP/siglip2-so400m-patch14-384}"
@@ -92,14 +104,14 @@ SWITCH_BS="${SWITCH_BS:-4}"
 # 当前 A/B/C 诊断建议：
 # A/C 默认 0.03，B 外部覆盖 0.05。
 DECODER_ATTN_BIAS_MAX_ABS="${DECODER_ATTN_BIAS_MAX_ABS:-0.03}"
-USE_DECODER_ATTN_BIAS_RANK_LOSS="${USE_DECODER_ATTN_BIAS_RANK_LOSS:-False}"
+USE_DECODER_ATTN_BIAS_RANK_LOSS="${USE_DECODER_ATTN_BIAS_RANK_LOSS:-True}"
 DECODER_ATTN_BIAS_RANK_LOSS_WEIGHT="${DECODER_ATTN_BIAS_RANK_LOSS_WEIGHT:-0.001}"
 DECODER_ATTN_BIAS_RANK_MARGIN="${DECODER_ATTN_BIAS_RANK_MARGIN:-0.1}"
 
 EVAL_METRICS_SCRIPT="${EVAL_METRICS_SCRIPT:-${RESEG_ROOT}/eval_val_metrics.py}"
 EVAL_USE_WANDB="${EVAL_USE_WANDB:-True}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-tgi-val}"
-EVAL_METRICS_RUN_NAME="${EVAL_METRICS_RUN_NAME:-decoder_attn_bias_last3_7w}"
+EVAL_METRICS_RUN_NAME="${EVAL_METRICS_RUN_NAME:-decoder_attn_bias_last3_max003_7w_C_rank_w0001_m01}"
 
 MERGE_PY="${REPO_DIR}/segearth_r2/train/merge_lora_weights_and_save_hf_model.py"
 EVAL_PY="${REPO_DIR}/segearth_r2/eval/eval.py"
@@ -338,6 +350,35 @@ run_eval_infer () {
       --decoder_attn_bias_force_scale 1.0
 }
 
+check_merged_config () {
+  local merged_dir="$1"
+  if [[ ! -f "${merged_dir}/config.json" ]]; then
+    echo "[ERROR] merged config 不存在: ${merged_dir}/config.json"
+    exit 1
+  fi
+  grep -n '"use_decoder_attn_bias"\|"decoder_attn_bias_dim"\|"decoder_attn_bias_init_std"\|"decoder_attn_bias_max_abs"\|"decoder_attn_bias_apply_layers"\|"use_decoder_attn_bias_rank_loss"\|"decoder_attn_bias_rank_loss_weight"\|"decoder_attn_bias_rank_margin"' \
+    "${merged_dir}/config.json" || {
+      echo "[ERROR] merged config.json missing decoder_attn_bias / rank fields"
+      exit 1
+    }
+  python - <<PY
+import json
+p = "${merged_dir}/config.json"
+c = json.load(open(p, "r", encoding="utf-8"))
+
+assert c.get("use_decoder_attn_bias") is True, c.get("use_decoder_attn_bias")
+assert str(c.get("decoder_attn_bias_apply_layers")) == "last3", c.get("decoder_attn_bias_apply_layers")
+assert abs(float(c.get("decoder_attn_bias_max_abs")) - float("${DECODER_ATTN_BIAS_MAX_ABS}")) < 1e-12, c.get("decoder_attn_bias_max_abs")
+
+expected_rank = str("${USE_DECODER_ATTN_BIAS_RANK_LOSS}").lower() == "true"
+assert bool(c.get("use_decoder_attn_bias_rank_loss")) == expected_rank, c.get("use_decoder_attn_bias_rank_loss")
+assert abs(float(c.get("decoder_attn_bias_rank_loss_weight", 0.001)) - float("${DECODER_ATTN_BIAS_RANK_LOSS_WEIGHT}")) < 1e-12, c.get("decoder_attn_bias_rank_loss_weight")
+assert abs(float(c.get("decoder_attn_bias_rank_margin", 0.1)) - float("${DECODER_ATTN_BIAS_RANK_MARGIN}")) < 1e-12, c.get("decoder_attn_bias_rank_margin")
+
+print("[PASS] merged decoder_attn_bias config checked:", p)
+PY
+}
+
 run_eval_metrics () {
   local pred_dir="$1"
   local run_name="$2"
@@ -375,6 +416,7 @@ echo "  DECODER_ATTN_BIAS_MAX_ABS=${DECODER_ATTN_BIAS_MAX_ABS}"
 echo "  USE_DECODER_ATTN_BIAS_RANK_LOSS=${USE_DECODER_ATTN_BIAS_RANK_LOSS}"
 echo "  DECODER_ATTN_BIAS_RANK_LOSS_WEIGHT=${DECODER_ATTN_BIAS_RANK_LOSS_WEIGHT}"
 echo "  DECODER_ATTN_BIAS_RANK_MARGIN=${DECODER_ATTN_BIAS_RANK_MARGIN}"
+echo "  EVAL_ONLY_FROM_MERGED=${EVAL_ONLY_FROM_MERGED:-0}"
 echo "========================================"
 
 if ! python -c "import transformers" 2>/dev/null; then
@@ -404,21 +446,36 @@ if [[ ! -d "${MODEL_NAME_OR_PATH}" ]]; then
   exit 1
 fi
 
-if [[ -d "${OUTPUT_DIR}" ]]; then
-  shopt -s nullglob
-  _existing=( "${OUTPUT_DIR}"/checkpoint-* )
-  shopt -u nullglob
-  if [[ ${#_existing[@]} -gt 0 ]]; then
-    if [[ "${RESUME_OK:-0}" != "1" ]]; then
-      echo "[ERROR] OUTPUT_DIR 下已有 checkpoint-*，可能误续训旧实验。"
-      echo "        请换 OUTPUT_DIR 或显式 RESUME_OK=1 续训。"
-      exit 1
+if [[ "${EVAL_ONLY_FROM_MERGED:-0}" != "1" ]]; then
+  if [[ -d "${OUTPUT_DIR}" ]]; then
+    shopt -s nullglob
+    _existing=( "${OUTPUT_DIR}"/checkpoint-* )
+    shopt -u nullglob
+    if [[ ${#_existing[@]} -gt 0 ]]; then
+      if [[ "${RESUME_OK:-0}" != "1" ]]; then
+        echo "[ERROR] OUTPUT_DIR 下已有 checkpoint-*，可能误续训旧实验。"
+        echo "        请换 OUTPUT_DIR 或显式 RESUME_OK=1 续训。"
+        echo "        若只需 eval/metrics：EVAL_ONLY_FROM_MERGED=1 bash $0"
+        exit 1
+      fi
+      echo "[WARN] RESUME_OK=1 — 将在已有 checkpoint 上续训。"
     fi
-    echo "[WARN] RESUME_OK=1 — 将在已有 checkpoint 上续训。"
   fi
 fi
 
 mkdir -p "${OUTPUT_DIR}"
+
+if [[ "${EVAL_ONLY_FROM_MERGED:-0}" == "1" ]]; then
+  echo "========================================"
+  echo "[EVAL_ONLY] 跳过 train / pick / merge，使用已有 MERGED_DIR"
+  echo "  MERGED_DIR=${MERGED_DIR}"
+  echo "========================================"
+  if [[ ! -d "${MERGED_DIR}" ]]; then
+    echo "[ERROR] MERGED_DIR 不存在: ${MERGED_DIR}"
+    exit 1
+  fi
+  check_merged_config "${MERGED_DIR}"
+else
 
 ########################################
 # [1/5] Train
@@ -629,28 +686,9 @@ echo "========================================"
 echo "[CHECK] merged config decoder_attn_bias fields"
 echo "========================================"
 
-grep -n '"use_decoder_attn_bias"\|"decoder_attn_bias_dim"\|"decoder_attn_bias_init_std"\|"decoder_attn_bias_max_abs"\|"decoder_attn_bias_apply_layers"\|"use_decoder_attn_bias_rank_loss"\|"decoder_attn_bias_rank_loss_weight"\|"decoder_attn_bias_rank_margin"' \
-  "${MERGED_DIR}/config.json" || {
-    echo "[ERROR] merged config.json missing decoder_attn_bias / rank fields"
-    exit 1
-  }
+check_merged_config "${MERGED_DIR}"
 
-python - <<PY
-import json
-p = "${MERGED_DIR}/config.json"
-c = json.load(open(p, "r", encoding="utf-8"))
-
-assert c.get("use_decoder_attn_bias") is True, c.get("use_decoder_attn_bias")
-assert str(c.get("decoder_attn_bias_apply_layers")) == "last3", c.get("decoder_attn_bias_apply_layers")
-assert abs(float(c.get("decoder_attn_bias_max_abs")) - float("${DECODER_ATTN_BIAS_MAX_ABS}")) < 1e-12, c.get("decoder_attn_bias_max_abs")
-
-expected_rank = str("${USE_DECODER_ATTN_BIAS_RANK_LOSS}").lower() == "true"
-assert bool(c.get("use_decoder_attn_bias_rank_loss")) == expected_rank, c.get("use_decoder_attn_bias_rank_loss")
-assert abs(float(c.get("decoder_attn_bias_rank_loss_weight", 0.001)) - float("${DECODER_ATTN_BIAS_RANK_LOSS_WEIGHT}")) < 1e-12, c.get("decoder_attn_bias_rank_loss_weight")
-assert abs(float(c.get("decoder_attn_bias_rank_margin", 0.1)) - float("${DECODER_ATTN_BIAS_RANK_MARGIN}")) < 1e-12, c.get("decoder_attn_bias_rank_margin")
-
-print("[PASS] merged decoder_attn_bias config checked:", p)
-PY
+fi  # end EVAL_ONLY_FROM_MERGED else (train → merge)
 
 ########################################
 # [4/5] Eval normal + bypass
@@ -679,13 +717,17 @@ echo "[INFO] Metrics bypass"
 run_eval_metrics "${TEST_BYPASS_DIR}" "${EVAL_METRICS_RUN_NAME}_bypass" "bypass"
 
 echo "========================================"
-echo "[DONE] 7w pipeline finished."
-echo "  BEST_CHECKPOINT=${BEST_CHECKPOINT}"
-echo "  BEST_SELECTION_STRATEGY=${BEST_SELECTION_STRATEGY}"
-echo "  BEST_METRIC_NAME=${BEST_METRIC_NAME}"
-echo "  BEST_METRIC_VALUE=${BEST_METRIC_VALUE}"
-echo "  BEST_CHECKPOINT_VALUE=${BEST_CHECKPOINT_VALUE}"
-echo "  BEST_INFO_JSON=${BEST_INFO_JSON}"
+if [[ "${EVAL_ONLY_FROM_MERGED:-0}" == "1" ]]; then
+  echo "[DONE] eval-only pipeline finished."
+else
+  echo "[DONE] 7w pipeline finished."
+  echo "  BEST_CHECKPOINT=${BEST_CHECKPOINT:-}"
+  echo "  BEST_SELECTION_STRATEGY=${BEST_SELECTION_STRATEGY:-}"
+  echo "  BEST_METRIC_NAME=${BEST_METRIC_NAME:-}"
+  echo "  BEST_METRIC_VALUE=${BEST_METRIC_VALUE:-}"
+  echo "  BEST_CHECKPOINT_VALUE=${BEST_CHECKPOINT_VALUE:-}"
+  echo "  BEST_INFO_JSON=${BEST_INFO_JSON:-}"
+fi
 echo "  MERGED_DIR=${MERGED_DIR}"
 echo "  TEST_NORMAL_DIR=${TEST_NORMAL_DIR}"
 echo "  TEST_BYPASS_DIR=${TEST_BYPASS_DIR}"

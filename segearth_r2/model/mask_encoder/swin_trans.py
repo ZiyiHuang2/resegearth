@@ -683,6 +683,10 @@ class SwinTransformer(nn.Module):
         return_mstva_maps=False,
     ):
         """Forward function."""
+        # vision_tower_mask 在 fp16 训练下为 half，但 dataloader 常给 float32 图像
+        enc_dtype = self.patch_embed.proj.weight.dtype
+        if x.dtype != enc_dtype:
+            x = x.to(dtype=enc_dtype)
         x = self.patch_embed(x)
 
         Wh, Ww = x.size(2), x.size(3)
