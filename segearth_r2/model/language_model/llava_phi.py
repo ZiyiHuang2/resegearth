@@ -726,8 +726,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             global_step=None,
             mask_num=None,
             dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
-        # SPIM-v1: spatial prior is only wired in this training forward path.
-        # eval_seg still uses output_attentions=False; SPIM at inference is deferred to a later phase.
+        # SPIM-v1: training forward always requests attentions for SPIM when enabled.
+        # SPIM-v2: eval_seg enables attentions + prior only when use_spim and spim_alpha>0.
 
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
@@ -951,7 +951,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             mask_num = None):
         
-        output_attentions = False
+        use_spim_eval = (
+            getattr(self.config, "use_spim", False)
+            and float(getattr(self.config, "spim_alpha", 0.0)) > 0
+        )
+        output_attentions = True if use_spim_eval else False
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -972,6 +976,35 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict=return_dict
         )
 
+        spim_prior = None
+        if use_spim_eval:
+            if image_features_indices is None:
+                raise ValueError("SPIM eval requires image_features_indices, but got None.")
+            if outputs.attentions is None:
+                raise ValueError("SPIM eval requires outputs.attentions, but got None.")
+
+            spim_prior, prior_stats = self.build_seg_spatial_prior(
+                raw_attentions=outputs.attentions,
+                SEG_token_embedding_indices=SEG_token_embedding_indices,
+                image_features_indices=image_features_indices,
+                layer_idx=getattr(self.config, "spim_layer_idx", -1),
+                detach=True,
+                normalize=getattr(self.config, "spim_norm", True),
+                seg_agg=getattr(self.config, "spim_seg_agg", "mean"),
+                near_zero_eps=getattr(self.config, "spim_near_zero_eps", 1e-8),
+            )
+
+            if getattr(self.config, "spim_debug", False):
+                print(
+                    "[SPIM eval debug]",
+                    f"prior_shape={tuple(spim_prior.shape)}",
+                    f"min={prior_stats['spim_prior_min']:.6f}",
+                    f"max={prior_stats['spim_prior_max']:.6f}",
+                    f"mean={prior_stats['spim_prior_mean']:.6f}",
+                    f"std={prior_stats['spim_prior_std']:.6f}",
+                    f"near_zero_count={prior_stats['spim_near_zero_count']}",
+                )
+
         hidden_states = outputs.last_hidden_state   
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
@@ -982,13 +1015,43 @@ class SegEarthR2(MiphaPhiForCausalLM):
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
         mask_num = torch.tensor(mask_num, device=mask_features.device)
+
+        if spim_prior is not None:
+            if spim_prior.shape[0] != mask_num.shape[0]:
+                raise ValueError(
+                    f"SPIM eval prior batch {spim_prior.shape[0]} must equal len(mask_num) {mask_num.shape[0]} before repeat_interleave."
+                )
+            spim_prior = torch.repeat_interleave(spim_prior, repeats=mask_num, dim=0)
+
         mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
         multi_scale_features = [
             torch.repeat_interleave(feat, repeats=mask_num, dim=0)
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        if spim_prior is not None:
+            if spim_prior.shape[0] != mask_features.shape[0]:
+                raise ValueError(
+                    f"SPIM eval prior batch {spim_prior.shape[0]} != mask_features batch {mask_features.shape[0]} after repeat_interleave."
+                )
+            if spim_prior.shape[0] != SEG_embedding.shape[0]:
+                raise ValueError(
+                    f"SPIM eval prior batch {spim_prior.shape[0]} != SEG_embedding batch {SEG_embedding.shape[0]} after repeat_interleave."
+                )
+
+        if use_spim_eval:
+            mask_outputs = self.predictor(
+                multi_scale_features,
+                mask_features,
+                None,
+                None,
+                SEG_embedding,
+                spim_prior=spim_prior,
+                spim_alpha=getattr(self.config, "spim_alpha", 0.0),
+                spim_debug=getattr(self.config, "spim_debug", False),
+            )
+        else:
+            mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
 
         
         mask_pred_results = mask_outputs["pred_masks"]
