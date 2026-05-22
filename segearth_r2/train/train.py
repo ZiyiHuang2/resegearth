@@ -5,6 +5,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
@@ -125,6 +126,28 @@ class TrainingArguments(transformers.TrainingArguments):
     diagnose_structured_effect_threshold: float = field(default=0.0)
     diagnose_structured_effect_mean_abs_threshold: float = field(default=1e-3)
     diagnose_structured_effect_eps: float = field(default=1e-6)
+    use_seg_query_refiner: bool = field(default=False)
+    seg_query_refiner_hidden_dim: int = field(default=512)
+    seg_query_topk_tokens: int = field(default=16)
+    use_seg_loc_prior: bool = field(default=False)
+    seg_loc_hidden_dim: int = field(default=256)
+    seg_loc_prior_grid_size: int = field(default=14)
+    seg_loc_prior_weight: float = field(default=0.1)
+    # Prior quality diagnostics only (no change to fusion / query path).
+    diagnose_seg_loc_prior_only: bool = field(
+        default=False,
+        metadata={"help": "When True, training logs emphasize seg_loc prior metrics (mask/attention scalars still computed)."},
+    )
+    export_seg_loc_prior_metrics: bool = field(
+        default=False,
+        metadata={"help": "Append batch-level prior metrics to output_dir/seg_loc_prior_metrics.jsonl (rank 0)."},
+    )
+    export_seg_loc_prior_samples: bool = field(
+        default=False,
+        metadata={"help": "Append per-SEG-instance prior rows to output_dir/seg_loc_prior_samples.jsonl (rank 0)."},
+    )
+    seg_loc_prior_entropy_high_thresh: float = field(default=0.35)
+    seg_loc_prior_low_fg_mass_thresh: float = field(default=0.05)
 
 
 def _parse_target_layers(target_layers_raw: Optional[str]):
@@ -305,6 +328,33 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 data_args=data_args,
                 split="val_data.json"
             )
+
+        elif dataset_name == "refsegrs":
+            train_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
+        elif dataset_name == "risbench":
+            train_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
         else:
             raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
@@ -344,6 +394,9 @@ def train():
     if training_args.data_seed is None:
         training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
@@ -386,6 +439,22 @@ def train():
         training_args.diagnose_structured_effect_mean_abs_threshold
     )
     model.config.diagnose_structured_effect_eps = training_args.diagnose_structured_effect_eps
+    model.config.use_seg_query_refiner = training_args.use_seg_query_refiner
+    model.config.seg_query_refiner_hidden_dim = training_args.seg_query_refiner_hidden_dim
+    model.config.seg_query_topk_tokens = training_args.seg_query_topk_tokens
+    model.config.use_seg_loc_prior = training_args.use_seg_loc_prior
+    model.config.seg_loc_hidden_dim = training_args.seg_loc_hidden_dim
+    model.config.seg_loc_prior_grid_size = training_args.seg_loc_prior_grid_size
+    model.config.seg_loc_prior_weight = training_args.seg_loc_prior_weight
+    model.config.diagnose_seg_loc_prior_only = training_args.diagnose_seg_loc_prior_only
+    model.config.export_seg_loc_prior_metrics = training_args.export_seg_loc_prior_metrics
+    model.config.export_seg_loc_prior_samples = training_args.export_seg_loc_prior_samples
+    model.config.seg_loc_prior_entropy_high_thresh = training_args.seg_loc_prior_entropy_high_thresh
+    model.config.seg_loc_prior_low_fg_mass_thresh = training_args.seg_loc_prior_low_fg_mass_thresh
+    if training_args.use_seg_query_refiner and hasattr(model, "ensure_seg_query_refiner_mlp"):
+        model.ensure_seg_query_refiner_mlp()
+    if training_args.use_seg_loc_prior and hasattr(model, "ensure_seg_loc_modules"):
+        model.ensure_seg_loc_modules()
 
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None

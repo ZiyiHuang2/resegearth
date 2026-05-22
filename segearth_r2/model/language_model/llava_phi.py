@@ -79,6 +79,28 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     diag_delta_iou_vs_gt: Optional[torch.FloatTensor] = None
     diag_attention_sup_default_minus_unstructured: Optional[torch.FloatTensor] = None
     diag_structured_supervision_alters_mask_forward_path: Optional[torch.FloatTensor] = None
+    # --- seg query refiner (top-k attention -> MLP -> fixed 0.5/0.5 blend) ---
+    seg_query_delta_norm: Optional[torch.FloatTensor] = None
+    seg_query_original_norm: Optional[torch.FloatTensor] = None
+    seg_query_refined_norm: Optional[torch.FloatTensor] = None
+    seg_query_cosine_q_delta: Optional[torch.FloatTensor] = None
+    seg_query_cosine_q_qnew: Optional[torch.FloatTensor] = None
+    # --- SEG explicit coarse spatial prior (q_sem / q_loc -> prior -> loc_code -> q_final) ---
+    loss_seg_loc_prior: Optional[torch.FloatTensor] = None
+    seg_loc_prior_mean: Optional[torch.FloatTensor] = None
+    seg_loc_prior_entropy: Optional[torch.FloatTensor] = None
+    seg_loc_prior_fg_mass: Optional[torch.FloatTensor] = None
+    seg_loc_prior_bg_mass: Optional[torch.FloatTensor] = None
+    seg_loc_code_norm: Optional[torch.FloatTensor] = None
+    seg_loc_sem_norm: Optional[torch.FloatTensor] = None
+    seg_loc_qfinal_norm: Optional[torch.FloatTensor] = None
+    seg_loc_code_to_sem_norm_ratio: Optional[torch.FloatTensor] = None
+    seg_loc_cosine_sem_qfinal: Optional[torch.FloatTensor] = None
+    seg_loc_cosine_sem_loccode: Optional[torch.FloatTensor] = None
+    # Per-batch dict of extra seg_loc prior diagnostics (percentiles, ratios, coarse IoU); trainer flattens to log.
+    seg_loc_prior_extended_metrics: Optional[dict] = None
+    # Optional list[dict] per SEG instance for jsonl export; trainer appends when enabled.
+    seg_loc_prior_sample_rows: Optional[list] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -256,7 +278,44 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-            
+
+        self.seg_query_refiner_mlp = None
+        if bool(getattr(self.config, "use_seg_query_refiner", False)):
+            d = int(self.config.hidden_size)
+            mid = int(getattr(self.config, "seg_query_refiner_hidden_dim", 512))
+            self.seg_query_refiner_mlp = nn.Sequential(
+                nn.Linear(d, mid),
+                nn.GELU(),
+                nn.Linear(mid, d),
+            )
+            print(f"[SEG][QueryRefiner] enabled: top_k={int(getattr(self.config, 'seg_query_topk_tokens', 16))}, mlp_hidden={mid}")
+
+        self.seg_loc_w_sem = None
+        self.seg_loc_w_loc = None
+        self.seg_loc_prior_head = None
+        self.seg_loc_code_linear = None
+        self.seg_loc_fuse_linear = None
+        if bool(getattr(self.config, "use_seg_loc_prior", False)):
+            d = int(self.config.hidden_size)
+            gh = int(getattr(self.config, "seg_loc_prior_grid_size", 14) or 14)
+            gh = max(4, gh)
+            g = gh * gh
+            mid = int(getattr(self.config, "seg_loc_hidden_dim", 256) or 256)
+            mid = max(32, mid)
+            self.seg_loc_w_sem = nn.Linear(d, d, bias=True)
+            self.seg_loc_w_loc = nn.Linear(d, d, bias=True)
+            self.seg_loc_prior_head = nn.Sequential(
+                nn.Linear(d, mid, bias=True),
+                nn.ReLU(),
+                nn.Linear(mid, g, bias=True),
+            )
+            self.seg_loc_code_linear = nn.Linear(g, d, bias=True)
+            self.seg_loc_fuse_linear = nn.Linear(2 * d, d, bias=True)
+            print(
+                f"[SEG][LocPrior] enabled: grid={gh}x{gh} (G={g}), prior_mlp={d}->{mid}->{g}, "
+                f"fuse=concat+Linear({2*d}->{d}), prior_weight={float(getattr(self.config, 'seg_loc_prior_weight', 0.1))}"
+            )
+
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
             def get_w(weights, keyword):
@@ -707,6 +766,358 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
+
+    def _seg_query_refiner_enabled(self) -> bool:
+        return bool(getattr(self.config, "use_seg_query_refiner", False)) and getattr(
+            self, "seg_query_refiner_mlp", None
+        ) is not None
+
+    def ensure_seg_query_refiner_mlp(self):
+        """Call after updating config on a loaded (e.g. merged) checkpoint so MLP exists when flag is turned on."""
+        if not bool(getattr(self.config, "use_seg_query_refiner", False)):
+            return
+        if getattr(self, "seg_query_refiner_mlp", None) is not None:
+            return
+        d = int(self.config.hidden_size)
+        mid = int(getattr(self.config, "seg_query_refiner_hidden_dim", 512))
+        self.seg_query_refiner_mlp = nn.Sequential(
+            nn.Linear(d, mid),
+            nn.GELU(),
+            nn.Linear(mid, d),
+        )
+        print(
+            f"[SEG][QueryRefiner] lazy-init MLP (merged ckpt path): top_k="
+            f"{int(getattr(self.config, 'seg_query_topk_tokens', 16))}, mlp_hidden={mid}"
+        )
+
+    def _seg_loc_prior_enabled(self) -> bool:
+        return bool(getattr(self.config, "use_seg_loc_prior", False)) and getattr(
+            self, "seg_loc_prior_head", None
+        ) is not None and getattr(self, "seg_loc_fuse_linear", None) is not None
+
+    def ensure_seg_loc_modules(self):
+        if not bool(getattr(self.config, "use_seg_loc_prior", False)):
+            return
+        if getattr(self, "seg_loc_prior_head", None) is not None and getattr(self, "seg_loc_fuse_linear", None) is not None:
+            return
+        d = int(self.config.hidden_size)
+        if getattr(self, "seg_loc_prior_head", None) is None:
+            gh = int(getattr(self.config, "seg_loc_prior_grid_size", 14) or 14)
+            gh = max(4, gh)
+            g = gh * gh
+            mid = int(getattr(self.config, "seg_loc_hidden_dim", 256) or 256)
+            mid = max(32, mid)
+            self.seg_loc_w_sem = nn.Linear(d, d, bias=True)
+            self.seg_loc_w_loc = nn.Linear(d, d, bias=True)
+            self.seg_loc_prior_head = nn.Sequential(
+                nn.Linear(d, mid, bias=True),
+                nn.ReLU(),
+                nn.Linear(mid, g, bias=True),
+            )
+            self.seg_loc_code_linear = nn.Linear(g, d, bias=True)
+            self.seg_loc_fuse_linear = nn.Linear(2 * d, d, bias=True)
+            print(f"[SEG][LocPrior] lazy-init modules (merged ckpt path): grid={gh}x{gh}")
+        else:
+            self.seg_loc_fuse_linear = nn.Linear(2 * d, d, bias=True)
+            print("[SEG][LocPrior] lazy-init seg_loc_fuse_linear only (older ckpt missing fuse)")
+
+    def _gather_q_seg_matrix(self, hidden_states: torch.Tensor, SEG_token_embedding_indices: Optional[torch.Tensor]):
+        if SEG_token_embedding_indices is None:
+            return torch.empty(
+                0,
+                hidden_states.size(-1),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        rows: List[torch.Tensor] = []
+        bs = hidden_states.size(0)
+        for b in range(bs):
+            h_b = hidden_states[b]
+            seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
+            for s in seg_pos:
+                rows.append(h_b[int(s.item())])
+        if len(rows) == 0:
+            return torch.empty(
+                0,
+                hidden_states.size(-1),
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        return torch.stack(rows, dim=0)
+
+    def _seg_loc_prior_loss_and_metrics(
+        self,
+        prior_logits: torch.Tensor,
+        targets,
+        SEG_token_embedding_indices: torch.Tensor,
+        seg_info=None,
+        global_step=None,
+    ):
+        """BCE prior vs GT mask downsampled to coarse grid; no GT fed into q. Returns (loss, metrics, ext, sample_rows)."""
+        gh = int(getattr(self.config, "seg_loc_prior_grid_size", 14) or 14)
+        gh = max(4, gh)
+        g = gh * gh
+        device = prior_logits.device
+        dtype = prior_logits.dtype
+        rows: List[torch.Tensor] = []
+        bs = SEG_token_embedding_indices.shape[0]
+        for b in range(bs):
+            seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
+            n_seg = int(seg_pos.numel())
+            masks_b = targets[b]["masks"]
+            for j in range(n_seg):
+                mj = min(j, int(masks_b.shape[0]) - 1)
+                m = masks_b[mj].float()
+                if m.dim() == 3:
+                    m = m[0]
+                down = F.interpolate(
+                    m.unsqueeze(0).unsqueeze(0),
+                    size=(gh, gh),
+                    mode="bilinear",
+                    align_corners=False,
+                ).clamp(0.0, 1.0)
+                rows.append(down.reshape(-1))
+        if len(rows) == 0:
+            z = torch.tensor(0.0, device=device, dtype=dtype)
+            empty_m = {
+                "seg_loc_prior_mean": z.detach(),
+                "seg_loc_prior_entropy": z.detach(),
+                "seg_loc_prior_fg_mass": z.detach(),
+                "seg_loc_prior_bg_mass": z.detach(),
+            }
+            return z, empty_m, {}, None
+        tgt = torch.stack(rows, dim=0)
+        if tgt.shape[0] != prior_logits.shape[0] or tgt.shape[1] != g:
+            raise ValueError(
+                f"seg loc prior shape mismatch: logits {tuple(prior_logits.shape)} vs target {tuple(tgt.shape)}"
+            )
+        loss = F.binary_cross_entropy_with_logits(prior_logits, tgt, reduction="mean")
+        p_det = torch.sigmoid(prior_logits.detach())
+        tgt_d = tgt.detach()
+        eps = 1e-8
+        fg_m = (tgt_d > 0.5).float()
+        bg_m = 1.0 - fg_m
+        fg_sum = fg_m.sum(dim=-1).clamp_min(1.0)
+        bg_sum = bg_m.sum(dim=-1).clamp_min(1.0)
+        fg_mass_per = (p_det * fg_m).sum(dim=-1) / fg_sum
+        bg_mass_per = (p_det * bg_m).sum(dim=-1) / bg_sum
+        ent_per = -(p_det * torch.log(p_det + eps) + (1.0 - p_det) * torch.log(1.0 - p_det + eps)).mean(dim=-1)
+        mean_per = p_det.mean(dim=-1)
+        prior_target_fg_ratio = fg_m.mean(dim=-1)
+
+        p_bin = (p_det > 0.5).float()
+        t_bin = (tgt_d > 0.5).float()
+        inter = (p_bin * t_bin).sum(dim=-1)
+        union = p_bin.sum(dim=-1) + t_bin.sum(dim=-1) - inter
+        iou_per = inter / union.clamp_min(eps)
+        top_idx = torch.argmax(p_det, dim=-1)
+        top_in_fg = (torch.gather(t_bin, 1, top_idx.unsqueeze(1)).squeeze(1) > 0.5).float()
+
+        ent_high_thr = float(getattr(self.config, "seg_loc_prior_entropy_high_thresh", 0.35) or 0.35)
+        fg_low_thr = float(getattr(self.config, "seg_loc_prior_low_fg_mass_thresh", 0.05) or 0.05)
+
+        fg_gt_bg_ratio = (fg_mass_per / (bg_mass_per + eps)).mean()
+        fg_better_ratio = (fg_mass_per > bg_mass_per).float().mean()
+        high_ent_ratio = (ent_per > ent_high_thr).float().mean()
+        low_fg_ratio = (fg_mass_per < fg_low_thr).float().mean()
+
+        qv = torch.tensor([0.25, 0.5, 0.75], device=device, dtype=torch.float32)
+
+        def _pct(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            xf = x.float()
+            return torch.quantile(xf, qv[0]), torch.quantile(xf, qv[1]), torch.quantile(xf, qv[2])
+
+        fg_p25, fg_p50, fg_p75 = _pct(fg_mass_per)
+        bg_p25, bg_p50, bg_p75 = _pct(bg_mass_per)
+        en_p25, en_p50, en_p75 = _pct(ent_per)
+        mn_p25, mn_p50, mn_p75 = _pct(mean_per)
+
+        ent = ent_per.mean()
+        fg_mass = fg_mass_per.mean()
+        bg_mass = bg_mass_per.mean()
+
+        ext = {
+            "seg_loc_prior_fg_mass_p25": fg_p25.detach(),
+            "seg_loc_prior_fg_mass_p50": fg_p50.detach(),
+            "seg_loc_prior_fg_mass_p75": fg_p75.detach(),
+            "seg_loc_prior_bg_mass_p25": bg_p25.detach(),
+            "seg_loc_prior_bg_mass_p50": bg_p50.detach(),
+            "seg_loc_prior_bg_mass_p75": bg_p75.detach(),
+            "seg_loc_prior_entropy_p25": en_p25.detach(),
+            "seg_loc_prior_entropy_p50": en_p50.detach(),
+            "seg_loc_prior_entropy_p75": en_p75.detach(),
+            "seg_loc_prior_mean_p25": mn_p25.detach(),
+            "seg_loc_prior_mean_p50": mn_p50.detach(),
+            "seg_loc_prior_mean_p75": mn_p75.detach(),
+            "seg_loc_prior_fg_gt_bg_ratio": fg_gt_bg_ratio.detach(),
+            "seg_loc_prior_fg_better_than_bg_ratio": fg_better_ratio.detach(),
+            "seg_loc_prior_high_entropy_ratio": high_ent_ratio.detach(),
+            "seg_loc_prior_low_fg_mass_ratio": low_fg_ratio.detach(),
+            "seg_loc_prior_coarse_iou_mean": iou_per.mean().detach(),
+            "seg_loc_prior_top1_in_fg_ratio": top_in_fg.mean().detach(),
+        }
+
+        metrics = {
+            "seg_loc_prior_mean": p_det.mean().detach(),
+            "seg_loc_prior_entropy": ent.detach(),
+            "seg_loc_prior_fg_mass": fg_mass.detach(),
+            "seg_loc_prior_bg_mass": bg_mass.detach(),
+        }
+
+        sample_rows = None
+        if bool(getattr(self.config, "export_seg_loc_prior_samples", False)):
+            small_th = float(getattr(self.config, "small_area_ratio_threshold", 0.01) or 0.01)
+            n_inst = prior_logits.shape[0]
+            sample_rows = []
+            row_idx = 0
+            for b in range(bs):
+                seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
+                n_seg = int(seg_pos.numel())
+                si = {}
+                if seg_info is not None and isinstance(seg_info, (list, tuple)) and b < len(seg_info):
+                    raw = seg_info[b]
+                    si = raw if isinstance(raw, dict) else {}
+                for j in range(n_seg):
+                    if row_idx >= n_inst:
+                        break
+                    image_id = str(si.get("image_id", si.get("image_name", "")))
+                    data_id = str(si.get("data_id", si.get("id", "")))
+                    mask_id = str(si.get("mask_id", ""))
+                    sample_key = f"{image_id}_{data_id}_{mask_id}_seg{j}".strip("_")
+                    ptf = float(prior_target_fg_ratio[row_idx].item())
+                    is_small = int(ptf < small_th)
+                    ti = int(top_idx[row_idx].item())
+                    tr = ti // gh
+                    tc = ti % gh
+                    sample_rows.append(
+                        {
+                            "sample_key": sample_key,
+                            "seg_idx": int(j),
+                            "image_id": image_id,
+                            "data_id": data_id,
+                            "mask_id": mask_id,
+                            "is_small": is_small,
+                            "global_step": int(global_step) if global_step is not None else -1,
+                            "seg_loc_prior_fg_mass": float(fg_mass_per[row_idx].item()),
+                            "seg_loc_prior_bg_mass": float(bg_mass_per[row_idx].item()),
+                            "seg_loc_prior_entropy": float(ent_per[row_idx].item()),
+                            "seg_loc_prior_mean": float(mean_per[row_idx].item()),
+                            "prior_target_fg_ratio": ptf,
+                            "seg_loc_prior_coarse_iou": float(iou_per[row_idx].item()),
+                            "seg_loc_prior_top1_in_fg": int(top_in_fg[row_idx].item()),
+                            "seg_loc_prior_top1_row": tr,
+                            "seg_loc_prior_top1_col": tc,
+                        }
+                    )
+                    row_idx += 1
+        return loss, metrics, ext, sample_rows
+
+    def _compute_seg_embedding_for_mask(
+        self,
+        hidden_states: torch.Tensor,
+        attentions: Optional[Tuple],
+        SEG_token_embedding_indices: torch.Tensor,
+        image_features_indices: torch.Tensor,
+    ):
+        """
+        Returns (SEG_embedding_for_predictor, aux).
+
+        aux is None, or dict with:
+          - "loc_logits": [N, G] when use_seg_loc_prior (takes precedence over query refiner)
+          - "loc_fuse_diag": dict of detached scalars for fusion strength logging
+          - "query_diag": dict when use_seg_query_refiner (top-k attention blend path)
+        """
+        if self._seg_loc_prior_enabled():
+            q_mat = self._gather_q_seg_matrix(hidden_states, SEG_token_embedding_indices)
+            if q_mat.size(0) == 0:
+                q_in = self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+                return self.SEG_token_projector(q_in), None
+            q_sem = self.seg_loc_w_sem(q_mat)
+            q_loc = self.seg_loc_w_loc(q_mat)
+            prior_logits = self.seg_loc_prior_head(q_loc)
+            p = torch.sigmoid(prior_logits)
+            loc_code = self.seg_loc_code_linear(p)
+            q_fused_in = torch.cat([q_sem, loc_code], dim=-1)
+            q_final = self.seg_loc_fuse_linear(q_fused_in)
+            seg_emb = self.SEG_token_projector(q_final.unsqueeze(1))
+            eps = 1e-8
+            sem_n = q_sem.norm(dim=-1)
+            loc_n = loc_code.norm(dim=-1)
+            qf_n = q_final.norm(dim=-1)
+            loc_fuse_diag = {
+                "seg_loc_code_norm": loc_n.mean().detach(),
+                "seg_loc_sem_norm": sem_n.mean().detach(),
+                "seg_loc_qfinal_norm": qf_n.mean().detach(),
+                "seg_loc_code_to_sem_norm_ratio": (loc_n / sem_n.clamp_min(eps)).mean().detach(),
+                "seg_loc_cosine_sem_qfinal": F.cosine_similarity(q_sem, q_final, dim=-1, eps=eps).mean().detach(),
+                "seg_loc_cosine_sem_loccode": F.cosine_similarity(q_sem, loc_code, dim=-1, eps=eps).mean().detach(),
+            }
+            return seg_emb, {"loc_logits": prior_logits, "loc_fuse_diag": loc_fuse_diag}
+
+        if (
+            self._seg_query_refiner_enabled()
+            and attentions is not None
+            and len(attentions) > 0
+            and SEG_token_embedding_indices is not None
+            and image_features_indices is not None
+        ):
+            top_k = int(getattr(self.config, "seg_query_topk_tokens", 16) or 16)
+            top_k = max(1, top_k)
+            last_attn = attentions[-1]
+            bs = hidden_states.size(0)
+            d_model = hidden_states.size(-1)
+            device = hidden_states.device
+            dtype = hidden_states.dtype
+
+            q_rows: List[torch.Tensor] = []
+            v_rows: List[torch.Tensor] = []
+
+            for b in range(bs):
+                h_b = hidden_states[b]
+                seg_pos = torch.where(SEG_token_embedding_indices[b].bool())[0]
+                img_pos = torch.where(image_features_indices[b].bool())[0]
+                n_img = int(img_pos.numel())
+                attn_b = last_attn[b]
+
+                for s in seg_pos:
+                    s_i = int(s.item())
+                    q_row = h_b[s_i].to(dtype=dtype)
+                    if n_img == 0:
+                        v_row = torch.zeros(d_model, device=device, dtype=dtype)
+                    else:
+                        seg_to_img = attn_b[:, s_i, img_pos]
+                        w = seg_to_img.mean(dim=0)
+                        k_eff = min(top_k, n_img)
+                        vals, rel_idx = torch.topk(w.float(), k=k_eff)
+                        idx = img_pos[rel_idx]
+                        w_top = torch.softmax(vals, dim=0).to(dtype=dtype)
+                        vecs = h_b[idx]
+                        v_row = (w_top.unsqueeze(-1) * vecs).sum(dim=0)
+                    q_rows.append(q_row)
+                    v_rows.append(v_row)
+
+            if len(q_rows) == 0:
+                q_in = self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+                return self.SEG_token_projector(q_in), None
+
+            q_mat = torch.stack(q_rows, dim=0)
+            v_mat = torch.stack(v_rows, dim=0)
+            delta_q = self.seg_query_refiner_mlp(v_mat)
+            q_new = 0.5 * q_mat + 0.5 * delta_q
+            seg_emb = self.SEG_token_projector(q_new.unsqueeze(1))
+
+            eps = 1e-6
+            diag = {
+                "seg_query_delta_norm": delta_q.norm(dim=-1).mean().detach(),
+                "seg_query_original_norm": q_mat.norm(dim=-1).mean().detach(),
+                "seg_query_refined_norm": q_new.norm(dim=-1).mean().detach(),
+                "seg_query_cosine_q_delta": F.cosine_similarity(q_mat, delta_q, dim=-1, eps=eps).mean().detach(),
+                "seg_query_cosine_q_qnew": F.cosine_similarity(q_mat, q_new, dim=-1, eps=eps).mean().detach(),
+            }
+            return seg_emb, {"query_diag": diag}
+
+        q_in = self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+        return self.SEG_token_projector(q_in), None
 
     def set_attention_loss_config(self):
         self.attention_loss = AttentionLoss(
@@ -1423,23 +1834,32 @@ class SegEarthR2(MiphaPhiForCausalLM):
         image_features,
         mask_num,
         SEG_token_embedding_indices: torch.Tensor,
-        use_cache: Optional[bool],
-        return_dict: bool,
-        output_attentions: bool,
+        image_features_indices: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        return_dict: bool = True,
+        output_attentions: bool = False,
     ):
+        eff_output_att = bool(output_attentions) or (
+            self._seg_query_refiner_enabled() and not self._seg_loc_prior_enabled()
+        )
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
-            output_attentions=output_attentions,
+            output_attentions=eff_output_att,
             output_hidden_states=False,
             return_dict=return_dict,
         )
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        SEG_embedding, _ = self._compute_seg_embedding_for_mask(
+            hidden_states,
+            outputs.attentions,
+            SEG_token_embedding_indices,
+            image_features_indices,
+        )
         mask_features, _transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features
         )
@@ -1560,6 +1980,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 image_features,
                 mask_num,
                 SEG_token_embedding_indices,
+                image_features_indices,
                 use_cache,
                 return_dict,
                 output_attentions=False,
@@ -1573,6 +1994,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 image_features,
                 mask_num,
                 SEG_token_embedding_indices,
+                image_features_indices,
                 use_cache,
                 return_dict,
                 output_attentions=False,
@@ -1705,6 +2127,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        seg_query_diag = None
+        loc_logits = None
+        loc_fuse_diag = {}
+        loss_seg_loc_tensor = None
+        loc_prior_metrics = {}
+        loc_prior_ext = {}
+        seg_loc_prior_sample_rows = None
 
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
@@ -1730,8 +2159,21 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        
+        SEG_embedding, seg_aux = self._compute_seg_embedding_for_mask(
+            hidden_states,
+            outputs.attentions,
+            SEG_token_embedding_indices,
+            image_features_indices,
+        )
+        if seg_aux:
+            seg_query_diag = seg_aux.get("query_diag")
+            loc_logits = seg_aux.get("loc_logits")
+            loc_fuse_diag = seg_aux.get("loc_fuse_diag") or {}
+        else:
+            seg_query_diag = None
+            loc_logits = None
+            loc_fuse_diag = {}
+
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
         mask_num = torch.tensor(mask_num, device=mask_features.device)
@@ -1804,6 +2246,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 else:
                     mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
+            if loc_logits is not None and targets is not None:
+                loss_seg_loc_tensor, loc_prior_metrics, loc_prior_ext, seg_loc_prior_sample_rows = (
+                    self._seg_loc_prior_loss_and_metrics(
+                        loc_logits,
+                        targets,
+                        SEG_token_embedding_indices,
+                        seg_info=seg_info,
+                        global_step=global_step,
+                    )
+                )
             if targets is not None and self._should_run_structured_effect_diagnose(global_step, seg_info):
                 structured_effect_diag_pack = self._run_structured_effect_diagnostics(
                     outputs=outputs,
@@ -1831,7 +2283,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             global_step=global_step,
         )
         attention_loss_weight = getattr(self.config, "attention_loss_weight", 0.01)
-        loss = llm_loss + mask_loss + attention_loss_weight * loss_attention
+        w_loc = float(getattr(self.config, "seg_loc_prior_weight", 0.1))
+        loc_term = (
+            w_loc * loss_seg_loc_tensor
+            if loss_seg_loc_tensor is not None
+            else torch.tensor(0.0, device=loss_attention.device, dtype=loss_attention.dtype)
+        )
+        loss = llm_loss + mask_loss + loc_term + attention_loss_weight * loss_attention
 
         return CausalOutputWithMask(
             loss=loss,
@@ -1945,6 +2403,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 if structured_effect_diag_pack
                 else None
             ),
+            seg_query_delta_norm=seg_query_diag["seg_query_delta_norm"] if seg_query_diag else None,
+            seg_query_original_norm=seg_query_diag["seg_query_original_norm"] if seg_query_diag else None,
+            seg_query_refined_norm=seg_query_diag["seg_query_refined_norm"] if seg_query_diag else None,
+            seg_query_cosine_q_delta=seg_query_diag["seg_query_cosine_q_delta"] if seg_query_diag else None,
+            seg_query_cosine_q_qnew=seg_query_diag["seg_query_cosine_q_qnew"] if seg_query_diag else None,
+            loss_seg_loc_prior=loss_seg_loc_tensor.detach() if loss_seg_loc_tensor is not None else None,
+            seg_loc_prior_mean=loc_prior_metrics.get("seg_loc_prior_mean") if loc_prior_metrics else None,
+            seg_loc_prior_entropy=loc_prior_metrics.get("seg_loc_prior_entropy") if loc_prior_metrics else None,
+            seg_loc_prior_fg_mass=loc_prior_metrics.get("seg_loc_prior_fg_mass") if loc_prior_metrics else None,
+            seg_loc_prior_bg_mass=loc_prior_metrics.get("seg_loc_prior_bg_mass") if loc_prior_metrics else None,
+            seg_loc_code_norm=loc_fuse_diag.get("seg_loc_code_norm") if loc_fuse_diag else None,
+            seg_loc_sem_norm=loc_fuse_diag.get("seg_loc_sem_norm") if loc_fuse_diag else None,
+            seg_loc_qfinal_norm=loc_fuse_diag.get("seg_loc_qfinal_norm") if loc_fuse_diag else None,
+            seg_loc_code_to_sem_norm_ratio=loc_fuse_diag.get("seg_loc_code_to_sem_norm_ratio") if loc_fuse_diag else None,
+            seg_loc_cosine_sem_qfinal=loc_fuse_diag.get("seg_loc_cosine_sem_qfinal") if loc_fuse_diag else None,
+            seg_loc_cosine_sem_loccode=loc_fuse_diag.get("seg_loc_cosine_sem_loccode") if loc_fuse_diag else None,
+            seg_loc_prior_extended_metrics=loc_prior_ext if loc_prior_ext else None,
+            seg_loc_prior_sample_rows=seg_loc_prior_sample_rows,
         )
     
     def eval_seg(
@@ -1969,7 +2445,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         return_mask_logits_all: if True, each output dict includes float32 'pred_logits_all' [Q,H,W]
         (after interpolate to image size). Default False preserves legacy eval behavior.
         """
-        output_attentions = False
+        output_attentions = bool(self._seg_query_refiner_enabled()) and not self._seg_loc_prior_enabled()
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1990,9 +2466,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict=return_dict
         )
 
-        hidden_states = outputs.last_hidden_state   
+        hidden_states = outputs.last_hidden_state
 
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        SEG_embedding, _ = self._compute_seg_embedding_for_mask(
+            hidden_states,
+            outputs.attentions,
+            SEG_token_embedding_indices,
+            image_features_indices,
+        )
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)

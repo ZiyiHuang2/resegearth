@@ -22,6 +22,7 @@ import functools
 import glob
 import importlib.metadata
 import inspect
+import json
 import math
 import os
 import random
@@ -222,6 +223,52 @@ class LLaVATrainer(Trainer):
                     if value != 0:
                         self.history_loss_dict[name] = value.item()
 
+    def _maybe_export_seg_loc_prior(self, outputs):
+        """Append prior batch metrics and/or per-sample rows to jsonl under output_dir (rank 0)."""
+        if not self.is_world_process_zero():
+            return
+        if not (
+            getattr(self.args, "export_seg_loc_prior_metrics", False)
+            or getattr(self.args, "export_seg_loc_prior_samples", False)
+        ):
+            return
+        out_dir = getattr(self.args, "output_dir", None) or None
+        if not out_dir:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        step = int(self.state.global_step)
+
+        if getattr(self.args, "export_seg_loc_prior_metrics", False):
+            ext = getattr(outputs, "seg_loc_prior_extended_metrics", None) or {}
+            row = {"global_step": step}
+            for k, v in ext.items():
+                fv = self._to_float_metric(v)
+                if fv is not None:
+                    row[k] = fv
+            for k in (
+                "loss_seg_loc_prior",
+                "seg_loc_prior_mean",
+                "seg_loc_prior_entropy",
+                "seg_loc_prior_fg_mass",
+                "seg_loc_prior_bg_mass",
+            ):
+                fv = self._to_float_metric(getattr(outputs, k, None))
+                if fv is not None:
+                    row[k] = fv
+            path = os.path.join(out_dir, "seg_loc_prior_metrics.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+        if getattr(self.args, "export_seg_loc_prior_samples", False):
+            rows = getattr(outputs, "seg_loc_prior_sample_rows", None)
+            if rows:
+                path = os.path.join(out_dir, "seg_loc_prior_samples.jsonl")
+                with open(path, "a", encoding="utf-8") as f:
+                    for r in rows:
+                        rr = dict(r)
+                        rr["global_step"] = step
+                        f.write(json.dumps(rr, ensure_ascii=False) + "\n")
+
     @staticmethod
     def _to_float_metric(value):
         if value is None:
@@ -285,14 +332,14 @@ class LLaVATrainer(Trainer):
             else:
                 loss = self.label_smoother(outputs, labels)
         else:
-            if isinstance(outputs, dict) and "loss" not in outputs:
+            if isinstance(outputs, Mapping) and "loss" not in outputs:
                 raise ValueError(
                     "The model did not return a loss from the inputs, only the following keys: "
                     f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-            if isinstance(outputs, dict):
+            loss = outputs["loss"] if isinstance(outputs, Mapping) else outputs[0]
+            if isinstance(outputs, Mapping):
                 metric_dict = {
                     "loss": self._to_float_metric(loss),
                     "data_time": data_time,
@@ -344,14 +391,52 @@ class LLaVATrainer(Trainer):
                     "diag_delta_iou_vs_gt",
                     "diag_attention_sup_default_minus_unstructured",
                     "diag_structured_supervision_alters_mask_forward_path",
+                    "seg_query_delta_norm",
+                    "seg_query_original_norm",
+                    "seg_query_refined_norm",
+                    "seg_query_cosine_q_delta",
+                    "seg_query_cosine_q_qnew",
+                    "loss_seg_loc_prior",
+                    "seg_loc_prior_mean",
+                    "seg_loc_prior_entropy",
+                    "seg_loc_prior_fg_mass",
+                    "seg_loc_prior_bg_mass",
+                    "seg_loc_code_norm",
+                    "seg_loc_sem_norm",
+                    "seg_loc_qfinal_norm",
+                    "seg_loc_code_to_sem_norm_ratio",
+                    "seg_loc_cosine_sem_qfinal",
+                    "seg_loc_cosine_sem_loccode",
                 ]:
                     if key in outputs:
                         scalar = self._to_float_metric(outputs[key])
                         if scalar is not None:
                             metric_dict[key] = scalar
+                ext_map = getattr(outputs, "seg_loc_prior_extended_metrics", None)
+                if ext_map:
+                    for kn, val in ext_map.items():
+                        s = self._to_float_metric(val)
+                        if s is not None:
+                            metric_dict[kn] = s
                 self.update_history_loss_dict(outputs)
-                self.log({k: v for k, v in metric_dict.items() if v is not None})
+                log_payload = {k: v for k, v in metric_dict.items() if v is not None}
+                if getattr(self.args, "diagnose_seg_loc_prior_only", False):
+                    keep = {
+                        "loss",
+                        "data_time",
+                        "iter_time",
+                        "forward_time",
+                        "throughput",
+                        "loss_seg_loc_prior",
+                    }
+                    log_payload = {
+                        k: v
+                        for k, v in log_payload.items()
+                        if k in keep or str(k).startswith("seg_loc_prior")
+                    }
+                self.log(log_payload)
 
+        self._maybe_export_seg_loc_prior(outputs)
         return (loss, outputs) if return_outputs else loss
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
