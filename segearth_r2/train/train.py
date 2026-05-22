@@ -4,6 +4,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
@@ -54,6 +55,7 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     mask_style: str = "legacy"
+    dataset_name: str = "rrsisd"
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -183,26 +185,125 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+def ensure_single_special_token(tokenizer, model, token_text: str) -> int:
+    """
+    Ensure token_text is registered as a single tokenizer token and model embeddings
+    are resized when needed.
+    """
+    before_vocab_size = len(tokenizer)
+
+    token_id = tokenizer.convert_tokens_to_ids(token_text)
+    encoded = tokenizer.encode(token_text, add_special_tokens=False)
+
+    already_single = (
+        token_id is not None
+        and isinstance(token_id, int)
+        and len(encoded) == 1
+        and encoded[0] == token_id
+    )
+
+    if not already_single:
+        num_new_tokens = tokenizer.add_special_tokens(
+            {"additional_special_tokens": [token_text]}
+        )
+        if num_new_tokens > 0:
+            model.resize_token_embeddings(len(tokenizer))
+
+    token_id = tokenizer.convert_tokens_to_ids(token_text)
+    encoded = tokenizer.encode(token_text, add_special_tokens=False)
+
+    if token_id is None or len(encoded) != 1 or encoded[0] != token_id:
+        raise ValueError(
+            f"Failed to register {token_text} as a single tokenizer token. "
+            f"token_id={token_id}, encoded={encoded}, "
+            f"vocab_before={before_vocab_size}, vocab_after={len(tokenizer)}"
+        )
+
+    print(f"[tokenizer] ensured special token {token_text} -> id={token_id}")
+    return token_id
 def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_args):
     data_ratio = data_args.data_ratio
     data_ratio = data_ratio.split('||')
     data_ratio = [int(data_) for data_ in data_ratio]
     datasets = []
-    if data_ratio[0] != 0:
-        RRSISTrainDataset = RRSISDDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            split='train'
-        )
-        datasets += [RRSISTrainDataset] * data_ratio[0]
 
-    
+    dataset_name = data_args.dataset_name.lower()
+
+    if data_ratio[0] != 0:
+        if dataset_name == "rrsisd":
+            train_dataset_single = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train'
+            )
+            eval_dataset = RRSISDDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='val'
+            )
+        elif dataset_name == "lasers":
+            train_dataset_single = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train_data.json'
+            )
+            eval_dataset = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='val_data.json'
+            )
+
+        elif dataset_name == "refsegrs":
+            train_dataset_single = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train'
+            )
+            eval_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='val'
+            )
+        elif dataset_name == "risbench":
+            train_dataset_single = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='train'
+            )
+            eval_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split='val'
+            )
+        else:
+            raise ValueError(
+                f"Unsupported dataset_name={data_args.dataset_name}. "
+                f"Expected one of: rrsisd, lasers, refsegrs, risbench"
+            )
+
+        datasets += [train_dataset_single] * data_ratio[0]
+    else:
+        raise ValueError("data_ratio[0] is 0; train dataset is empty.")
+
     print(f'the dataset ratio is: {data_ratio}')
-    train_dataset = UnifyDatasetSingleDatasetForBatch(datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len)
+    print(f'the dataset name is: {dataset_name}')
+    train_dataset = UnifyDatasetSingleDatasetForBatch(
+        datasets, data_ratio, data_args.switch_bs, fix_dataset_len=data_args.fix_dataset_len
+    )
     print(f'total unify datasest number is {len(train_dataset)}')
-    data_collator = DataCollatorForCOCODatasetV2(tokenizer=tokenizer, clip_image_processor=clip_image_processor)
-    return dict(train_dataset=train_dataset, eval_dataset=None, data_collator=data_collator)
+    data_collator = DataCollatorForCOCODatasetV2(
+        tokenizer=tokenizer,
+        clip_image_processor=clip_image_processor
+    )
+    return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 def _non_ignore_spans(labels, ignore_index=IGNORE_INDEX):
     spans = []
@@ -224,7 +325,7 @@ def _format_prompt_for_dump(prompt_text, keep_chars=500):
     return prompt_text[:keep_chars] + "\n...[TRUNCATED]...\n" + prompt_text[-keep_chars:]
 
 
-def _safe_decode_with_placeholders(tokenizer, input_ids):
+def _safe_decode_with_placeholders(tokenizer, input_ids, seg_token_id=None):
     parts = []
     valid_ids = []
     vocab_size = getattr(tokenizer, "vocab_size", None)
@@ -250,6 +351,9 @@ def _safe_decode_with_placeholders(tokenizer, input_ids):
         elif vocab_size is not None and (tid_int < 0 or tid_int >= vocab_size):
             flush_valid()
             parts.append(f"<tok:{tid_int}>")
+        elif seg_token_id is not None and tid_int == seg_token_id:
+            flush_valid()
+            parts.append("[SEG]")
         else:
             valid_ids.append(tid_int)
 
@@ -282,7 +386,7 @@ def dump_prompt_diagnostics_step0(
             if torch.is_tensor(labels):
                 labels = labels.tolist()
 
-            prompt_text = _safe_decode_with_placeholders(tokenizer, input_ids)
+            prompt_text = _safe_decode_with_placeholders(tokenizer, input_ids, seg_token_id=seg_token_id)
             spans = _non_ignore_spans(labels)
             ignore_cnt = sum(1 for x in labels if x == IGNORE_INDEX)
             total_cnt = len(labels)
@@ -347,7 +451,14 @@ def train():
         (ModelArguments, DataArguments, TrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if training_args.seed is None:
+        training_args.seed = 42
+    if training_args.data_seed is None:
+        training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
 
     compute_dtype = (
         torch.float16 if training_args.fp16 else
@@ -436,8 +547,9 @@ def train():
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = True
 
-    tokenizer.add_tokens("[SEG]")
-    model.resize_token_embeddings(len(tokenizer))
+    seg_token_id = ensure_single_special_token(tokenizer, model, "[SEG]")
+    print("SEG token id after tokenizer add:", tokenizer.convert_tokens_to_ids("[SEG]"))
+    print("SEG encode after tokenizer add:", tokenizer.encode("[SEG]", add_special_tokens=False))
 
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
@@ -469,7 +581,7 @@ def train():
                 p.requires_grad = True
 
     model.get_special_token(
-        SEG=tokenizer("[SEG]", return_tensors="pt", add_special_tokens=False)["input_ids"],
+        SEG=torch.tensor([[seg_token_id]], dtype=torch.long),
         EOS=tokenizer.eos_token_id
     )
 
@@ -495,6 +607,19 @@ def train():
             max_samples=10,
         )
     training_args.dataloader_drop_last = True
+    if hasattr(training_args, "evaluation_strategy"):
+        training_args.evaluation_strategy = "steps"
+    if hasattr(training_args, "eval_strategy"):
+        training_args.eval_strategy = "steps"
+    training_args.save_strategy = "steps"
+    if training_args.save_steps is None or training_args.save_steps <= 0:
+        training_args.save_steps = 500
+    training_args.eval_steps = training_args.save_steps
+    training_args.load_best_model_at_end = True
+    training_args.metric_for_best_model = "eval_score"
+    training_args.greater_is_better = True
+    if training_args.save_total_limit is None or training_args.save_total_limit > 2:
+        training_args.save_total_limit = 2
 
     current_device = torch.device(f"cuda:{training_args.local_rank}") if torch.cuda.is_available() and training_args.local_rank != -1 else training_args.device
     model.to(current_device)

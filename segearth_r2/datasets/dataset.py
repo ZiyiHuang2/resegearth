@@ -21,7 +21,7 @@ from PIL import Image
 from fvcore.common.config import CfgNode
 import warnings
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
-from segearth_r2.model.mipha import conversation as conversation_lib
+from segearth_r2.utils import conversation as conversation_lib
 from segearth_r2.model import *
 from segearth_r2.model.mask_decoder.mask_config.config import Config
 
@@ -44,6 +44,25 @@ def _tokenizer_special_tokens_impl(prompt, tokenizer, image_token_index=IMAGE_TO
             return torch.tensor(input_ids, dtype=torch.long).squeeze()
         raise ValueError(f'Unsupported tensor type: {return_tensors}')
     return input_ids
+
+def _get_single_token_id_or_raise(tokenizer, token_text: str) -> int:
+    token_id = tokenizer.convert_tokens_to_ids(token_text)
+    encoded = tokenizer.encode(token_text, add_special_tokens=False)
+
+    if token_id is None or len(encoded) != 1 or encoded[0] != token_id:
+        raise ValueError(
+            f"{token_text} is not a single tokenizer token. "
+            f"token_id={token_id}, encoded={encoded}. "
+            f"Make sure train/eval registered it via add_special_tokens before building datasets."
+        )
+    return token_id
+
+
+def _build_single_token_marker_indices(input_ids: torch.Tensor, token_id: int) -> torch.Tensor:
+    marker = torch.zeros_like(input_ids)
+    marker[input_ids == token_id] = 1
+    return marker
+
 def preprocess_mask(mask, image_size):
     if len(mask.shape) == 2:
         mask = np.expand_dims(mask, axis=0)
@@ -127,47 +146,60 @@ class RS_Base_Dataset(Dataset):
         return prompt, input_ids
 
     def _mask_with_chatml_style(self, sources, tokenizer):
-        def _find_subseq(haystack, needle, start=0):
-            if needle.numel() == 0 or haystack.numel() < needle.numel():
-                return -1
-            max_start = haystack.numel() - needle.numel()
-            for st in range(start, max_start + 1):
-                if torch.equal(haystack[st:st + needle.numel()], needle):
-                    return st
-            return -1
-
         input_ids_list = []
         labels_list = []
-        assistant_prefix_ids = _tokenizer_special_tokens_impl("<|im_start|>assistant\n", tokenizer, return_tensors='pt')
-        im_end_ids = _tokenizer_special_tokens_impl("<|im_end|>", tokenizer, return_tensors='pt')
+    
+        assistant_header = "<|im_start|>assistant\n"
+        im_end_text = "<|im_end|>"
+
         for source in sources:
             prompt, input_ids = self._tokenize_source_as_conversation(source, tokenizer)
             labels = torch.full_like(input_ids, IGNORE_INDEX)
+
             chatml_masked = False
-            cursor = 0
+            cursor_char = 0
+
             while True:
-                assist_pos = _find_subseq(input_ids, assistant_prefix_ids, start=cursor)
+                assist_pos = prompt.find(assistant_header, cursor_char)
                 if assist_pos < 0:
                     break
-                content_start = assist_pos + assistant_prefix_ids.numel()
-                content_end_marker = _find_subseq(input_ids, im_end_ids, start=content_start)
-                if content_end_marker < 0:
-                    break
-                if content_end_marker > content_start:
-                    labels[content_start:content_end_marker] = input_ids[content_start:content_end_marker]
-                    chatml_masked = True
-                cursor = content_end_marker + im_end_ids.numel()
 
+                content_start_char = assist_pos + len(assistant_header)
+                content_end_char = prompt.find(im_end_text, content_start_char)
+                if content_end_char < 0:
+                    break
+
+            # 用“前缀 token 长度”把字符位置映射回 token 位置
+                prefix_ids = _tokenizer_special_tokens_impl(
+                    prompt[:content_start_char], tokenizer, return_tensors="pt"
+                )
+                content_ids = _tokenizer_special_tokens_impl(
+                    prompt[:content_end_char], tokenizer, return_tensors="pt"
+                )
+
+                token_start = prefix_ids.numel()
+                token_end = content_ids.numel()
+
+                if token_end > token_start:
+                    labels[token_start:token_end] = input_ids[token_start:token_end]
+                    chatml_masked = True
+
+                cursor_char = content_end_char + len(im_end_text)
+
+            # 如果字符串边界法没命中，再保底 fallback 到 assistant_value 的尾部匹配
             if not chatml_masked:
                 assistant_value = source[-1]["value"] if len(source) > 0 else ""
-                assistant_ids = _tokenizer_special_tokens_impl(assistant_value, tokenizer, return_tensors='pt')
+                assistant_ids = _tokenizer_special_tokens_impl(
+                    assistant_value, tokenizer, return_tensors="pt"
+                )
+
                 if assistant_ids.numel() <= 0 or input_ids.numel() < assistant_ids.numel():
                     prompt_snippet = prompt[:200].replace("\n", "\\n")
                     raise ValueError(
                         f"[mask_style=chatml] invalid assistant tokens for masking. "
                         f"version={conversation_lib.default_conversation.version}, "
                         f"assistant_len={assistant_ids.numel()}, input_len={input_ids.numel()}, "
-                        f"prompt_snippet={prompt_snippet}"
+                        f"assistant_ids={assistant_ids.tolist()}, prompt_snippet={prompt_snippet}"
                     )
 
                 start_idx = -1
@@ -183,12 +215,18 @@ class RS_Base_Dataset(Dataset):
                         prompt_snippet = prompt[:200].replace("\n", "\\n")
                         print(
                             f"[mask_style=chatml][fallback-tail] assistant span not found, "
-                            f"use tail span instead. version={conversation_lib.default_conversation.version}, "
-                            f"assistant_len={assistant_ids.numel()}, start_idx={start_idx}, prompt_snippet={prompt_snippet}"
-                        )
+                            f"use tail span instead. "
+                            f"version={conversation_lib.default_conversation.version}, "
+                            f"assistant_len={assistant_ids.numel()}, "
+                            f"assistant_ids={assistant_ids.tolist()}, "
+                            f"start_idx={start_idx}, "
+                            f"input_len={input_ids.numel()}, "
+                            f"prompt_snippet={prompt_snippet}"
+                            )
                         self._chatml_fallback_warned = True
 
                 labels[start_idx:start_idx + assistant_ids.numel()] = input_ids[start_idx:start_idx + assistant_ids.numel()]
+
             input_ids_list.append(input_ids)
             labels_list.append(labels)
 
@@ -225,7 +263,7 @@ class RS_Base_Dataset(Dataset):
         # Tokenize conversations
 
         input_ids = torch.stack(
-            [self.tokenizer_special_tokens(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+            [_tokenizer_special_tokens_impl(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
 
         targets = input_ids.clone()
 
@@ -256,13 +294,13 @@ class RS_Base_Dataset(Dataset):
                         break
                     parts[0] += sep
                     if idx > 0:
-                        round_len = len(self.tokenizer_special_tokens(rou, tokenizer)) + 1
+                        round_len = len(_tokenizer_special_tokens_impl(rou, tokenizer)) + 1
                     else:
-                        round_len = len(self.tokenizer_special_tokens(rou, tokenizer)) + 1
+                        round_len = len(_tokenizer_special_tokens_impl(rou, tokenizer)) + 1
                     if idx > 0:
-                        instruction_len = len(self.tokenizer_special_tokens(parts[0], tokenizer))
+                        instruction_len = len(_tokenizer_special_tokens_impl(parts[0], tokenizer))
                     else:
-                        instruction_len = len(self.tokenizer_special_tokens(parts[0], tokenizer)) - 2
+                        instruction_len = len(_tokenizer_special_tokens_impl(parts[0], tokenizer)) - 2
 
                     target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
@@ -289,8 +327,8 @@ class RS_Base_Dataset(Dataset):
                     if len(parts) != 2:
                         break
                     parts[0] += sep
-                    round_len = len(self.tokenizer_special_tokens(rou, tokenizer))
-                    instruction_len = len(self.tokenizer_special_tokens(parts[0], tokenizer)) - 2
+                    round_len = len(_tokenizer_special_tokens_impl(rou, tokenizer))
+                    instruction_len = len(_tokenizer_special_tokens_impl(parts[0], tokenizer)) - 2
 
                     target[cur_len: cur_len + instruction_len] = IGNORE_INDEX
 
@@ -328,7 +366,7 @@ class RRSISDDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.mask_style = getattr(data_args, "mask_style", "legacy")
-        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SEG_token_id = _get_single_token_id_or_raise(self.tokenizer, "[SEG]")
 
         # 官方目录结构
         self.image_dir = os.path.join(base_data_path, "images", "rrsisd", "JPEGImages")
@@ -357,6 +395,9 @@ class RRSISDDataset(RS_Base_Dataset):
         ref = self.reason_file[idx]
 
         image_path = os.path.join(self.image_dir, ref["file_name"])
+        image_BGR = cv2.imread(image_path)
+        if image_BGR is None:
+            raise FileNotFoundError(f"failed to read image: {image_path}")
         data_id = ref["ref_id"]
 
         # 文本描述
@@ -427,9 +468,18 @@ class RRSISDDataset(RS_Base_Dataset):
         text_dict = self.preprocess_llama2(sources, self.tokenizer, mask_style=self.mask_style)
         input_ids = text_dict['input_ids'][0]
 
-        SEG_token_embedding_indices = torch.zeros_like(input_ids)
-        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        SEG_token_embedding_indices = _build_single_token_marker_indices(
+            input_ids, self.SEG_token_id
+        )
 
+        seg_count = int(SEG_token_embedding_indices.sum().item())
+        if seg_count != 1:
+            raise ValueError(
+                f"[RRSISD] SEG token count mismatch. "
+                f"expected=1, actual={seg_count}, "
+                f"answer={answer}, seg_token_id={self.SEG_token_id}, "
+                f"encoded_answer={self.tokenizer.encode(answer, add_special_tokens=False)}"
+    )
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
 
@@ -474,7 +524,7 @@ class LaSeRSDataset(RS_Base_Dataset):
         else:
             raise ValueError(f"Unsupported split: {split}")
 
-        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SEG_token_id = _get_single_token_id_or_raise(self.tokenizer, "[SEG]")
         
         with open(self.LaSeRS_json_path, "r") as f:
             data = json.load(f)
@@ -486,6 +536,9 @@ class LaSeRSDataset(RS_Base_Dataset):
     def __getitem__(self, idx):
         data_info = self.reason_file[idx]
         image_path = os.path.join(self.LaSeRS_image_path, data_info['image_name'])
+        image_BGR = cv2.imread(image_path)
+        if image_BGR is None:
+            raise FileNotFoundError(f"failed to read image: {image_path}")
         ref = data_info['description']
         answer = data_info['answer']
         data_id = data_info['id']
@@ -541,9 +594,19 @@ class LaSeRSDataset(RS_Base_Dataset):
         text_dict = self.preprocess_llama2(sources, self.tokenizer, mask_style=self.mask_style)
         input_ids = text_dict['input_ids'][0]
         
-        SEG_token_embedding_indices = torch.zeros_like(input_ids)
-        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
-        
+        SEG_token_embedding_indices = _build_single_token_marker_indices(
+                input_ids, self.SEG_token_id
+            )
+        expected_seg_num = answer.count("[SEG]")
+        actual_seg_num = int(SEG_token_embedding_indices.sum().item())
+        if actual_seg_num != expected_seg_num:
+            raise ValueError(
+                f"[LaSeRS] SEG token count mismatch. "
+                f"expected={expected_seg_num}, actual={actual_seg_num}, "
+                f"answer={answer}, seg_token_id={self.SEG_token_id}, "
+                f"encoded_answer={self.tokenizer.encode(answer, add_special_tokens=False)}"
+            )
+
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
         
@@ -557,6 +620,237 @@ class LaSeRSDataset(RS_Base_Dataset):
         
         data_dict['mask_num'] = mask_num
         
+        return data_dict
+
+class RefSegRSDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split='train'):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+
+        split = split.lower()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unsupported RefSegRS split: {split}")
+
+        self.image_dir = os.path.join(base_data_path, "images")
+        self.mask_dir = os.path.join(base_data_path, "masks")
+        self.phrase_path = os.path.join(base_data_path, f"output_phrase_{split}.txt")
+
+        if not os.path.isfile(self.phrase_path):
+            raise FileNotFoundError(f"RefSegRS phrase file not found: {self.phrase_path}")
+
+        self.reason_file = []
+        with open(self.phrase_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                sid, phrase = parts[0].strip(), parts[1].strip()
+                self.reason_file.append({"sample_id": sid, "description": phrase})
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        sid = rec["sample_id"]
+        instruction = rec["description"]
+
+        image_path = os.path.join(self.image_dir, f"{sid}.tif")
+        mask_path = os.path.join(self.mask_dir, f"{sid}.tif")
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"RefSegRS image missing: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(f"RefSegRS mask missing: {mask_path}")
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to read RefSegRS mask: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = (mask > 0).astype(np.uint8)
+        masks = np.expand_dims(mask, axis=0)
+
+        data_dict = {}
+        data_dict["file_name"] = image_path
+
+        image_BGR = cv2.imread(image_path)
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = sid
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        data_dict["annotations"] = [{
+            "data_id": int(sid),
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": sid,
+        }]
+
+        prefix_inst = "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:"
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"}
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict["input_ids"][0]
+
+        SEG_token_embedding_indices = torch.zeros_like(input_ids)
+        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
+        return data_dict
+
+
+class RISBenchDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split='train'):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+
+        split = split.lower()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unsupported RISBench split: {split}")
+
+        self.image_dir = os.path.join(base_data_path, "img_rgb")
+        self.mask_dir = os.path.join(base_data_path, "mask")
+        self.phrase_path = os.path.join(base_data_path, f"output_phrase_{split}.txt")
+
+        if not os.path.isfile(self.phrase_path):
+            raise FileNotFoundError(f"RISBench phrase file not found: {self.phrase_path}")
+
+        self.reason_file = []
+        with open(self.phrase_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line_idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                fname, phrase = parts[0].strip(), parts[1].strip()
+                stem = os.path.splitext(fname)[0]
+                self.reason_file.append({
+                    "line_idx": line_idx,
+                    "file_name": fname,
+                    "stem": stem,
+                    "description": phrase,
+                })
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        fname = rec["file_name"]
+        stem = rec["stem"]
+        instruction = rec["description"]
+
+        image_path = os.path.join(self.image_dir, fname)
+        mask_path = os.path.join(self.mask_dir, fname)
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"RISBench image missing: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(f"RISBench mask missing: {mask_path}")
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to read RISBench mask: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = (mask > 0).astype(np.uint8)
+        masks = np.expand_dims(mask, axis=0)
+
+        data_dict = {}
+        data_dict["file_name"] = image_path
+
+        image_BGR = cv2.imread(image_path)
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = stem
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        # Use idx as unique id to avoid occasional duplicate keys in phrase files.
+        data_dict["annotations"] = [{
+            "data_id": int(idx),
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": stem,
+        }]
+
+        prefix_inst = "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:"
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"}
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict["input_ids"][0]
+
+        SEG_token_embedding_indices = torch.zeros_like(input_ids)
+        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
         return data_dict
 
 @dataclass

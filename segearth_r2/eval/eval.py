@@ -17,6 +17,8 @@ from segearth_r2.utils.builder import load_pretrained_model
 from segearth_r2.datasets.dataset import (
     DataCollatorForCOCODatasetV2,
     LaSeRSDataset,
+    RefSegRSDataset,
+    RISBenchDataset,
     RRSISDDataset,
 )
 
@@ -42,15 +44,19 @@ class DataArguments:
     image_aspect_ratio: str = "square"
     image_grid_pinpoints: Optional[str] = field(default=None)
     model_map_name: str = "segearth_r2"
-    version: str = "llava_phi"
+    version: str = "qwen2_5_vl"
+    mask_style: str = "chatml"
     output_dir: str = "save_folder"
     eval_batch_size: int = 1
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
+
+    load_8bit: bool = False
+    load_4bit: bool = False
     eval_dtype: str = "float16"   # float16 / bfloat16 / float32
 
     # 新增：数据集类型与 split
-    dataset_name: str = "lasers"   # "lasers" or "rrsisd"
+    dataset_name: str = "lasers"   # "lasers" or "rrsisd" or "refsegrs" or "risbench"
     split: str = "val"             # for rrsisd: train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
@@ -133,6 +139,41 @@ def build_eval_datasets(data_args, tokenizer):
         split_name = f"{split}.json"
         return [(split_name, eval_dataset)]
 
+    elif dataset_name == "refsegrs":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported RefSegRS split: {split}. Must be train / val / test")
+
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is RefSegRS {split} subset -------")
+
+        eval_dataset = RefSegRSDataset(
+            base_data_path=data_args.base_data_path,
+            tokenizer=tokenizer,
+            data_args=data_args,
+            split=split,
+        )
+
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
+
+    elif dataset_name == "risbench":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported RISBench split: {split}. Must be train / val / test")
+
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is RISBench {split} subset -------")
+
+        eval_dataset = RISBenchDataset(
+            base_data_path=data_args.base_data_path,
+            tokenizer=tokenizer,
+            data_args=data_args,
+            split=split,
+        )
+
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
     else:
         raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
@@ -153,7 +194,30 @@ def evaluation():
         model_args=data_args,
         mask_config=data_args.mask_config,
         device="cuda",
+        load_8bit=data_args.load_8bit,
+        load_4bit=data_args.load_4bit,
     )
+
+    seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
+    encoded = tokenizer.encode("[SEG]", add_special_tokens=False)
+
+    if seg_token_id is None or len(encoded) != 1 or encoded[0] != seg_token_id:
+        num_new_tokens = tokenizer.add_special_tokens(
+            {"additional_special_tokens": ["[SEG]"]}
+        )
+        if num_new_tokens > 0:
+            model.resize_token_embeddings(len(tokenizer))
+
+    seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
+    encoded = tokenizer.encode("[SEG]", add_special_tokens=False)
+
+    if seg_token_id is None or len(encoded) != 1 or encoded[0] != seg_token_id:
+        raise ValueError(
+            f"[eval] [SEG] token is still invalid: id={seg_token_id}, encoded={encoded}"
+        )
+
+    if data_args.local_rank == 0:
+        print(f"[eval] ensured [SEG] token id={seg_token_id}, encoded={encoded}")
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
     dtype_map = {

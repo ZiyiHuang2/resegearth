@@ -874,7 +874,7 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -901,7 +901,10 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if (SEG_token_embedding_indices == 1).sum() != 0:
+        image_features = None
+        bs = input_ids.shape[0] if input_ids is not None else 0
+
+        if SEG_token_embedding_indices is not None and (SEG_token_embedding_indices == 1).sum() != 0:
             if input_ids.shape[1] != 1:
                 image_features = self.get_vision_tower_feature(images)
                 bs = input_ids.shape[0]
@@ -917,6 +920,8 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
                     token_refer_id=token_refer_id,
                     SEG_token_embedding_indices=SEG_token_embedding_indices,
                 )
+        else:
+            image_features_indices = None
 
         outputs = self.model(
             input_ids=input_ids,
@@ -931,7 +936,21 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
 
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+
+        # DEBUG: inspect raw attention shapes
+        if global_step is None or global_step < 3:
+            print("=== DEBUG raw attentions ===")
+            print("num attention layers:", len(outputs.attentions))
+            for i, att in enumerate(outputs.attentions[:3]):
+                print(f"layer {i} raw attention shape:", att.shape)
+
+        # 用 mean 比 sum 更稳，避免数值尺度过大
+        attentions = [attention_item.mean(dim=1) for attention_item in outputs.attentions]
+
+        if global_step is None or global_step < 3:
+            print("=== DEBUG reduced attentions ===")
+            for i, att in enumerate(attentions[:3]):
+                print(f"layer {i} reduced attention shape:", att.shape)
 
         SEG_embedding = self.SEG_token_projector(
             self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
@@ -967,6 +986,9 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
             llm_loss = loss_fct(shift_logits, shift_labels)
 
         mask_loss = None
+        loss_mask = torch.tensor(0.0, device=logits.device)
+        loss_dice = torch.tensor(0.0, device=logits.device)
+
         if seg_info is not None:
             if "padding_mask" in seg_info[0]:
                 if isinstance(seg_info[0]["instances"], list):
@@ -991,9 +1013,6 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
             mask_losses = self.criterion(mask_outputs, targets)
             weight_dict = self.weight_dict
 
-            loss_mask = 0.0
-            loss_dice = 0.0
-
             for k in list(mask_losses.keys()):
                 if k in weight_dict:
                     if mask_losses[k] is not None:
@@ -1008,28 +1027,71 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
 
             mask_loss = loss_mask + loss_dice
 
-        loss_attention = None
-        masks = [_seg_info["mask"] for _seg_info in seg_info]
-        masks_resized = [
-            F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
-            for m in masks
-        ]
-        masks = torch.stack(masks_resized, dim=0)
-        masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
-        masks_down = masks_down.view(masks_down.size(0), -1)
-        masks_down[masks_down > 0] = 1
+        loss_attention = torch.tensor(0.0, device=logits.device)
 
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)
-        for full_attention_map in attentions:
-            batch_attentions_list = []
-            for batch_idx in range(bs):
-                attention_map = full_attention_map[batch_idx]
-                SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
-                image_features_mask = image_features_indices[batch_idx].bool()
-                attention = attention_map[SEG_mask][:, image_features_mask]
-                batch_attentions_list.append(attention)
-            batch_attentions = torch.cat(batch_attentions_list, dim=0)
-            loss_attention += self.attention_loss(batch_attentions, masks_down)
+        if seg_info is not None and image_features_indices is not None and SEG_token_embedding_indices is not None:
+            masks = [_seg_info["mask"] for _seg_info in seg_info]
+            masks_resized = [
+                F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
+                for m in masks
+            ]
+            masks = torch.stack(masks_resized, dim=0)
+            masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
+            masks_down = masks_down.view(masks_down.size(0), -1)
+            masks_down[masks_down > 0] = 1
+
+            if global_step is None or global_step < 3:
+                print("=== DEBUG masks_down ===")
+                print("masks_down.shape:", masks_down.shape)
+                print("masks_down positive counts:", (masks_down > 0).sum(dim=1)[:10])
+
+            for layer_idx, full_attention_map in enumerate(attentions):
+                batch_attentions_list = []
+
+                if global_step is None or global_step < 3:
+                    print(f"=== DEBUG attention layer {layer_idx} ===")
+                    print("full_attention_map.shape:", full_attention_map.shape)
+
+                for batch_idx in range(bs):
+                    attention_map = full_attention_map[batch_idx]
+                    SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
+                    image_features_mask = image_features_indices[batch_idx].bool()
+
+                    attention = attention_map[SEG_mask][:, image_features_mask]
+                    batch_attentions_list.append(attention)
+
+                    if global_step is None or global_step < 3:
+                        print(f"[layer {layer_idx}][batch {batch_idx}] attention_map.shape:", attention_map.shape)
+                        print(f"[layer {layer_idx}][batch {batch_idx}] SEG count:", SEG_mask.sum().item())
+                        print(f"[layer {layer_idx}][batch {batch_idx}] image token count:", image_features_mask.sum().item())
+                        print(f"[layer {layer_idx}][batch {batch_idx}] sliced attention.shape:", attention.shape)
+
+                if len(batch_attentions_list) > 0:
+                    batch_attentions = torch.cat(batch_attentions_list, dim=0)
+
+                    if global_step is None or global_step < 3:
+                        print(f"[layer {layer_idx}] batch_attentions.shape:", batch_attentions.shape)
+                        print(f"[layer {layer_idx}] masks_down.shape:", masks_down.shape)
+
+                    if batch_attentions.shape[0] == masks_down.shape[0] and batch_attentions.shape[1] == masks_down.shape[1]:
+                        att_loss_item = self.attention_loss(batch_attentions, masks_down)
+
+                        if global_step is None or global_step < 3:
+                            print(f"[layer {layer_idx}] att_loss_item:", att_loss_item)
+
+                        loss_attention += att_loss_item
+                    else:
+                        if global_step is None or global_step < 3:
+                            print(
+                                f"[layer {layer_idx}] shape mismatch, skip attention loss: "
+                                f"batch_attentions.shape={batch_attentions.shape}, "
+                                f"masks_down.shape={masks_down.shape}"
+                            )
+
+        if llm_loss is None:
+            llm_loss = torch.tensor(0.0, device=logits.device)
+        if mask_loss is None:
+            mask_loss = torch.tensor(0.0, device=logits.device)
 
         loss = llm_loss + mask_loss + 0.01 * loss_attention
 
@@ -1063,8 +1125,8 @@ class SegEarthR2Qwen(MiphaQwenForCausalLM):
         SEG_token_embedding_indices=None,
         mask_num=None,
     ):
-        output_attentions = True
-        output_hidden_states = True
+        output_attentions = False
+        output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_features = self.get_vision_tower_feature(images)
