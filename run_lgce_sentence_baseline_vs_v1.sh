@@ -10,8 +10,8 @@ export WANDB_INIT_TIMEOUT=300
 export WANDB_PROJECT=segearth-lgce-round1
 unset CUDA_VISIBLE_DEVICES
 
-GPU_SLOT="localhost:2"
-GPU_ID="2"
+GPU_SLOT="localhost:"1
+GPU_ID="1"
 MASTER_PORT_BASE="29321"
 
 ########################################
@@ -188,7 +188,7 @@ run_exp() {
 # 1) sentence_mean rebuild_sentence (reconstructed path; not historical old sentence)
 ########################################
 run_exp \
-  "sentence_rebuild_r4_15k" \
+  "sentence_rebuild_r8_70k" \
   "$((MASTER_PORT_BASE + 1))" \
   "rebuild_sentence"
 
@@ -196,7 +196,7 @@ run_exp \
 # 2) sentence_mean + V1 dual concat
 ########################################
 run_exp \
-  "sentence_v1_dual_concat_r4_15k" \
+  "sentence_v1_dual_concat_r8_70k" \
   "$((MASTER_PORT_BASE + 2))" \
   "v1_dual_concat"
 
