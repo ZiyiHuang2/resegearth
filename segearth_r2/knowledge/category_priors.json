@@ -1,0 +1,37 @@
+{
+  "airplane": {
+    "scale": "small",
+    "shape": "elongated",
+    "boundary": "thin",
+    "typical_context": ["runway", "apron", "airport"],
+    "small_target": true
+  },
+  "ship": {
+    "scale": "small",
+    "shape": "elongated",
+    "boundary": "thin",
+    "typical_context": ["water", "port", "coast"],
+    "small_target": true
+  },
+  "bridge": {
+    "scale": "medium",
+    "shape": "linear",
+    "boundary": "narrow",
+    "typical_context": ["river", "road", "water"],
+    "small_target": false
+  },
+  "baseball field": {
+    "scale": "large",
+    "shape": "roundish",
+    "boundary": "clear",
+    "typical_context": ["grass", "court", "playground"],
+    "small_target": false
+  },
+  "vehicle": {
+    "scale": "small",
+    "shape": "compact",
+    "boundary": "weak",
+    "typical_context": ["road", "parking", "urban"],
+    "small_target": true
+  }
+}

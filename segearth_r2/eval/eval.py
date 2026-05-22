@@ -15,7 +15,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
-from segearth_r2.datasets.dataset import DataCollatorForCOCODatasetV2, LaSeRSDataset, RRSISDDataset
+from segearth_r2.datasets.dataset import DataCollatorForCOCODatasetV2, LaSeRSDataset, RefSegRSDataset, RISBenchDataset, RRSISDDataset
 from segearth_r2.utils import conversation as conversation_lib
 from segearth_r2.utils.builder import load_pretrained_model
 
@@ -23,16 +23,12 @@ from segearth_r2.utils.builder import load_pretrained_model
 @dataclass
 class DataArguments:
     local_rank: int = 0
-
     vision_tower: str = "pretrained_model/CLIP/siglip-so400m-patch14-384"
     vision_tower_mask: str = "pretrained_model/mask2former/model_final_54b88a.pkl"
-
     lazy_preprocess: bool = False
     base_data_path: Optional[str] = field(default="your_data_path")
     model_path: Optional[str] = field(default="your_model_path")
-    mask_config: Optional[str] = field(
-        default="../segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
-    )
+    mask_config: Optional[str] = field(default="../segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     image_aspect_ratio: str = "square"
     image_grid_pinpoints: Optional[str] = field(default=None)
     model_map_name: str = "segearth_r2"
@@ -42,10 +38,11 @@ class DataArguments:
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
 
+    load_8bit: bool = False
+    load_4bit: bool = False
     dataset_name: str = "lasers"
     split: str = "val"
     zip_results: bool = True
-
     use_semantic_kb: bool = False
     semantic_kb_inject_mode: str = "hard"
     semantic_kb_hard_query_max_tokens: int = 7
@@ -53,11 +50,14 @@ class DataArguments:
     semantic_kb_include_fields: str = "cat,rel,ctx,shape,scale"
     semantic_kb_category_priors_path: Optional[str] = None
     semantic_kb_relation_priors_path: Optional[str] = None
-
     use_clip_prior: bool = False
     clip_prior_alpha: float = 0.2
     clip_prior_text_source: str = "semantic_cat"
     clip_prior_map_size: int = 27
+    use_prototype_kb: bool = False
+    prototype_kb_path: Optional[str] = None
+    prototype_unknown_key: str = "unknown"
+    prototype_visual_dim: int = 256
 
 
 def init_distributed_mode(args):
@@ -67,12 +67,10 @@ def init_distributed_mode(args):
         args.local_rank = 0
         args.world_size = 1
         return
-
     distributed.init_process_group(backend="nccl")
     local_rank = distributed.get_rank()
     world_size = distributed.get_world_size()
     torch.cuda.set_device(local_rank)
-
     print(f"I am rank {local_rank} in this world of size {world_size}!")
     args.local_rank = local_rank
     args.world_size = world_size
@@ -80,7 +78,6 @@ def init_distributed_mode(args):
 
 def zip_folder(folder_path):
     import zipfile
-
     folder_path = os.path.abspath(folder_path)
     zip_path = f"{folder_path}.zip"
     with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -92,44 +89,46 @@ def zip_folder(folder_path):
 
 def build_eval_datasets(data_args, tokenizer):
     dataset_name = data_args.dataset_name.lower()
-
     if dataset_name == "lasers":
         json_folders = os.path.join(data_args.base_data_path, "val", "annotations")
         if not os.path.isdir(json_folders):
             raise FileNotFoundError(f"LaSeRS val annotation dir not found: {json_folders}")
-
         splits = sorted(os.listdir(json_folders))
         eval_sets = []
-
         for split in splits:
             if data_args.local_rank == 0:
                 print(f"------ cur benchmark is LaSeRS {split} subset -------")
-
-            eval_dataset = LaSeRSDataset(
-                base_data_path=data_args.base_data_path,
-                tokenizer=tokenizer,
-                data_args=data_args,
-                split=split,
-            )
+            eval_dataset = LaSeRSDataset(base_data_path=data_args.base_data_path, tokenizer=tokenizer, data_args=data_args, split=split)
             eval_sets.append((split, eval_dataset))
-
         return eval_sets
 
     if dataset_name == "rrsisd":
         split = data_args.split.lower()
         if split not in ["train", "val", "test"]:
             raise ValueError(f"Unsupported RRSISD split: {split}. Must be train / val / test")
-
         if data_args.local_rank == 0:
             print(f"------ cur benchmark is RRSISD {split} subset -------")
+        eval_dataset = RRSISDDataset(base_data_path=data_args.base_data_path, tokenizer=tokenizer, data_args=data_args, split=split)
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
 
-        eval_dataset = RRSISDDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            split=split,
-        )
+    if dataset_name == "refsegrs":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported RefSegRS split: {split}. Must be train / val / test")
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is RefSegRS {split} subset -------")
+        eval_dataset = RefSegRSDataset(base_data_path=data_args.base_data_path, tokenizer=tokenizer, data_args=data_args, split=split)
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
 
+    if dataset_name == "risbench":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported RISBench split: {split}. Must be train / val / test")
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is RISBench {split} subset -------")
+        eval_dataset = RISBenchDataset(base_data_path=data_args.base_data_path, tokenizer=tokenizer, data_args=data_args, split=split)
         split_name = f"{split}.json"
         return [(split_name, eval_dataset)]
 
@@ -139,30 +138,21 @@ def build_eval_datasets(data_args, tokenizer):
 def evaluation():
     parser = transformers.HfArgumentParser(DataArguments)
     data_args = parser.parse_args_into_dataclasses()[0]
-
     init_distributed_mode(data_args)
-
     if data_args.local_rank == 0:
-        print(
-            f"[Eval] dataset_name={data_args.dataset_name}, split={data_args.split}, "
-            f"base_data_path={data_args.base_data_path}"
-        )
+        print(f"[Eval] dataset_name={data_args.dataset_name}, split={data_args.split}, base_data_path={data_args.base_data_path}")
 
     model_path = os.path.expanduser(data_args.model_path)
-
-    tokenizer, model, image_processor, context_len = load_pretrained_model(
-        model_path,
-        model_args=data_args,
-        mask_config=data_args.mask_config,
-        device="cuda",
-    )
-
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, model_args=data_args, mask_config=data_args.mask_config, device="cuda")
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
-    model.to(dtype=torch.float32, device=device)
-
+    if not data_args.load_8bit and not data_args.load_4bit:
+        model.to(dtype=torch.float16, device=device)
+    else:
+        model.to(device=device)
+    model.config.use_prototype_kb = data_args.use_prototype_kb or getattr(model.config, "use_prototype_kb", False)
+    model.config.prototype_visual_dim = getattr(model.config, "prototype_visual_dim", data_args.prototype_visual_dim)
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
-
     clip_image_processor = SiglipImageProcessor.from_pretrained(data_args.vision_tower)
 
     use_clip_prior = data_args.use_clip_prior or getattr(model.config, "use_clip_prior", False)
@@ -173,47 +163,21 @@ def evaluation():
         model.config.clip_prior_alpha = clip_prior_alpha
         model.config.clip_prior_text_source = data_args.clip_prior_text_source
         model.config.clip_prior_map_size = clip_prior_map_size
-        model.initialize_clip_prior(
-            clip_model=model.get_model().get_vision_tower(),
-            tokenizer=tokenizer,
-            clip_model_name_or_path=data_args.vision_tower,
-            map_size=clip_prior_map_size,
-            alpha=clip_prior_alpha,
-        )
+        model.initialize_clip_prior(clip_model=model.get_model().get_vision_tower(), tokenizer=tokenizer, clip_model_name_or_path=data_args.vision_tower, map_size=clip_prior_map_size, alpha=clip_prior_alpha)
 
-    data_collator = DataCollatorForCOCODatasetV2(
-        tokenizer=tokenizer,
-        clip_image_processor=clip_image_processor,
-    )
-
+    data_collator = DataCollatorForCOCODatasetV2(tokenizer=tokenizer, clip_image_processor=clip_image_processor)
     save_folder = data_args.output_dir
     os.makedirs(save_folder, exist_ok=True)
-
     eval_sets = build_eval_datasets(data_args, tokenizer)
 
     for split, eval_dataset in eval_sets:
         if data_args.local_rank == 0:
             print(f"[Eval] split={split}, dataset_len={len(eval_dataset)}")
-
         if not data_args.distributed:
             val_sampler = None
         else:
-            val_sampler = torch.utils.data.distributed.DistributedSampler(
-                eval_dataset,
-                shuffle=False,
-                drop_last=False,
-            )
-
-        eval_dataloader = torch.utils.data.DataLoader(
-            eval_dataset,
-            batch_size=data_args.eval_batch_size,
-            shuffle=False,
-            num_workers=data_args.dataloader_num_workers,
-            pin_memory=False,
-            sampler=val_sampler,
-            collate_fn=data_collator,
-        )
-
+            val_sampler = torch.utils.data.distributed.DistributedSampler(eval_dataset, shuffle=False, drop_last=False)
+        eval_dataloader = torch.utils.data.DataLoader(eval_dataset, batch_size=data_args.eval_batch_size, shuffle=False, num_workers=data_args.dataloader_num_workers, pin_memory=False, sampler=val_sampler, collate_fn=data_collator)
         do_eval(model, eval_dataloader, save_folder, split, data_args, device)
 
     if data_args.local_rank == 0 and data_args.zip_results:
@@ -223,21 +187,19 @@ def evaluation():
 def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
     model.eval()
     processed_samples = 0
-
     if data_args.distributed:
         distributed.barrier()
 
+    infer_dtype = next(model.parameters()).dtype
+
     with torch.no_grad():
-        for idx, inputs in tqdm(
-            enumerate(eval_dataloader),
-            total=len(eval_dataloader),
-            disable=(data_args.local_rank != 0),
-        ):
+        for idx, inputs in tqdm(enumerate(eval_dataloader), total=len(eval_dataloader), disable=(data_args.local_rank != 0)):
             if data_args.max_eval_samples > 0 and processed_samples >= data_args.max_eval_samples:
                 break
-
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
             inputs["token_refer_id"] = [ids.to(device) for ids in inputs["token_refer_id"]]
+            if "kb_text_token_id" in inputs:
+                inputs["kb_text_token_id"] = [ids.to(device) for ids in inputs["kb_text_token_id"]]
 
             outputs = model.eval_seg(
                 input_ids=inputs["input_ids"],
@@ -247,6 +209,8 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 seg_info=inputs["seg_info"],
                 token_refer_id=inputs["token_refer_id"],
                 clip_prior_text=inputs.get("clip_prior_text"),
+                kb_text_token_id=inputs.get("kb_text_token_id"),
+                kb_visual_feat=inputs.get("kb_visual_feat"),
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
@@ -257,17 +221,11 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 image_name = output["image_name"]
                 sample_id = output["id"]
                 mask_id = output["mask_id"]
-
                 split_stem = split.split(".")[0]
                 mask_save_name = f"{image_name}_{sample_id}_{split_stem}_{mask_id}.tif"
-
                 if pred_mask.ndim > 2:
                     pred_mask = np.squeeze(pred_mask)
-
-                imsave(
-                    os.path.join(save_folder, mask_save_name),
-                    pred_mask.astype(np.uint8),
-                )
+                imsave(os.path.join(save_folder, mask_save_name), pred_mask.astype(np.uint8))
                 processed_samples += 1
 
     if data_args.distributed:

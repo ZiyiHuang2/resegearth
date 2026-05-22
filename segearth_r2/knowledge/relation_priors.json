@@ -1,0 +1,16 @@
+{
+  "left": {"type": "absolute_location"},
+  "right": {"type": "absolute_location"},
+  "top": {"type": "absolute_location"},
+  "bottom": {"type": "absolute_location"},
+  "upper": {"type": "absolute_location"},
+  "lower": {"type": "absolute_location"},
+  "center": {"type": "absolute_location"},
+  "middle": {"type": "absolute_location"},
+  "near": {"type": "relative_location"},
+  "beside": {"type": "relative_location"},
+  "next to": {"type": "relative_location"},
+  "around": {"type": "relative_location"},
+  "behind": {"type": "relative_location"},
+  "in front of": {"type": "relative_location"}
+}
