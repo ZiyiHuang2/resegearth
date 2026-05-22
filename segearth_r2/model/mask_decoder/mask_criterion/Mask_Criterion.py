@@ -1,3 +1,4 @@
+import math
 import torch
 import numpy as np
 import torch.nn.functional as F
@@ -82,6 +83,28 @@ sigmoid_ce_loss_jit = torch.jit.script(
 )  # type: torch.jit.ScriptModule
 
 
+def ohem_sigmoid_ce_loss(
+    inputs: torch.Tensor,
+    targets: torch.Tensor,
+    num_masks: float,
+    ratio: float,
+    min_points: int,
+):
+    """
+    Per matched mask: keep top-k hardest points by BCE, mean over those points,
+    then sum over masks / num_masks (same scaling as sigmoid_ce_loss).
+    """
+    bce = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    num_points = bce.shape[1]
+    if num_points == 0:
+        return inputs.sum() * 0.0
+    k = int(math.ceil(ratio * num_points))
+    k = max(min_points, k)
+    k = min(k, num_points)
+    topk_bce = bce.topk(k, dim=1).values
+    return topk_bce.mean(dim=1).sum() / num_masks
+
+
 def sigmoid_focal_loss(inputs, targets, num_masks, alpha: float = 0.25, gamma: float = 2):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
@@ -130,7 +153,18 @@ def calculate_uncertainty(logits):
 
 class Criterion(nn.Module):
 
-    def __init__(self, matcher, losses, num_points, oversample_ratio, importance_sample_ratio, device):
+    def __init__(
+        self,
+        matcher,
+        losses,
+        num_points,
+        oversample_ratio,
+        importance_sample_ratio,
+        device,
+        use_ohem_bce: bool = False,
+        ohem_ratio: float = 0.3,
+        ohem_min_points: int = 1,
+    ):
         super().__init__()
         self.matcher = matcher
         self.losses = losses
@@ -138,6 +172,9 @@ class Criterion(nn.Module):
         self.oversample_ratio = oversample_ratio
         self.importance_sample_ratio = importance_sample_ratio
         self.device = device
+        self.use_ohem_bce = use_ohem_bce
+        self.ohem_ratio = ohem_ratio
+        self.ohem_min_points = ohem_min_points
         self.pos_weight = torch.tensor([99.0])
 
 
@@ -209,9 +246,21 @@ class Criterion(nn.Module):
             align_corners=False,
         ).squeeze(1)
 
+        if self.use_ohem_bce:
+            loss_mask = ohem_sigmoid_ce_loss(
+                point_logits,
+                point_labels,
+                num_masks,
+                self.ohem_ratio,
+                self.ohem_min_points,
+            )
+        else:
+            loss_mask = sigmoid_ce_loss_jit(point_logits, point_labels, num_masks)
+        loss_dice = dice_loss_jit(point_logits, point_labels, num_masks)
+
         losses = {
-            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
-            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+            "loss_mask": loss_mask,
+            "loss_dice": loss_dice,
         }
 
         del src_masks

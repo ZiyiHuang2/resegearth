@@ -1,0 +1,7 @@
+_BASE_: ./maskformer2_swin_base_384_bs16_50ep.yaml
+MODEL:
+  MASK_FORMER:
+    # MQ-v1: OHEM-BCE on mask BCE branch only (see Mask_Criterion.loss_masks).
+    USE_OHEM_BCE: True
+    OHEM_RATIO: 0.3
+    OHEM_MIN_POINTS: 1

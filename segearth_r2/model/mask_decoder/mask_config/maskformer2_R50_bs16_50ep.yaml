@@ -47,6 +47,10 @@ MODEL:
     TRAIN_NUM_POINTS: 12544
     OVERSAMPLE_RATIO: 3.0
     IMPORTANCE_SAMPLE_RATIO: 0.75
+    # Mask Quality v1 (OHEM-BCE): Criterion only; matcher/decoder unchanged. False = strict baseline.
+    USE_OHEM_BCE: False
+    OHEM_RATIO: 0.3
+    OHEM_MIN_POINTS: 1
     TEST:
       SEMANTIC_ON: False
       INSTANCE_ON: True

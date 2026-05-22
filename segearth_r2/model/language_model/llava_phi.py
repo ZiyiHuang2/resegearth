@@ -39,6 +39,9 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_qmc: Optional[torch.FloatTensor] = None
+    qmc_cosine_mean: Optional[torch.FloatTensor] = None
+    qmc_valid_count: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -137,6 +140,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.initial_mask_module()
         self.post_init()
 
+        # QMC-GT v1 (overridden from train.py when needed)
+        self.use_qmc = False
+        self.qmc_loss_weight = 0.05
+        self.qmc_min_mask_sum = 1e-6
+        self.qmc_detach_visual = False
+
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
             print('Initialize mask modules...')
@@ -150,7 +159,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-            
+
+        hidden_dim = self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+        self.qmc_q_projector = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+        self.qmc_v_projector = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+        )
+
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
             def get_w(weights, keyword):
@@ -224,13 +245,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
         losses = ["SEG_labels", "masks",]
+        mf = cfg.MODEL.MASK_FORMER
         self.criterion = Criterion(
             matcher=matcher,
             losses=losses,
-            num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
-            oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
-            importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-            device=self.device
+            num_points=mf.TRAIN_NUM_POINTS,
+            oversample_ratio=mf.OVERSAMPLE_RATIO,
+            importance_sample_ratio=mf.IMPORTANCE_SAMPLE_RATIO,
+            device=self.device,
+            use_ohem_bce=getattr(mf, "USE_OHEM_BCE", False),
+            ohem_ratio=float(getattr(mf, "OHEM_RATIO", 0.3)),
+            ohem_min_points=int(getattr(mf, "OHEM_MIN_POINTS", 1)),
         )
         self.size_divisibility = 32
         self.sem_seg_postprocess_before_inference = True
@@ -601,7 +626,79 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
-           
+
+    def _compute_qmc_gt_loss(self, mask_features, SEG_embedding, seg_info):
+        """Query–Mask Consistency (GT pooled). Returns (loss_qmc, qmc_cosine_mean, qmc_valid_count_tensor)."""
+        if seg_info is None:
+            raise RuntimeError("QMC-GT v1 requires seg_info when use_qmc=True.")
+        if len(seg_info) == 0:
+            raise RuntimeError("QMC-GT v1 requires non-empty flat seg_info when use_qmc=True.")
+        if "padding_mask" in seg_info[0]:
+            raise RuntimeError(
+                "QMC-GT v1 does not support padding_mask/instances seg_info layout; "
+                "use the flat seg_info path with seg_info[i]['mask'] (see DataCollator annotations)."
+            )
+        if "mask" not in seg_info[0]:
+            raise RuntimeError("QMC-GT v1 requires seg_info[i]['mask'] for each flat entry when use_qmc=True.")
+
+        assert SEG_embedding.shape[0] == mask_features.shape[0], (
+            f"QMC alignment: SEG_embedding batch {SEG_embedding.shape[0]} != mask_features {mask_features.shape[0]}"
+        )
+        assert len(seg_info) == mask_features.shape[0], (
+            f"QMC alignment: len(seg_info)={len(seg_info)} != mask_features.shape[0]={mask_features.shape[0]}"
+        )
+
+        N, C, Hf, Wf = mask_features.shape
+        eps = 1e-6
+        min_sum = float(getattr(self, "qmc_min_mask_sum", 1e-6))
+
+        mf = mask_features.detach() if getattr(self, "qmc_detach_visual", False) else mask_features
+
+        gt_list = []
+        for i in range(N):
+            gt = seg_info[i]["mask"]
+            if not torch.is_tensor(gt):
+                gt = torch.as_tensor(gt, device=mf.device, dtype=torch.float32)
+            else:
+                gt = gt.float().to(device=mf.device)
+            while gt.dim() > 2 and gt.shape[0] == 1:
+                gt = gt.squeeze(0)
+            if gt.dim() != 2:
+                raise RuntimeError(
+                    f"QMC-GT v1 expected GT mask to reduce to [H,W] after squeezing leading 1s; got shape {tuple(gt.shape)} at seg_info[{i}]"
+                )
+            H, W = gt.shape
+            gt = gt.reshape(1, 1, H, W)
+            gt = F.interpolate(gt, size=(Hf, Wf), mode="bilinear", align_corners=False)
+            gt = gt.clamp(0.0, 1.0)
+            gt_list.append(gt)
+        gt_stack = torch.cat(gt_list, dim=0)
+
+        wsum = gt_stack.sum(dim=(2, 3), keepdim=False)
+        valid = wsum.reshape(-1) > min_sum
+
+        if not valid.any():
+            z = SEG_embedding.sum() * 0.0
+            zero = torch.zeros((), device=mf.device, dtype=mf.dtype)
+            return z, zero, torch.zeros((), device=mf.device, dtype=torch.float32)
+
+        mf_v = mf[valid]
+        gt_v = gt_stack[valid]
+        v_gt = (mf_v * gt_v).sum(dim=(2, 3)) / (gt_v.sum(dim=(2, 3), keepdim=False).unsqueeze(-1) + eps)
+
+        q_seg = SEG_embedding.squeeze(1)[valid]
+        proj_dtype = self.qmc_q_projector[0].weight.dtype
+        q_seg = q_seg.to(proj_dtype)
+        v_gt = v_gt.to(proj_dtype)
+
+        projected_q = F.normalize(self.qmc_q_projector(q_seg), dim=-1, eps=eps)
+        projected_v = F.normalize(self.qmc_v_projector(v_gt), dim=-1, eps=eps)
+        cos = (projected_q * projected_v).sum(dim=-1)
+        loss_qmc = (1.0 - cos).mean()
+        qmc_cosine_mean = cos.mean().detach()
+        qmc_valid_count = torch.tensor(float(valid.sum().item()), device=mf.device, dtype=torch.float32)
+        return loss_qmc, qmc_cosine_mean, qmc_valid_count
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -667,6 +764,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
             torch.repeat_interleave(feat, repeats=mask_num, dim=0)
             for feat in multi_scale_features
         ]
+
+        loss_qmc_out = None
+        qmc_cosine_mean_out = None
+        qmc_valid_count_out = None
+        loss_qmc_for_total = None
+        if getattr(self, "use_qmc", False):
+            loss_qmc_for_total, qmc_cosine_mean_out, qmc_valid_count_out = self._compute_qmc_gt_loss(
+                mask_features, SEG_embedding, seg_info
+            )
+            loss_qmc_out = loss_qmc_for_total.detach()
 
         mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
 
@@ -754,6 +861,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
         loss = llm_loss + mask_loss + 0.01 * loss_attention
+        if getattr(self, "use_qmc", False) and loss_qmc_for_total is not None:
+            loss = loss + self.qmc_loss_weight * loss_qmc_for_total
 
         return CausalOutputWithMask(
             loss=loss,
@@ -765,6 +874,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            loss_qmc=loss_qmc_out,
+            qmc_cosine_mean=qmc_cosine_mean_out,
+            qmc_valid_count=qmc_valid_count_out,
         )
     
     def eval_seg(

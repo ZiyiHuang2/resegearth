@@ -215,6 +215,8 @@ class LLaVATrainer(Trainer):
         if not hasattr(self,'history_loss_dict'):
             self.history_loss_dict = {}
         for name, value in outputs.items():
+            if value is None:
+                continue
             if 'loss' in name and name != 'loss':
                 if name not in self.history_loss_dict:
                     self.history_loss_dict[name] = value.item()
@@ -256,12 +258,21 @@ class LLaVATrainer(Trainer):
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
             if isinstance(outputs, dict) and 'loss_dice' in outputs:
                 loss_dict = {}
+                diagnostic_keys = (
+                    "qmc_cosine_mean",
+                    "qmc_valid_count",
+                )
                 for name,value in outputs.items():
+                    if value is None:
+                        continue
                     if 'loss' in name and name != 'loss':
                         loss_value = value.item()
                         if loss_value == 0 and hasattr(self,'history_loss_dict'):
-                            loss_value = self.history_loss_dict[name]
+                            loss_value = self.history_loss_dict.get(name, loss_value)
                         loss_dict[name] = loss_value
+                for dk in diagnostic_keys:
+                    if dk in outputs and outputs[dk] is not None:
+                        loss_dict[dk] = outputs[dk].item()
                 self.update_history_loss_dict(outputs)
                 self.log(loss_dict)
 

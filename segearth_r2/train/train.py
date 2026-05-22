@@ -4,7 +4,9 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
+from transformers.modeling_utils import unwrap_model
 from peft import LoraConfig, get_peft_model
 import warnings
 import copy
@@ -96,6 +98,11 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
+
+    use_qmc: bool = False
+    qmc_loss_weight: float = 0.05
+    qmc_min_mask_sum: float = 1e-6
+    qmc_detach_visual: bool = False
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -217,6 +224,33 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 data_args=data_args,
                 split="val_data.json"
             )
+
+        elif dataset_name == "refsegrs":
+            train_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
+        elif dataset_name == "risbench":
+            train_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
         else:
             raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
@@ -246,6 +280,9 @@ def train():
     if training_args.data_seed is None:
         training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
@@ -326,6 +363,7 @@ def train():
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "qmc_q_projector", "qmc_v_projector",
     ]
 
     if model_args.train_swin_backbone:
@@ -355,6 +393,13 @@ def train():
                 ]):
 
                 p.requires_grad = True
+
+    # PeftModel.unwrap_model 可能仍为 Peft 包装；QMC 开关必须写在实际 forward 的 SegEarthR2 上
+    _base_model = model.get_base_model() if hasattr(model, "get_base_model") else unwrap_model(model)
+    _base_model.use_qmc = training_args.use_qmc
+    _base_model.qmc_loss_weight = training_args.qmc_loss_weight
+    _base_model.qmc_min_mask_sum = training_args.qmc_min_mask_sum
+    _base_model.qmc_detach_visual = training_args.qmc_detach_visual
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
     
