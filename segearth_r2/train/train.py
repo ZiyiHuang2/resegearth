@@ -259,6 +259,33 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 data_args=data_args,
                 split="val_data.json"
             )
+
+        elif dataset_name == "refsegrs":
+            train_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
+        elif dataset_name == "risbench":
+            train_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
         else:
             raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 

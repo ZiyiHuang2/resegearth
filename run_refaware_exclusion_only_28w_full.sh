@@ -1,5 +1,20 @@
 #!/usr/bin/env bash
-# 28w：public_semantic_v2_refaware_exclusion_only；一次完成 train → best checkpoint → merge → eval → metrics。
+# =============================================================================
+# rrsisd_public_semantic_v2_refaware_exclusion_only_28w（默认 max_steps=280000）
+# 全链路：train → 选点 checkpoint → merge LoRA → eval 推理 → eval_val_metrics
+#
+# Phase-1 基建封口（本脚本内）：
+#   - OUTPUT_DIR 下若已有 checkpoint-* 且未设置 RESUME_OK=1，则直接退出（防无意续训污染）。
+#   - MERGED_DIR / TEST_OUTPUT_DIR 若已存在，须分别设置 OVERWRITE_MERGE=1 /
+#     OVERWRITE_EVAL=1 才允许覆盖；否则在训练前 preflight 即退出。
+#   - checkpoint 选取：仅允许 SELECTED_CHECKPOINT、trainer_state.json 的
+#     best_model_checkpoint，或各 checkpoint-* 下可解析的 eval 指标链；禁止在
+#     无可用选点依据时静默回退到「最大 step」checkpoint。
+#   - 最终 BEST_CHECKPOINT（无论来自用户 / trainer_state / metric scan）必须通过
+#     统一指标校验：在 checkpoint 目录下须能从 eval_results.json 等或
+#     trainer_state.json 的 log_history 解析到 eval_gIoU/gIoU/giou/… 之一；
+#     否则 FATAL 退出。仅当 ALLOW_NO_METRIC_CHECKPOINT=1 时可跳过该校验。
+# =============================================================================
 set -euo pipefail
 
 export NCCL_P2P_DISABLE=1
@@ -67,7 +82,11 @@ MERGE_PY="${REPO_DIR}/segearth_r2/train/merge_lora_weights_and_save_hf_model.py"
 EVAL_PY="${REPO_DIR}/segearth_r2/eval/eval.py"
 
 ########################################
-# Pick best checkpoint (stdout: single control line)
+# Pick checkpoint for merge（stdout: 单行控制串；失败时 stderr + 非 0 退出）
+# 优先级：SELECTED_CHECKPOINT → 根 trainer_state best_model_checkpoint →
+# 各 checkpoint-*/trainer_state.json 的 best → 在 checkpoint 目录中解析
+# eval_gIoU / gIoU / eval_mDice / mDice 等（见 chain）。禁止无依据时取 latest。
+# 最终路径仍须通过 validate_final_checkpoint_metrics（见下）。
 ########################################
 pick_best_checkpoint () {
   export _CK_ROOT="${OUTPUT_DIR}"
@@ -192,8 +211,88 @@ if not candidates:
     print("ERROR:no_checkpoint_dirs", file=sys.stderr)
     sys.exit(3)
 
-latest = max(candidates, key=step_of)
-print(f"WARN:fallback_max_step:{latest}")
+print(
+    "ERROR:no_checkpoint_selection: no valid SELECTED_CHECKPOINT, no usable "
+    "best_model_checkpoint in trainer_state.json, and no eval_gIoU/gIoU/eval_mDice/mDice/… "
+    "in checkpoint eval files or log_history under any checkpoint-*.",
+    file=sys.stderr,
+)
+sys.exit(4)
+PY
+}
+
+########################################
+# 对最终 BEST_CHECKPOINT 做专家级硬校验：目录内须能解析到规定 eval 指标之一
+#（eval_results.json / metrics.json / … 或 该目录下 trainer_state.json 的 log_history）。
+# ALLOW_NO_METRIC_CHECKPOINT=1 时跳过（默认不允许）。
+########################################
+validate_final_checkpoint_metrics () {
+  export _VALIDATE_CKPT_DIR="${BEST_CHECKPOINT}"
+  export ALLOW_NO_METRIC_CHECKPOINT="${ALLOW_NO_METRIC_CHECKPOINT:-0}"
+  python - <<'PY'
+import json
+import os
+import sys
+
+KEYS = ("eval_gIoU", "gIoU", "giou", "eval_mDice", "mDice", "eval_cIoU", "cIoU")
+
+
+def read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def dict_has_metric(d):
+    if not isinstance(d, dict):
+        return None
+    for k in KEYS:
+        v = d.get(k)
+        if isinstance(v, (int, float)):
+            return k, float(v)
+    return None
+
+
+def scan_checkpoint_dir(ckpt_dir):
+    # 与需求一致：先 log_history，再各 eval 落盘 json
+    ts = read_json(os.path.join(ckpt_dir, "trainer_state.json"))
+    if isinstance(ts, dict) and isinstance(ts.get("log_history"), list):
+        for row in reversed(ts["log_history"]):
+            hit = dict_has_metric(row)
+            if hit:
+                return hit[0], hit[1], "trainer_state.json:log_history"
+    for fname in ("eval_results.json", "metrics.json", "all_results.json", "eval_metrics.json"):
+        p = os.path.join(ckpt_dir, fname)
+        data = read_json(p)
+        hit = dict_has_metric(data)
+        if hit:
+            return hit[0], hit[1], fname
+    return None
+
+
+allow = os.environ.get("ALLOW_NO_METRIC_CHECKPOINT", "0").strip() == "1"
+ckpt = (os.environ.get("_VALIDATE_CKPT_DIR") or "").strip()
+
+if allow:
+    print(
+        "[INFO] ALLOW_NO_METRIC_CHECKPOINT=1 — skipping mandatory metric validation.",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+
+if not ckpt or not os.path.isdir(ckpt):
+    print("FATAL: No valid best checkpoint metrics found", file=sys.stderr)
+    sys.exit(1)
+
+found = scan_checkpoint_dir(os.path.abspath(ckpt))
+if not found:
+    print("FATAL: No valid best checkpoint metrics found", file=sys.stderr)
+    sys.exit(1)
+
+k, v, src = found
+print(f"[OK] final checkpoint metric validation: {k}={v} (source={src})")
 sys.exit(0)
 PY
 }
@@ -251,7 +350,7 @@ run_eval_metrics () {
 # Preflight
 ########################################
 echo "========================================"
-echo "[CONFIG] refaware_exclusion_only 28w full pipeline"
+echo "[CONFIG] rrsisd_public_semantic_v2_refaware_exclusion_only_28w（full pipeline）"
 echo "  OUTPUT_DIR=${OUTPUT_DIR}"
 echo "  MERGED_DIR=${MERGED_DIR}"
 echo "  TEST_OUTPUT_DIR=${TEST_OUTPUT_DIR}"
@@ -260,6 +359,10 @@ echo "  SEED=${SEED}"
 echo "  DATA_SEED=${DATA_SEED}"
 echo "  GPU_SLOT=${GPU_SLOT}"
 echo "  MASTER_PORT=${MASTER_PORT}"
+echo "  RESUME_OK=${RESUME_OK:-0}  (1=allow OUTPUT_DIR with checkpoint-* / resume train)"
+echo "  OVERWRITE_MERGE=${OVERWRITE_MERGE:-0}  (1=allow replacing existing MERGED_DIR)"
+echo "  OVERWRITE_EVAL=${OVERWRITE_EVAL:-0}  (1=allow replacing existing TEST_OUTPUT_DIR)"
+echo "  ALLOW_NO_METRIC_CHECKPOINT=${ALLOW_NO_METRIC_CHECKPOINT:-0}  (1=skip mandatory metric validation on BEST_CHECKPOINT)"
 echo "  concept_refaware_prior=True"
 echo "  concept_match_strict=False"
 echo "========================================"
@@ -312,6 +415,22 @@ if [[ ! -f "${EVAL_METRICS_SCRIPT}" ]]; then
   exit 1
 fi
 
+# MERGED_DIR / TEST_OUTPUT_DIR：训练前即检查，避免跑满训练后才发现无法 merge/eval
+if [[ -e "${MERGED_DIR}" ]]; then
+  if [[ "${OVERWRITE_MERGE:-0}" != "1" ]]; then
+    echo "[ERROR] MERGED_DIR already exists: ${MERGED_DIR}"
+    echo "Set OVERWRITE_MERGE=1 to allow remove and re-merge, or choose a new MERGED_DIR."
+    exit 1
+  fi
+fi
+if [[ -e "${TEST_OUTPUT_DIR}" ]]; then
+  if [[ "${OVERWRITE_EVAL:-0}" != "1" ]]; then
+    echo "[ERROR] TEST_OUTPUT_DIR already exists: ${TEST_OUTPUT_DIR}"
+    echo "Set OVERWRITE_EVAL=1 to allow overwrite, or choose a new TEST_OUTPUT_DIR."
+    exit 1
+  fi
+fi
+
 if [[ -d "${OUTPUT_DIR}" ]]; then
   shopt -s nullglob
   _existing=( "${OUTPUT_DIR}"/checkpoint-* )
@@ -333,7 +452,7 @@ mkdir -p "${OUTPUT_DIR}"
 # [1/5] Train
 ########################################
 echo "========================================"
-echo "[1/5] Training (refaware_exclusion_only, ${MAX_STEPS} steps)"
+echo "[1/5] Training rrsisd_public_semantic_v2_refaware_exclusion_only_28w (${MAX_STEPS} steps)"
 echo "========================================"
 
 deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/train/train.py \
@@ -395,13 +514,14 @@ if [[ "${_CK_RC}" -eq 3 ]]; then
   echo "[ERROR] No checkpoint-* under OUTPUT_DIR."
   exit 1
 fi
+if [[ "${_CK_RC}" -eq 4 ]]; then
+  echo "[ERROR] Checkpoint selection failed: no SELECTED_CHECKPOINT, no valid best_model_checkpoint,"
+  echo "        and no eval_gIoU/gIoU/eval_mDice/mDice (or configured BEST_METRIC_NAME) under checkpoint-*."
+  echo "        Silent fallback to latest step is disabled. Fix training eval saving or set SELECTED_CHECKPOINT=..."
+  exit 1
+fi
 
-if echo "${PICK}" | grep -q '^WARN:fallback_max_step:'; then
-  echo "WARNING: No best_model_checkpoint or eval metric found."
-  echo "Falling back to latest checkpoint by step. This may not be the best checkpoint."
-  BEST_CHECKPOINT="${PICK#WARN:fallback_max_step:}"
-  _STRATEGY="fallback_max_step"
-elif echo "${PICK}" | grep -q '^OK:user:'; then
+if echo "${PICK}" | grep -q '^OK:user:'; then
   BEST_CHECKPOINT="${PICK#OK:user:}"
   _STRATEGY="user SELECTED_CHECKPOINT"
   echo "Using user-specified SELECTED_CHECKPOINT=${BEST_CHECKPOINT}"
@@ -431,6 +551,11 @@ fi
 
 echo "[OK] checkpoint selection strategy: ${_STRATEGY}"
 echo "[OK] BEST_CHECKPOINT=${BEST_CHECKPOINT}"
+
+echo "========================================"
+echo "[2b/5] Mandatory metric validation on BEST_CHECKPOINT"
+echo "========================================"
+validate_final_checkpoint_metrics
 
 ########################################
 # [3/5] Merge LoRA
@@ -523,7 +648,7 @@ echo "========================================"
 run_eval_metrics "${TEST_OUTPUT_DIR}"
 
 echo "========================================"
-echo "DONE public_semantic_v2_refaware_exclusion_only_28w"
+echo "DONE rrsisd_public_semantic_v2_refaware_exclusion_only_28w"
 echo "  OUTPUT_DIR=${OUTPUT_DIR}"
 echo "  BEST_CHECKPOINT=${BEST_CHECKPOINT}"
 echo "  MERGED_DIR=${MERGED_DIR}"
