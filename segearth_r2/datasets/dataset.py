@@ -453,6 +453,237 @@ class LaSeRSDataset(RS_Base_Dataset):
         
         return data_dict
 
+class RefSegRSDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split='train'):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+
+        split = split.lower()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unsupported RefSegRS split: {split}")
+
+        self.image_dir = os.path.join(base_data_path, "images")
+        self.mask_dir = os.path.join(base_data_path, "masks")
+        self.phrase_path = os.path.join(base_data_path, f"output_phrase_{split}.txt")
+
+        if not os.path.isfile(self.phrase_path):
+            raise FileNotFoundError(f"RefSegRS phrase file not found: {self.phrase_path}")
+
+        self.reason_file = []
+        with open(self.phrase_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                sid, phrase = parts[0].strip(), parts[1].strip()
+                self.reason_file.append({"sample_id": sid, "description": phrase})
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        sid = rec["sample_id"]
+        instruction = rec["description"]
+
+        image_path = os.path.join(self.image_dir, f"{sid}.tif")
+        mask_path = os.path.join(self.mask_dir, f"{sid}.tif")
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"RefSegRS image missing: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(f"RefSegRS mask missing: {mask_path}")
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to read RefSegRS mask: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = (mask > 0).astype(np.uint8)
+        masks = np.expand_dims(mask, axis=0)
+
+        data_dict = {}
+        data_dict["file_name"] = image_path
+
+        image_BGR = cv2.imread(image_path)
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = sid
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        data_dict["annotations"] = [{
+            "data_id": int(sid),
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": sid,
+        }]
+
+        prefix_inst = "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:"
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"}
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict["input_ids"][0]
+
+        SEG_token_embedding_indices = torch.zeros_like(input_ids)
+        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
+        return data_dict
+
+
+class RISBenchDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split='train'):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+
+        split = split.lower()
+        if split not in ("train", "val", "test"):
+            raise ValueError(f"Unsupported RISBench split: {split}")
+
+        self.image_dir = os.path.join(base_data_path, "img_rgb")
+        self.mask_dir = os.path.join(base_data_path, "mask")
+        self.phrase_path = os.path.join(base_data_path, f"output_phrase_{split}.txt")
+
+        if not os.path.isfile(self.phrase_path):
+            raise FileNotFoundError(f"RISBench phrase file not found: {self.phrase_path}")
+
+        self.reason_file = []
+        with open(self.phrase_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line_idx, line in enumerate(f):
+                line = line.strip()
+                if not line:
+                    continue
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                fname, phrase = parts[0].strip(), parts[1].strip()
+                stem = os.path.splitext(fname)[0]
+                self.reason_file.append({
+                    "line_idx": line_idx,
+                    "file_name": fname,
+                    "stem": stem,
+                    "description": phrase,
+                })
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        fname = rec["file_name"]
+        stem = rec["stem"]
+        instruction = rec["description"]
+
+        image_path = os.path.join(self.image_dir, fname)
+        mask_path = os.path.join(self.mask_dir, fname)
+
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"RISBench image missing: {image_path}")
+        if not os.path.isfile(mask_path):
+            raise FileNotFoundError(f"RISBench mask missing: {mask_path}")
+
+        mask = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+        if mask is None:
+            raise ValueError(f"Failed to read RISBench mask: {mask_path}")
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = (mask > 0).astype(np.uint8)
+        masks = np.expand_dims(mask, axis=0)
+
+        data_dict = {}
+        data_dict["file_name"] = image_path
+
+        image_BGR = cv2.imread(image_path)
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = stem
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        # Use idx as unique id to avoid occasional duplicate keys in phrase files.
+        data_dict["annotations"] = [{
+            "data_id": int(idx),
+            "mask_id": 0,
+            "mask": np.expand_dims(masks[0], axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": stem,
+        }]
+
+        prefix_inst = "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, please doing Reasoning Segmentation according to the following instruction:"
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"}
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+        input_ids = text_dict["input_ids"][0]
+
+        SEG_token_embedding_indices = torch.zeros_like(input_ids)
+        SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(input_ids)
+        refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
+        return data_dict
+
 @dataclass
 class DataCollatorForCOCODatasetV2(object):
     """Collate examples for supervised fine-tuning."""

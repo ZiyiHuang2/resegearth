@@ -17,6 +17,8 @@ from segearth_r2.utils.builder import load_pretrained_model
 from segearth_r2.datasets.dataset import (
     DataCollatorForCOCODatasetV2,
     LaSeRSDataset,
+    RefSegRSDataset,
+    RISBenchDataset,
     RRSISDDataset,
 )
 
@@ -47,8 +49,11 @@ class DataArguments:
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
 
+    load_8bit: bool = False
+    load_4bit: bool = False
+
     # 新增：数据集类型与 split
-    dataset_name: str = "lasers"   # "lasers" or "rrsisd"
+    dataset_name: str = "lasers"   # "lasers" or "rrsisd" or "refsegrs" or "risbench"
     split: str = "val"             # for rrsisd: train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
@@ -125,6 +130,41 @@ def build_eval_datasets(data_args, tokenizer):
         split_name = f"{split}.json"
         return [(split_name, eval_dataset)]
 
+    elif dataset_name == "refsegrs":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported RefSegRS split: {split}. Must be train / val / test")
+
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is RefSegRS {split} subset -------")
+
+        eval_dataset = RefSegRSDataset(
+            base_data_path=data_args.base_data_path,
+            tokenizer=tokenizer,
+            data_args=data_args,
+            split=split,
+        )
+
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
+
+    elif dataset_name == "risbench":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported RISBench split: {split}. Must be train / val / test")
+
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is RISBench {split} subset -------")
+
+        eval_dataset = RISBenchDataset(
+            base_data_path=data_args.base_data_path,
+            tokenizer=tokenizer,
+            data_args=data_args,
+            split=split,
+        )
+
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
     else:
         raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
@@ -145,10 +185,15 @@ def evaluation():
         model_args=data_args,
         mask_config=data_args.mask_config,
         device="cuda",
+        load_8bit=data_args.load_8bit,
+        load_4bit=data_args.load_4bit,
     )
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
-    model.to(dtype=torch.float32, device=device)
+    if not data_args.load_8bit and not data_args.load_4bit:
+        model.to(dtype=torch.float16, device=device)
+    else:
+        model.to(device=device)
 
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
@@ -199,6 +244,8 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
 
     if data_args.distributed:
         distributed.barrier()
+
+    infer_dtype = next(model.parameters()).dtype
 
     with torch.no_grad():
         for idx, inputs in tqdm(
