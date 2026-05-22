@@ -17,7 +17,7 @@ class ImageTextAlignmentAdapter(nn.Module):
             nn.Linear(hidden_dim, image_dim),
         )
 
-        # 对已经是 image_dim 的 SEG embedding，不再重复重投影
+        # 如果输入已经是 image_dim，就不再投影
         self.text_proj_image_dim = nn.Identity()
 
         self.query_norm = nn.LayerNorm(image_dim)
@@ -43,7 +43,14 @@ class ImageTextAlignmentAdapter(nn.Module):
         )
         self.mlp_norm = nn.LayerNorm(image_dim)
 
+        # 保持最小扰动：先从严格 identity 开始
+        # 结合你前面实验，先求“稳”，再求“强”
         self.seg_gate = nn.Parameter(torch.tensor(0.0))
+
+        # OHEM 参数：先保守
+        self.ohem_bg_ratio = 0.05
+        self.ohem_neg_pos_ratio = 2
+        self.bg_loss_weight = 0.5
 
     def _normalize_seg_embedding(self, seg_embedding):
         if seg_embedding.dim() == 3:
@@ -92,9 +99,9 @@ class ImageTextAlignmentAdapter(nn.Module):
             f"Cannot infer query->image mapping: num_queries={num_queries}, batch_size={batch_size}"
         )
 
-    def _dense_attention_align_loss(self, text_feat, per_query_image_feat, per_query_mask):
+    def _dense_attention_align_loss(self, refined_feat, per_query_image_feat, per_query_mask):
         """
-        text_feat: [Q, C]
+        refined_feat: [Q, C]
         per_query_image_feat: [Q, C, H, W]
         per_query_mask: [Q, 1, Hm, Wm] or [Q, Hm, Wm]
         """
@@ -107,17 +114,57 @@ class ImageTextAlignmentAdapter(nn.Module):
             mode="nearest",
         )  # [Q,1,H,W]
 
-        # query x dense feature map -> attention logit map
-        attn_map = torch.sum(
-            per_query_image_feat * text_feat.unsqueeze(-1).unsqueeze(-1),
-            dim=1,
+        gt = gt_mask_resized.squeeze(1)  # [Q,H,W]
+
+        q_norm = F.normalize(refined_feat.float(), dim=-1)  # [Q,C]
+        img_norm = F.normalize(per_query_image_feat.float(), dim=1)  # [Q,C,H,W]
+        logits = torch.einsum("qc,qchw->qhw", q_norm, img_norm) / 0.07
+
+        pixel_losses = F.binary_cross_entropy_with_logits(
+            logits,
+            gt.float(),
+            reduction="none",
         )  # [Q,H,W]
 
-        align_loss = F.binary_cross_entropy_with_logits(
-            attn_map.float(),
-            gt_mask_resized.squeeze(1).float(),
-        )
-        return align_loss
+        zero = torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+        per_query_losses = []
+
+        # 关键：per-query OHEM，避免大目标压制小目标
+        for q in range(logits.shape[0]):
+            cur_loss = pixel_losses[q].reshape(-1)
+            cur_gt = gt[q].reshape(-1)
+
+            fg_mask = cur_gt > 0.5
+            bg_mask = cur_gt <= 0.5
+
+            if fg_mask.any():
+                fg_loss = cur_loss[fg_mask].mean()
+                num_fg = int(fg_mask.sum().item())
+            else:
+                fg_loss = zero
+                num_fg = 0
+
+            if bg_mask.any():
+                bg_losses = cur_loss[bg_mask]
+                num_bg = int(bg_losses.numel())
+
+                k = max(
+                    int(num_fg * self.ohem_neg_pos_ratio),
+                    int(num_bg * self.ohem_bg_ratio),
+                )
+                k = max(k, 1)
+                k = min(k, num_bg)
+
+                hard_bg_loss = torch.topk(bg_losses, k=k, largest=True).values.mean()
+            else:
+                hard_bg_loss = zero
+
+            per_query_losses.append(fg_loss + self.bg_loss_weight * hard_bg_loss)
+
+        if len(per_query_losses) == 0:
+            return zero
+
+        return torch.stack(per_query_losses).mean()
 
     def forward(
         self,
@@ -131,13 +178,10 @@ class ImageTextAlignmentAdapter(nn.Module):
         """
         image_embedding: [B, C, H, W]
         seg_embedding: [Q, 1, D] or [Q, D]
-        gt_mask / gt_masks_per_query:
-            - [B, 1, H, W] / [Q, 1, H, W]
-            - 用于 dense attention supervision
         """
         B, C, H, W = image_embedding.shape
 
-        seg_embedding = self._normalize_seg_embedding(seg_embedding)  # [Q, D]
+        seg_embedding = self._normalize_seg_embedding(seg_embedding)  # [Q,D]
         Q = seg_embedding.shape[0]
 
         query_to_image_index = self._build_query_to_image_index(
@@ -151,9 +195,9 @@ class ImageTextAlignmentAdapter(nn.Module):
 
         # query branch
         if seg_embedding.shape[-1] == self.llm_dim:
-            text_feat = self.query_norm(self.text_proj(seg_embedding))   # [Q, C]
+            text_feat = self.query_norm(self.text_proj(seg_embedding))   # [Q,C]
         elif seg_embedding.shape[-1] == self.image_dim:
-            text_feat = self.query_norm(self.text_proj_image_dim(seg_embedding))  # [Q, C]
+            text_feat = self.query_norm(self.text_proj_image_dim(seg_embedding))  # [Q,C]
         else:
             raise ValueError(
                 f"Unsupported seg embedding dim {seg_embedding.shape[-1]}, "
@@ -161,16 +205,15 @@ class ImageTextAlignmentAdapter(nn.Module):
             )
 
         # image branch
-        img_feat_proj = self.image_proj(image_embedding)                 # [B, C, H, W]
-        per_query_image_feat = img_feat_proj[query_to_image_index]       # [Q, C, H, W]
+        img_feat_proj = self.image_proj(image_embedding)           # [B,C,H,W]
+        per_query_image_feat = img_feat_proj[query_to_image_index] # [Q,C,H,W]
 
-        # Dense attention supervision
+        # mask organize
         per_query_mask = gt_masks_per_query if gt_masks_per_query is not None else gt_mask
         if per_query_mask is not None:
             if per_query_mask.dim() == 3:
                 per_query_mask = per_query_mask.unsqueeze(1)
 
-            # 如果给的是按 batch 组织的 mask，而不是按 query 组织的 mask，就按 query_to_image_index 展开
             if per_query_mask.shape[0] == B and Q != B:
                 per_query_mask = per_query_mask[query_to_image_index]
 
@@ -179,24 +222,11 @@ class ImageTextAlignmentAdapter(nn.Module):
                     f"gt mask size mismatch, expected first dim {Q}, got {per_query_mask.shape[0]}"
                 )
 
-        align_loss = torch.tensor(
-            0.0,
-            device=image_embedding.device,
-            dtype=img_feat_proj.dtype,
-        )
-
-        if self.training and per_query_mask is not None:
-            align_loss = self._dense_attention_align_loss(
-                text_feat=text_feat,
-                per_query_image_feat=per_query_image_feat,
-                per_query_mask=per_query_mask,
-            )
-
         # Cross-attention refinement
-        value_tokens = per_query_image_feat.flatten(2).transpose(1, 2)   # [Q, HW, C]
+        value_tokens = per_query_image_feat.flatten(2).transpose(1, 2)  # [Q,HW,C]
         value_tokens = self.image_norm(value_tokens)
 
-        query = text_feat.unsqueeze(1)                                   # [Q,1,C]
+        query = text_feat.unsqueeze(1)  # [Q,1,C]
         attn_out, _ = self.cross_attn(
             query=query,
             key=value_tokens,
@@ -206,6 +236,23 @@ class ImageTextAlignmentAdapter(nn.Module):
 
         fused = self.attn_norm(query + attn_out)
         fused = self.mlp_norm(fused + self.mlp(fused))
-        fused_seg_feat = text_feat + self.seg_gate * fused.squeeze(1)
+        fused = fused.squeeze(1)  # [Q,C]
+
+        delta = fused - text_feat
+        fused_seg_feat = text_feat + self.seg_gate * delta
+
+        align_loss = torch.tensor(
+            0.0,
+            device=image_embedding.device,
+            dtype=img_feat_proj.dtype,
+        )
+
+        # 关键：监督 refined query，而不是 raw query
+        if self.training and per_query_mask is not None:
+            align_loss = self._dense_attention_align_loss(
+                refined_feat=fused_seg_feat,
+                per_query_image_feat=per_query_image_feat,
+                per_query_mask=per_query_mask,
+            )
 
         return fused_seg_feat.unsqueeze(1), align_loss

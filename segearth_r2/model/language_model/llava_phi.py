@@ -42,7 +42,7 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
-    loss_itaa: Optional[torch.FloatTensor] = None
+    align_loss: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -755,21 +755,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
         else:
             query_to_image_index = query_to_image_index.to(mask_features.device)
 
-        itaa_loss = torch.tensor(0.0, device=mask_features.device)
+        align_loss = torch.tensor(0.0, device=mask_features.device)
         if hasattr(self, "itaa") and self.itaa is not None:
-            gt_mask = None
             if gt_masks_per_query is not None:
-                gt_mask = gt_masks_per_query.to(mask_features.device)
-            elif seg_info is not None and len(seg_info) > 0 and "mask" in seg_info[0]:
-                gt_mask = torch.stack([item["mask"] for item in seg_info], dim=0).to(mask_features.device)
+                gt_masks_per_query = gt_masks_per_query.to(mask_features.device)
 
-            SEG_embedding, itaa_loss = self.itaa(
+            SEG_embedding, align_loss = self.itaa(
                 mask_features,
                 SEG_embedding,
-                gt_mask=gt_mask,
+                gt_mask=gt_masks_per_query,
                 mask_num=mask_num,
                 query_to_image_index=query_to_image_index,
-                gt_masks_per_query=gt_mask,
+                gt_masks_per_query=gt_masks_per_query,
             )
         mask_num = torch.tensor(mask_num, device=mask_features.device)
         mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
@@ -898,20 +895,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
         w_llm = self._get_loss_weight("loss_llm_weight", 1.0)
         w_mask = self._get_loss_weight("loss_mask_weight", 1.0)
         w_attention = self._get_loss_weight("loss_attention_weight", 0.0)
-        w_itaa = self._get_loss_weight("loss_itaa_weight", 0.03)
+        w_itaa = self._get_loss_weight("loss_itaa_weight", 0.05)
         enable_attention_loss = self._get_loss_flag("enable_attention_loss", False)
         enable_itaa_loss = self._get_loss_flag("enable_itaa_loss", True)
 
         llm_loss_term = llm_loss if llm_loss is not None else zero
         mask_loss_term = mask_loss if mask_loss is not None else zero
         attention_term = loss_attention if (enable_attention_loss and loss_attention is not None) else zero
-        itaa_term = itaa_loss if (enable_itaa_loss and itaa_loss is not None) else zero
+        align_term = align_loss if (
+            self.training and enable_itaa_loss and gt_masks_per_query is not None and align_loss is not None
+        ) else zero
 
         loss = (
             w_llm * llm_loss_term
             + w_mask * mask_loss_term
             + w_attention * attention_term
-            + w_itaa * itaa_term
+            + w_itaa * align_term
         )
 
         return CausalOutputWithMask(
@@ -924,7 +923,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach() if loss_dice is not None else zero,
             loss_llm=llm_loss.detach() if llm_loss is not None else zero,
             loss_attention=(w_attention * loss_attention).detach() if loss_attention is not None else zero,
-            loss_itaa=(w_itaa * itaa_loss).detach() if itaa_loss is not None else zero,
+            align_loss=(w_itaa * align_loss).detach() if align_loss is not None else zero,
         )
     
     def eval_seg(
@@ -990,19 +989,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
             query_to_image_index = query_to_image_index.to(mask_features.device)
 
         if hasattr(self, 'itaa') and self.itaa is not None:
-            gt_mask = None
-            if use_gt_mask_for_alignment:
-                if gt_masks_per_query is not None:
-                    gt_mask = gt_masks_per_query.to(mask_features.device)
-                elif seg_info is not None and len(seg_info) > 0 and 'mask' in seg_info[0]:
-                    gt_mask = torch.stack([item['mask'] for item in seg_info], dim=0).to(mask_features.device)
+            if gt_masks_per_query is not None:
+                gt_masks_per_query = gt_masks_per_query.to(mask_features.device)
             SEG_embedding, _ = self.itaa(
                 mask_features,
                 SEG_embedding,
-                gt_mask=gt_mask,
+                gt_mask=gt_masks_per_query,
                 mask_num=mask_num,
                 query_to_image_index=query_to_image_index,
-                gt_masks_per_query=gt_mask,
+                gt_masks_per_query=gt_masks_per_query,
             )
     
         mask_num_list = mask_num
