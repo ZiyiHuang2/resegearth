@@ -40,6 +40,7 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_contrast: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -841,7 +842,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
         masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
         masks_down = masks_down.view(masks_down.size(0), -1)
         masks_down[masks_down > 0] = 1
-        
         loss_attention = torch.tensor(0.0, device=SEG_embedding.device)
 
         if len(attentions) > 0:
@@ -852,10 +852,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
                     image_features_mask = image_features_indices[batch_idx].bool()
                     attention = attention_map[SEG_mask][:, image_features_mask]
+                    if global_step is not None and global_step < 5:
+                        print("[debug] SEG tokens:", int(SEG_mask.sum().item()))
+                        print("[debug] image tokens:", int(image_features_mask.sum().item()))
+                        print("[debug] selected attention shape:", tuple(attention.shape))
+                        if attention.numel() > 0:
+                            print("[debug] selected attention mean:", float(attention.float().mean().detach().cpu()))
+                            print("[debug] selected attention max:", float(attention.float().max().detach().cpu()))
                     batch_attentions_list.append(attention)
 
                 batch_attentions = torch.cat(batch_attentions_list, dim=0)
+                if global_step is not None and global_step < 5:
+                    print("[debug] batch_attentions shape:", tuple(batch_attentions.shape))
+                    print("[debug] masks_down shape for loss:", tuple(masks_down.shape))
                 loss_attention += self.attention_loss(batch_attentions, masks_down)
+                if global_step is not None and global_step < 5:
+                    print("[debug] raw loss_attention after layer:", float(loss_attention.detach().float().cpu()))
                              
         loss = llm_loss + mask_loss + 0.01 * loss_attention + self.contrast_loss_weight * loss_contrast
 
@@ -869,6 +881,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            loss_contrast=loss_contrast.detach(),
         )
     
     def eval_seg(
@@ -889,8 +902,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             mask_num = None):
         
-        output_attentions = True
-        output_hidden_states = True
+        output_attentions = False
+        output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         image_features = self.get_vision_tower_feature(images)
@@ -941,7 +954,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         processed_results = []
         for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
             instance_r = {
-                'pred': ((mask_pred_result.cpu().numpy() > 0) * 255).astype(np.uint8),
+                'pred': ((mask_pred_result.detach().float().cpu().numpy() > 0) * 255).astype(np.uint8),
                 'image_name': _seg_info['image_id'],
                 'id': _seg_info['data_id'],
                 'mask_id': _seg_info['mask_id'],
