@@ -4,6 +4,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import transformers
 from transformers import SiglipImageProcessor
 from peft import LoraConfig, get_peft_model
 import warnings
@@ -217,6 +218,33 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 data_args=data_args,
                 split="val_data.json"
             )
+
+        elif dataset_name == "refsegrs":
+            train_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RefSegRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
+        elif dataset_name == "risbench":
+            train_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train"
+            )
+            eval_dataset = RISBenchDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="val"
+            )
         else:
             raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
@@ -246,6 +274,9 @@ def train():
     if training_args.data_seed is None:
         training_args.data_seed = 42
     local_rank = training_args.local_rank
+    transformers.set_seed(training_args.seed)
+    if training_args.local_rank in (-1, 0):
+        print(f"[Seed] Set global seed before model init: {training_args.seed}")
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)

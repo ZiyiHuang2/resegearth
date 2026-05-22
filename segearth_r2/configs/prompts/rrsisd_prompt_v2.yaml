@@ -1,0 +1,44 @@
+version: rrsisd_prompt_v2
+language: en
+k_prompts: 3
+
+target_synonyms: {}
+spatial_synonyms: {}
+relation_synonyms: {}
+attribute_synonyms: {}
+
+templates: []
+
+rules:
+  keep_original_as_prompt_0: true
+  deduplicate: true
+  lite_only: true
+  original_weight: 0.75
+  area_ratio_min: 0.6
+  area_ratio_max: 1.6
+  confidence_ratio_min: 0.9
+  enable_keyword_gate: true
+  trigger_keywords:
+    - left
+    - right
+    - top
+    - bottom
+    - middle
+    - upper
+    - lower
+    - near
+    - adjacent
+    - above
+    - below
+  min_words: 2
+  max_words: 40
+  fallback_mode:
+    - "segment the object referred to by: {original}"
+    - "segment the region described as: {original}"
+
+examples:
+  - input: "the small ship on the left of the harbor"
+    prompts:
+      - "the small ship on the left of the harbor"
+      - "segment the object referred to by: the small ship on the left of the harbor"
+      - "segment the region described as: the small ship on the left of the harbor"

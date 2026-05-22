@@ -783,7 +783,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
-            mask_num = None):
+            mask_num = None,
+            return_logits: bool = False):
         
         output_attentions = False
         output_hidden_states = False
@@ -836,11 +837,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         processed_results = []
         for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
+            mask_np = mask_pred_result.detach().float().cpu().numpy()
+            if mask_np.ndim == 3:
+                mask_np = mask_np[0]
             instance_r = {
-                'pred': ((mask_pred_result.detach().float().cpu().numpy() > 0) * 255).astype(np.uint8),
                 'image_name': _seg_info['image_id'],
                 'id': _seg_info['data_id'],
                 'mask_id': _seg_info['mask_id'],
             }
+            if return_logits:
+                instance_r['logits'] = mask_np
+            else:
+                instance_r['pred'] = ((mask_np > 0) * 255).astype(np.uint8)
             processed_results.append(instance_r)
         return processed_results
