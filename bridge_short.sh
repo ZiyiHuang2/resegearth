@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Bridge 短训（约 100～500 step）+ 训练期 Bridge 诊断日志专用脚本。
+# 基于同目录 run_train_merge_test.sh 的路径与流程；训练代码使用 segearth+cross（含 seg_query_feature_bridge_diag_interval）。
+#
+# 前置：MODEL_NAME_OR_PATH 下 config.json 需 use_seg_query_feature_bridge=true。
+# 勿直接改官方 Mipha：运行一次
+#   bash scripts/setup_mipha_3b_bridge_config_copy.sh
+# 生成硬链接副本（仅 config 独立），默认输出到 Mipha-3B_bridge_config；下面 MODEL 默认已指向该目录。
+#
 set -euo pipefail
 
 ########################################
@@ -6,26 +14,26 @@ set -euo pipefail
 ########################################
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
-export WANDB_PROJECT=segearth-standard
-export WANDB_NAME=base-siglip1-10w
+export WANDB_PROJECT="${WANDB_PROJECT:-segearth-cross}"
+export WANDB_NAME="${WANDB_NAME:-bridge-150k}"
 export WANDB_INIT_TIMEOUT=300
 unset CUDA_VISIBLE_DEVICES
 
-GPU_SLOT="localhost:2"
-GPU_ID="2"
-MASTER_PORT="29501"
+GPU_SLOT="${GPU_SLOT:-localhost:2}"
+GPU_ID="${GPU_ID:-2}"
+MASTER_PORT="${MASTER_PORT:-29501}"
 
 ########################################
-# Project dir
+# Project dir（Bridge 诊断在 cross 仓库的 train / llava_trainer）
 ########################################
-REPO_DIR="/home/wangchengjun/huangziyi/reseg/segearth+base"
+REPO_DIR="/home/wangchengjun/huangziyi/reseg/segearth+cross"
 cd "${REPO_DIR}"
 
 ########################################
-# Common paths
+# Common paths（与 segearth+base/run_train_merge_test.sh 对齐）
 ########################################
-MODEL_NAME_OR_PATH="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B"
-VISION_TOWER="/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384"
+MODEL_NAME_OR_PATH="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B_bridge_config"
+VISION_TOWER="/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip2-so400m-patch14-384"
 VISION_TOWER_MASK="/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl"
 MASK_CONFIG="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
 
@@ -39,7 +47,7 @@ TEST_SPLIT="test"
 ########################################
 # Output
 ########################################
-OUTPUT_DIR="/home/wangchengjun/huangziyi/reseg/output/base/siglip1-10w"
+OUTPUT_DIR="/home/wangchengjun/huangziyi/reseg/output/cross/bridge-150k"
 MERGED_DIR="${OUTPUT_DIR}/merged_model"
 TEST_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
 
@@ -48,20 +56,20 @@ TEST_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
 ########################################
 EVAL_METRICS_SCRIPT="/home/wangchengjun/huangziyi/reseg/eval_val_metrics.py"
 EVAL_USE_WANDB="True"
-EVAL_WANDB_PROJECT="segearth-eval-standard-val"
-EVAL_WANDB_RUN_NAME="base-siglip1-10w"
+EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-cross-test}"
+EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-bridge-150k}"
 
 ########################################
-# Train config
+# Train config — 短训 + Bridge 诊断间隔（optimizer step）
 ########################################
-MAX_STEPS="100000"
-PER_DEVICE_TRAIN_BATCH_SIZE="1"
-GRADIENT_ACCUMULATION_STEPS="1"
+MAX_STEPS="${MAX_STEPS:-150000}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 
-SAVE_STEPS="2000"
+SAVE_STEPS="${SAVE_STEPS:-2000}"
 SAVE_TOTAL_LIMIT="2"
 
-LEARNING_RATE="1e-4"
+LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 WEIGHT_DECAY="0.0"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
@@ -70,12 +78,15 @@ LOGGING_STEPS="10"
 BF16="True"
 TF32="False"
 MODEL_MAX_LENGTH="2048"
-GRADIENT_CHECKPOINTING="False"
+GRADIENT_CHECKPOINTING="True"
 DATALOADER_NUM_WORKERS="4"
 
 LORA_R="8"
 LORA_ALPHA="16"
 LORA_DROPOUT="0.05"
+
+# 每 N 个 optimizer step 打印一行 [BridgeDiag]（rank 0）；可 export 为 20
+SEG_QUERY_FEATURE_BRIDGE_DIAG_INTERVAL="${SEG_QUERY_FEATURE_BRIDGE_DIAG_INTERVAL:-50}"
 
 DATA_RATIO="1"
 SWITCH_BS="4"
@@ -193,16 +204,18 @@ run_eval_metrics () {
 # Preflight
 ########################################
 echo "========================================"
-echo "[0/6] Preflight checks"
+echo "[0/6] Preflight checks (Bridge short + diag)"
 echo "========================================"
 
-echo "[INFO] REPO_DIR=${REPO_DIR}"
+echo "[INFO] REPO_DIR=${REPO_DIR} (segearth+cross for Bridge train/diag)"
 echo "[INFO] MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}"
 echo "[INFO] VISION_TOWER=${VISION_TOWER}"
 echo "[INFO] VISION_TOWER_MASK=${VISION_TOWER_MASK}"
 echo "[INFO] MASK_CONFIG=${MASK_CONFIG}"
 echo "[INFO] BASE_DATA_PATH=${BASE_DATA_PATH}"
 echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] MAX_STEPS=${MAX_STEPS} SAVE_STEPS=${SAVE_STEPS}"
+echo "[INFO] SEG_QUERY_FEATURE_BRIDGE_DIAG_INTERVAL=${SEG_QUERY_FEATURE_BRIDGE_DIAG_INTERVAL}"
 echo "[INFO] GPU_SLOT=${GPU_SLOT}"
 echo "[INFO] LORA_R=${LORA_R}"
 echo "[INFO] LEARNING_RATE=${LEARNING_RATE}"
@@ -212,6 +225,26 @@ echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
 
 if [[ ! -d "${MODEL_NAME_OR_PATH}" ]]; then
   echo "[ERROR] model path not found: ${MODEL_NAME_OR_PATH}"
+  exit 1
+fi
+
+if [[ ! -f "${MODEL_NAME_OR_PATH}/config.json" ]]; then
+  echo "[ERROR] config.json not found under model path: ${MODEL_NAME_OR_PATH}/config.json"
+  exit 1
+fi
+
+if ! python - <<PY
+import json
+p = "${MODEL_NAME_OR_PATH}/config.json"
+with open(p, "r", encoding="utf-8") as f:
+    c = json.load(f)
+if not bool(c.get("use_seg_query_feature_bridge", False)):
+    raise SystemExit(
+        "config.json must set use_seg_query_feature_bridge=true for Bridge short-train diagnostics."
+    )
+PY
+then
+  echo "[ERROR] ${MODEL_NAME_OR_PATH}/config.json 中 use_seg_query_feature_bridge 应为 true。"
   exit 1
 fi
 
@@ -263,7 +296,7 @@ echo "[OK] preflight passed"
 # 1) Train
 ########################################
 echo "========================================"
-echo "[1/6] Training (includes val + best ckpt)"
+echo "[1/6] Training (short + BridgeDiag + val + best ckpt)"
 echo "========================================"
 
 deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/train/train.py \
@@ -296,6 +329,8 @@ deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/tra
   --switch_bs "${SWITCH_BS}" \
   --seed "${SEED}" \
   --data_seed "${DATA_SEED}" \
+  --freeze_backbone True \
+  --seg_query_feature_bridge_diag_interval "${SEG_QUERY_FEATURE_BRIDGE_DIAG_INTERVAL}" \
   --report_to wandb
 
 ########################################

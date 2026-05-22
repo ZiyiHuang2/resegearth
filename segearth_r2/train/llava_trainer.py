@@ -265,7 +265,94 @@ class LLaVATrainer(Trainer):
                 self.update_history_loss_dict(outputs)
                 self.log(loss_dict)
 
+        if isinstance(loss, torch.Tensor) and loss.numel() > 0:
+            if not torch.isfinite(loss).all():
+                raise RuntimeError(
+                    f"[BridgeDiag] Non-finite loss from compute_loss at global_step={self.state.global_step}: "
+                    f"{loss.detach()}"
+                )
+
         return (loss, outputs) if return_outputs else loss
+
+    @staticmethod
+    def _l2_norm_tensor_list(tensors):
+        """L2 norm of a list of tensors (flattened), skipping None entries."""
+        total_sq = 0.0
+        for t in tensors:
+            if t is None:
+                continue
+            x = t.detach().float().reshape(-1)
+            total_sq += float((x * x).sum().item())
+        return math.sqrt(total_sq)
+
+    def _grad_norm_of_params(self, params):
+        grads = [p.grad for p in params]
+        if all(g is None for g in grads):
+            return 0.0
+        return self._l2_norm_tensor_list(grads)
+
+    def _weight_norm_of_params(self, params):
+        return self._l2_norm_tensor_list([p.data for p in params])
+
+    def _maybe_log_seg_query_feature_bridge_diag(self, model, loss):
+        interval = int(getattr(self.args, "seg_query_feature_bridge_diag_interval", 0) or 0)
+        if interval <= 0:
+            return
+        if not getattr(self.accelerator, "sync_gradients", True):
+            return
+        if not self.is_world_process_zero():
+            return
+        unwrapped = unwrap_model(model)
+        if hasattr(unwrapped, "get_base_model") and callable(unwrapped.get_base_model):
+            try:
+                unwrapped = unwrapped.get_base_model()
+            except Exception:
+                pass
+        if not getattr(unwrapped, "use_seg_query_feature_bridge", False):
+            return
+        bridge = getattr(unwrapped, "seg_query_feature_bridge", None)
+        if bridge is None:
+            return
+        next_opt_step = int(self.state.global_step) + 1
+        if next_opt_step % interval != 0:
+            return
+
+        alpha = bridge.alpha
+        alpha_val = float(alpha.detach().float().reshape(-1)[0].item())
+        alpha_grad = self._grad_norm_of_params([alpha])
+
+        qn = self._grad_norm_of_params(list(bridge.q_proj.parameters()))
+        kn = self._grad_norm_of_params(list(bridge.k_conv.parameters()))
+        vn = self._grad_norm_of_params(list(bridge.v_conv.parameters()))
+        dn = self._grad_norm_of_params(list(bridge.delta_proj.parameters()))
+        all_params = list(bridge.parameters())
+        g_all = self._grad_norm_of_params(all_params)
+        w_all = self._weight_norm_of_params(all_params)
+
+        loss_finite = True
+        if isinstance(loss, torch.Tensor):
+            loss_finite = bool(torch.isfinite(loss).all().item())
+        elif isinstance(loss, (float, int)):
+            loss_finite = math.isfinite(float(loss))
+
+        print(
+            f"[BridgeDiag] opt_step={next_opt_step} global_step={self.state.global_step} "
+            f"alpha={alpha_val:.6e} alpha_grad_norm={alpha_grad:.6e} "
+            f"grad_norm q_proj={qn:.6e} k_conv={kn:.6e} v_conv={vn:.6e} delta_proj={dn:.6e} "
+            f"bridge_grad_norm={g_all:.6e} bridge_weight_norm={w_all:.6e} loss_finite={loss_finite}",
+            flush=True,
+        )
+
+    def training_step(self, model, inputs, *args, **kwargs):
+        loss = super().training_step(model, inputs, *args, **kwargs)
+        if isinstance(loss, torch.Tensor) and loss.numel() > 0:
+            if not torch.isfinite(loss).all():
+                raise RuntimeError(
+                    f"[BridgeDiag] Non-finite training loss after backward at "
+                    f"global_step={self.state.global_step}: {loss.detach()}"
+                )
+        self._maybe_log_seg_query_feature_bridge_diag(model, loss)
+        return loss
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
         # Keep train drop_last behavior unchanged, but force eval to keep tail batches.

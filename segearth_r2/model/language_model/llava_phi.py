@@ -19,6 +19,7 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
+from .seg_query_feature_bridge import SegQueryFeatureBridge
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
@@ -127,6 +128,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
 
+        # Lightweight SEG_embedding refinement before Mask2Former predictor (default off; see config attributes).
+        self.use_seg_query_feature_bridge = bool(getattr(config, "use_seg_query_feature_bridge", False))
+        self.seg_query_feature_bridge_level = int(getattr(config, "seg_query_feature_bridge_level", 1))
+        self.seg_query_feature_bridge_alpha_init = float(
+            getattr(config, "seg_query_feature_bridge_alpha_init", 1e-3)
+        )
+        self.debug_seg_query_feature_bridge = bool(getattr(config, "debug_seg_query_feature_bridge", False))
+        self.debug_seg_query_feature_bridge_param_stats = bool(
+            getattr(config, "debug_seg_query_feature_bridge_param_stats", False)
+        )
+        self.seg_query_feature_bridge = None
+
         self.lm_head = nn.Linear(config.hidden_size, 51200, bias=False)
 
         is_train_mask_decode = getattr(config, 'mask_decode_train', False)
@@ -136,6 +149,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print('Mask Decoder has been trained, init directly')
             self.initial_mask_module()
         self.post_init()
+
+    def tie_weights(self):
+        """HF `from_pretrained` calls this after loading; restore bridge alpha after missing-key init."""
+        ret = super().tie_weights()
+        bridge = getattr(self, "seg_query_feature_bridge", None)
+        if bridge is not None:
+            with torch.no_grad():
+                bridge.alpha.data.fill_(float(self.seg_query_feature_bridge_alpha_init))
+            bridge.repair_weights_after_pretrained_load()
+            if getattr(self, "debug_seg_query_feature_bridge_param_stats", False):
+                bridge.log_parameter_stats()
+        return ret
 
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
@@ -150,7 +175,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
-            
+
+        _hd = int(self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.seg_query_feature_bridge = SegQueryFeatureBridge(
+            hidden_dim=_hd,
+            alpha_init=self.seg_query_feature_bridge_alpha_init,
+        )
+
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
             def get_w(weights, keyword):
@@ -601,7 +632,42 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
-           
+
+    def _refine_seg_embedding_with_bridge(
+        self,
+        SEG_embedding: torch.Tensor,
+        multi_scale_features: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """Optional predictor-front refinement; no-op when disabled or mask modules missing."""
+        if not self.use_seg_query_feature_bridge:
+            return SEG_embedding
+        bridge = self.seg_query_feature_bridge
+        if bridge is None:
+            raise RuntimeError(
+                "use_seg_query_feature_bridge is True but seg_query_feature_bridge is None. "
+                "Ensure mask decoder modules are initialized (initial_mask_module / mask_decode_train)."
+            )
+        level = self.seg_query_feature_bridge_level
+        n_levels = len(multi_scale_features)
+        if level < 0 or level >= n_levels:
+            raise ValueError(
+                f"seg_query_feature_bridge_level={level} is invalid for len(multi_scale_features)={n_levels} "
+                f"(expected 0 <= level < {n_levels})"
+            )
+        feat = multi_scale_features[level]
+        # `tie_weights` can run while weights are still Meta; repair once on first real forward.
+        if not getattr(self, "_seg_query_feature_bridge_lazy_repair_done", False):
+            w0 = bridge.q_proj.weight
+            if not getattr(w0, "is_meta", False) and getattr(w0.device, "type", "") != "meta":
+                bridge.repair_weights_after_pretrained_load()
+                self._seg_query_feature_bridge_lazy_repair_done = True
+        return bridge(
+            SEG_embedding,
+            feat,
+            debug=self.debug_seg_query_feature_bridge,
+            bridge_level=level,
+        )
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -656,7 +722,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        # Gradient checkpointing (and some backends) may leave per-layer attentions as None; skip those.
+        _raw_attn = outputs.attentions
+        if _raw_attn is None:
+            attentions = []
+        else:
+            attentions = [
+                attention_item.sum(dim=1)
+                for attention_item in _raw_attn
+                if attention_item is not None
+            ]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
@@ -668,6 +743,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
+        SEG_embedding = self._refine_seg_embedding_with_bridge(SEG_embedding, multi_scale_features)
         mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
 
         # 开始计算loss
@@ -822,7 +898,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        SEG_embedding = self._refine_seg_embedding_with_bridge(SEG_embedding, multi_scale_features)
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
 
         
         mask_pred_results = mask_outputs["pred_masks"]
