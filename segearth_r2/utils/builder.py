@@ -21,6 +21,23 @@ from segearth_r2.model import *
 from segearth_r2.datasets.dataset import get_mask_config
 from segearth_r2.model.language_model.llava_phi import SegEarthR2
 
+
+def _read_hf_state_dict(model_path):
+    import os
+    import glob
+    st_paths = sorted(glob.glob(os.path.join(model_path, "*.safetensors")))
+    if st_paths:
+        from safetensors.torch import load_file
+        state_dict = {}
+        for path in st_paths:
+            state_dict.update(load_file(path))
+        return state_dict
+    bin_path = os.path.join(model_path, "pytorch_model.bin")
+    if os.path.isfile(bin_path):
+        return torch.load(bin_path, map_location="cpu")
+    raise FileNotFoundError(f"No HF weights found under {model_path}")
+
+
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
     kwargs = {"device_map": 'cpu'}
@@ -41,8 +58,33 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
+    use_dgp_qdti = bool(getattr(model_args, "use_dgp_qdti", False))
+    require_qdti_bias = SegEarthR2.resolve_use_qdti_bias(model_args)
+    hf_state_dict = _read_hf_state_dict(model_path)
+    if use_dgp_qdti:
+        SegEarthR2.validate_dgp_qdti_checkpoint(
+            hf_state_dict,
+            context=f"HF model {model_path}",
+            require_qdti_bias=require_qdti_bias,
+        )
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+
+    SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
+    model.ensure_dgp_qdti_modules()
+    missing, unexpected = model.load_state_dict(hf_state_dict, strict=False)
+    if use_dgp_qdti:
+        missing_dgp = [
+            k for k in missing
+            if any(marker in k for marker in SegEarthR2.DGP_PROMPT_KEY_MARKERS)
+            or (require_qdti_bias and "query_specific_text_memory_bias" in k)
+        ]
+        if missing_dgp:
+            raise RuntimeError(
+                f"use_dgp_qdti=True but failed to load DGP-QDTI weights from {model_path}. "
+                f"Missing keys: {missing_dgp[:20]}"
+            )
     
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)

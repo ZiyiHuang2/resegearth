@@ -94,10 +94,29 @@ class CrossAttentionLayer(nn.Module):
                      memory_mask: Optional[Tensor] = None,
                      memory_key_padding_mask: Optional[Tensor] = None,
                      pos: Optional[Tensor] = None,
-                     query_pos: Optional[Tensor] = None):
+                     query_pos: Optional[Tensor] = None,
+                     extra_attn_bias: Optional[Tensor] = None):
+        effective_mask = memory_mask
+        if extra_attn_bias is not None:
+            if memory_mask is None:
+                effective_mask = extra_attn_bias
+            elif memory_mask.dtype == torch.bool:
+                if extra_attn_bias.shape != memory_mask.shape:
+                    raise ValueError(
+                        f"extra_attn_bias shape {tuple(extra_attn_bias.shape)} != "
+                        f"memory_mask shape {tuple(memory_mask.shape)}"
+                    )
+                bias = extra_attn_bias.float()
+                mask_float = torch.zeros_like(bias, dtype=torch.float32)
+                mask_float = mask_float.masked_fill(memory_mask, float("-inf"))
+                effective_mask = mask_float + bias
+                effective_mask = effective_mask.masked_fill(memory_mask, float("-inf"))
+                effective_mask = effective_mask.to(dtype=tgt.dtype)
+            else:
+                effective_mask = memory_mask.to(dtype=extra_attn_bias.dtype) + extra_attn_bias
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt, query_pos),
                                    key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
+                                   value=memory, attn_mask=effective_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
         tgt = self.norm(tgt)
@@ -108,11 +127,30 @@ class CrossAttentionLayer(nn.Module):
                     memory_mask: Optional[Tensor] = None,
                     memory_key_padding_mask: Optional[Tensor] = None,
                     pos: Optional[Tensor] = None,
-                    query_pos: Optional[Tensor] = None):
+                    query_pos: Optional[Tensor] = None,
+                    extra_attn_bias: Optional[Tensor] = None):
         tgt2 = self.norm(tgt)
+        effective_mask = memory_mask
+        if extra_attn_bias is not None:
+            if memory_mask is None:
+                effective_mask = extra_attn_bias
+            elif memory_mask.dtype == torch.bool:
+                if extra_attn_bias.shape != memory_mask.shape:
+                    raise ValueError(
+                        f"extra_attn_bias shape {tuple(extra_attn_bias.shape)} != "
+                        f"memory_mask shape {tuple(memory_mask.shape)}"
+                    )
+                bias = extra_attn_bias.float()
+                mask_float = torch.zeros_like(bias, dtype=torch.float32)
+                mask_float = mask_float.masked_fill(memory_mask, float("-inf"))
+                effective_mask = mask_float + bias
+                effective_mask = effective_mask.masked_fill(memory_mask, float("-inf"))
+                effective_mask = effective_mask.to(dtype=tgt2.dtype)
+            else:
+                effective_mask = memory_mask.to(dtype=extra_attn_bias.dtype) + extra_attn_bias
         tgt2 = self.multihead_attn(query=self.with_pos_embed(tgt2, query_pos),
                                    key=self.with_pos_embed(memory, pos),
-                                   value=memory, attn_mask=memory_mask,
+                                   value=memory, attn_mask=effective_mask,
                                    key_padding_mask=memory_key_padding_mask)[0]
         tgt = tgt + self.dropout(tgt2)
 
@@ -122,12 +160,13 @@ class CrossAttentionLayer(nn.Module):
                 memory_mask: Optional[Tensor] = None,
                 memory_key_padding_mask: Optional[Tensor] = None,
                 pos: Optional[Tensor] = None,
-                query_pos: Optional[Tensor] = None):
+                query_pos: Optional[Tensor] = None,
+                extra_attn_bias: Optional[Tensor] = None):
         if self.normalize_before:
             return self.forward_pre(tgt, memory, memory_mask,
-                                    memory_key_padding_mask, pos, query_pos)
+                                    memory_key_padding_mask, pos, query_pos, extra_attn_bias)
         return self.forward_post(tgt, memory, memory_mask,
-                                 memory_key_padding_mask, pos, query_pos)
+                                 memory_key_padding_mask, pos, query_pos, extra_attn_bias)
 
 
 class FFNLayer(nn.Module):
@@ -407,6 +446,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             seg_proj=True,
             seg_fuse_score=False,
             use_seg_query=False,
+            qdti_apply_layers=None,
     ):
         nn.Module.__init__(self)
         # positional encoding
@@ -420,6 +460,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
         self.use_seg_query = use_seg_query
+        self.qdti_apply_layers = qdti_apply_layers
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -478,12 +519,44 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+    def _qdti_layer_active(self, layer_idx: int) -> bool:
+        spec = self.qdti_apply_layers
+        if spec is None:
+            return False
+        if spec == "last3":
+            return layer_idx >= self.num_layers - 3
+        return False
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward(
+        self,
+        x,
+        mask_features,
+        mask=None,
+        seg_query=None,
+        SEG_embedding=None,
+        text_memory=None,
+        text_memory_mask=None,
+    ):
+        return self.forward_woconcat(
+            x,
+            mask_features,
+            mask,
+            seg_query,
+            SEG_embedding,
+            text_memory=text_memory,
+            text_memory_mask=text_memory_mask,
+        )
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
-
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward_woconcat(
+        self,
+        x,
+        mask_features,
+        mask=None,
+        seg_query=None,
+        SEG_embedding=None,
+        text_memory=None,
+        text_memory_mask=None,
+    ):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -545,16 +618,39 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         
         predictions_mask.append(outputs_mask)
 
+        qdti_mod = getattr(self, "query_specific_text_memory_bias", None)
+
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
+
+            layer_extra_attn_bias = None
+            if (
+                qdti_mod is not None
+                and self._qdti_layer_active(i)
+                and text_memory is not None
+                and text_memory_mask is not None
+            ):
+                layer_extra_attn_bias, _ = qdti_mod(
+                    src[level_index],
+                    output,
+                    text_memory,
+                    text_memory_mask,
+                    self.num_heads,
+                )
+                if layer_extra_attn_bias is not None:
+                    assert layer_extra_attn_bias.shape == attn_mask.shape, (
+                        f"extra_attn_bias shape {tuple(layer_extra_attn_bias.shape)} != "
+                        f"attn_mask shape {tuple(attn_mask.shape)}"
+                    )
 
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
                 memory_mask=attn_mask,
                 memory_key_padding_mask=None,  # here we do not apply masking on padded region
-                pos=pos[level_index], query_pos=query_embed
+                pos=pos[level_index], query_pos=query_embed,
+                extra_attn_bias=layer_extra_attn_bias,
             )
 
             output = self.transformer_self_attention_layers[i](

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SegEarth-R2 Stage 3 DGP-QDTI: train -> merge -> eval -> metrics
 set -euo pipefail
 
 ########################################
@@ -6,57 +7,72 @@ set -euo pipefail
 ########################################
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
-export WANDB_PROJECT=segearth-standard
-export WANDB_NAME=base-siglip1-28w-gd4    
+export WANDB_PROJECT=segearth-dgp-stage3
+export WANDB_NAME=dgp-qdti-stage3-v5
 export WANDB_INIT_TIMEOUT=300
 unset CUDA_VISIBLE_DEVICES
 
-GPU_SLOT="localhost:1"
-GPU_ID="1"
-MASTER_PORT="29500"
+GPU_SLOT="localhost:0"
+GPU_ID="0"
+MASTER_PORT="29800"
 
 ########################################
 # Project dir
 ########################################
-REPO_DIR="/home/wangchengjun/huangziyi/reseg/segearth+base"
+REPO_DIR="/root/rivermind-data/huangziyi/reseg/segearth+DGP"
 cd "${REPO_DIR}"
 
 ########################################
 # Common paths
 ########################################
-MODEL_NAME_OR_PATH="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B"
-VISION_TOWER="/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384"
-VISION_TOWER_MASK="/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl"
+MODEL_NAME_OR_PATH="/root/rivermind-data/huangziyi/reseg/pretrained_model/mllm/Mipha-3B"
+VISION_TOWER="/root/rivermind-data/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384"
+VISION_TOWER_MASK="/root/rivermind-data/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl"
 MASK_CONFIG="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
 
 ########################################
 # Dataset config
 ########################################
-BASE_DATA_PATH="/home/wangchengjun/huangziyi/data/RRSISD"
+BASE_DATA_PATH="/root/rivermind-data/huangziyi/data/RRSISD"
 DATASET_NAME="rrsisd"
 TEST_SPLIT="test"
 
 ########################################
 # Output
 ########################################
-OUTPUT_DIR="/home/wangchengjun/huangziyi/reseg/output/base/standard-base-siglip1-28w-gd4"
+OUTPUT_DIR="/root/rivermind-data/huangziyi/reseg/output/dgp/dgp-qdti-stage3-v5"
 MERGED_DIR="${OUTPUT_DIR}/merged_model"
 TEST_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
 
 ########################################
 # Eval metrics config (auto upload to W&B)
 ########################################
-EVAL_METRICS_SCRIPT="/home/wangchengjun/huangziyi/reseg/eval_val_metrics.py"
+EVAL_METRICS_SCRIPT="/root/rivermind-data/huangziyi/reseg/eval_val_metrics.py"
 EVAL_USE_WANDB="True"
-EVAL_WANDB_PROJECT="segearth-eval-standard-val"
-EVAL_WANDB_RUN_NAME="base-siglip1-28w-gd4"
+EVAL_WANDB_PROJECT="segearth-eval-dgp-stage3"
+EVAL_WANDB_RUN_NAME="dgp-qdti-stage3-v5"
+
+########################################
+# Stage 3 DGP-QDTI config (train / merge / eval must stay consistent)
+########################################
+USE_DGP_QDTI="True"
+USE_QDTI_BIAS="True"
+DGP_FUSE_DIM="256"
+DGP_REFINER_HIDDEN_DIM="512"
+DGP_PG_TOKENS="1"
+QDTI_BIAS_DIM="128"
+QDTI_INIT_STD="1e-3"
+QDTI_MAX_ABS="0.01"
+QDTI_APPLY_LAYERS="last3"
+QDTI_SCALE_INIT="0.0"
+SCALE_HARD_LOSS_WEIGHT="0.0"
 
 ########################################
 # Train config
 ########################################
-MAX_STEPS="70000"
-PER_DEVICE_TRAIN_BATCH_SIZE="1"
-GRADIENT_ACCUMULATION_STEPS="4"
+MAX_STEPS="80000"
+PER_DEVICE_TRAIN_BATCH_SIZE="4"
+GRADIENT_ACCUMULATION_STEPS="1"
 
 SAVE_STEPS="2000"
 SAVE_TOTAL_LIMIT="2"
@@ -147,7 +163,18 @@ merge_ckpt () {
     --save_path "${save_dir}" \
     --lora_r "${LORA_R}" \
     --lora_alpha "${LORA_ALPHA}" \
-    --lora_dropout "${LORA_DROPOUT}"
+    --lora_dropout "${LORA_DROPOUT}" \
+    --use_dgp_qdti "${USE_DGP_QDTI}" \
+    --use_qdti_bias "${USE_QDTI_BIAS}" \
+    --dgp_fuse_dim "${DGP_FUSE_DIM}" \
+    --dgp_refiner_hidden_dim "${DGP_REFINER_HIDDEN_DIM}" \
+    --dgp_pg_tokens "${DGP_PG_TOKENS}" \
+    --qdti_bias_dim "${QDTI_BIAS_DIM}" \
+    --qdti_init_std "${QDTI_INIT_STD}" \
+    --qdti_max_abs "${QDTI_MAX_ABS}" \
+    --qdti_apply_layers "${QDTI_APPLY_LAYERS}" \
+    --qdti_scale_init "${QDTI_SCALE_INIT}" \
+    --scale_hard_loss_weight "${SCALE_HARD_LOSS_WEIGHT}"
 }
 
 eval_model () {
@@ -167,7 +194,58 @@ eval_model () {
     --dataset_name "${DATASET_NAME}" \
     --split "${TEST_SPLIT}" \
     --eval_batch_size 1 \
+    --use_dgp_qdti "${USE_DGP_QDTI}" \
+    --use_qdti_bias "${USE_QDTI_BIAS}" \
+    --dgp_fuse_dim "${DGP_FUSE_DIM}" \
+    --dgp_refiner_hidden_dim "${DGP_REFINER_HIDDEN_DIM}" \
+    --dgp_pg_tokens "${DGP_PG_TOKENS}" \
+    --qdti_bias_dim "${QDTI_BIAS_DIM}" \
+    --qdti_init_std "${QDTI_INIT_STD}" \
+    --qdti_max_abs "${QDTI_MAX_ABS}" \
+    --qdti_apply_layers "${QDTI_APPLY_LAYERS}" \
+    --qdti_scale_init "${QDTI_SCALE_INIT}" \
+    --scale_hard_loss_weight "${SCALE_HARD_LOSS_WEIGHT}" \
     --zip_results False
+}
+
+check_merged_dgp_config () {
+  local merged_dir="$1"
+  MERGED_DIR="${merged_dir}" python - <<'PY'
+import json
+import os
+import sys
+
+merged_dir = os.environ["MERGED_DIR"]
+cfg_path = os.path.join(merged_dir, "config.json")
+required = (
+    "use_dgp_qdti",
+    "use_qdti_bias",
+    "dgp_pg_tokens",
+    "qdti_apply_layers",
+    "qdti_scale_init",
+    "qdti_max_abs",
+    "scale_hard_loss_weight",
+)
+
+if not os.path.isfile(cfg_path):
+    print(f"[ERROR] missing {cfg_path}", file=sys.stderr)
+    sys.exit(1)
+
+with open(cfg_path, "r", encoding="utf-8") as f:
+    cfg = json.load(f)
+
+missing = [k for k in required if k not in cfg]
+if missing:
+    print(f"[ERROR] merged config.json missing DGP keys: {missing}", file=sys.stderr)
+    sys.exit(1)
+
+if not cfg.get("use_dgp_qdti", False):
+    print("[ERROR] merged config.json use_dgp_qdti is not True", file=sys.stderr)
+    sys.exit(1)
+
+for key in required:
+    print(f"  config.{key}={cfg.get(key)!r}")
+PY
 }
 
 run_eval_metrics () {
@@ -204,8 +282,9 @@ echo "[INFO] MASK_CONFIG=${MASK_CONFIG}"
 echo "[INFO] BASE_DATA_PATH=${BASE_DATA_PATH}"
 echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
 echo "[INFO] GPU_SLOT=${GPU_SLOT}"
-echo "[INFO] LORA_R=${LORA_R}"
-echo "[INFO] LEARNING_RATE=${LEARNING_RATE}"
+echo "[INFO] USE_DGP_QDTI=${USE_DGP_QDTI} USE_QDTI_BIAS=${USE_QDTI_BIAS}"
+echo "[INFO] QDTI_APPLY_LAYERS=${QDTI_APPLY_LAYERS} QDTI_SCALE_INIT=${QDTI_SCALE_INIT}"
+echo "[INFO] LORA_R=${LORA_R} LEARNING_RATE=${LEARNING_RATE}"
 echo "[INFO] EVAL_METRICS_SCRIPT=${EVAL_METRICS_SCRIPT}"
 echo "[INFO] EVAL_WANDB_PROJECT=${EVAL_WANDB_PROJECT}"
 echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
@@ -296,6 +375,19 @@ deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/tra
   --switch_bs "${SWITCH_BS}" \
   --seed "${SEED}" \
   --data_seed "${DATA_SEED}" \
+  --use_dgp_qdti "${USE_DGP_QDTI}" \
+  --use_qdti_bias "${USE_QDTI_BIAS}" \
+  --dgp_fuse_dim "${DGP_FUSE_DIM}" \
+  --dgp_refiner_hidden_dim "${DGP_REFINER_HIDDEN_DIM}" \
+  --dgp_pg_tokens "${DGP_PG_TOKENS}" \
+  --qdti_bias_dim "${QDTI_BIAS_DIM}" \
+  --qdti_init_std "${QDTI_INIT_STD}" \
+  --qdti_max_abs "${QDTI_MAX_ABS}" \
+  --qdti_apply_layers "${QDTI_APPLY_LAYERS}" \
+  --qdti_scale_init "${QDTI_SCALE_INIT}" \
+  --scale_hard_loss_weight "${SCALE_HARD_LOSS_WEIGHT}" \
+  --dgp_monitor_wandb True \
+  --dgp_monitor_steps 10 \
   --report_to wandb
 
 ########################################
@@ -332,15 +424,11 @@ merge_ckpt "${BEST_CHECKPOINT}" "${MERGED_DIR}"
 # 4) Check merged config
 ########################################
 echo "========================================"
-echo "[4/6] Check merged config"
+echo "[4/6] Check merged DGP config"
 echo "========================================"
 
-if [[ ! -f "${MERGED_DIR}/config.json" ]]; then
-  echo "[ERROR] merged config.json not found: ${MERGED_DIR}/config.json"
-  exit 1
-fi
-
-echo "[OK] merged config.json present"
+check_merged_dgp_config "${MERGED_DIR}"
+echo "[OK] merged config.json DGP fields verified"
 
 ########################################
 # 5) Eval merged model + upload eval metrics
@@ -361,6 +449,7 @@ echo "Output dir        : ${OUTPUT_DIR}"
 echo "Selected ckpt     : ${BEST_CHECKPOINT}"
 echo "Merged model      : ${MERGED_DIR}"
 echo "Test outputs      : ${TEST_OUTPUT_DIR}"
+echo "DGP-QDTI          : use_dgp_qdti=${USE_DGP_QDTI} use_qdti_bias=${USE_QDTI_BIAS}"
 echo "Eval W&B project  : ${EVAL_WANDB_PROJECT}"
 echo "Eval W&B run name : ${EVAL_WANDB_RUN_NAME}"
 echo "========================================"

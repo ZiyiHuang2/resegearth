@@ -18,6 +18,7 @@ from ..mipha.model.language_model.mipha_phi import (MiphaPhiForCausalLM, MiphaPh
 from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_TOKEN_INDEX
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
+from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.qdti import QuerySpecificTextMemoryBias
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
 
@@ -25,6 +26,13 @@ from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_e
 
 from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
+from segearth_r2.model.language_model.prompt_query_fusion import (
+    DualGranularityPromptAdapter,
+    PromptAwareQueryRefiner,
+    pack_seg_hidden_states_bq,
+    expand_bq_for_mask_num,
+    expand_bp_for_mask_num,
+)
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
 
@@ -119,6 +127,40 @@ class SegEarthR2Model(MiphaPhiModel):
         vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
 
 class SegEarthR2(MiphaPhiForCausalLM):
+    DGP_QDTI_STATE_KEY_MARKERS = (
+        "prompt_adapter",
+        "query_refiner",
+        "query_specific_text_memory_bias",
+    )
+    DGP_PROMPT_KEY_MARKERS = (
+        "prompt_adapter",
+        "query_refiner",
+    )
+
+    @staticmethod
+    def resolve_use_qdti_bias(model_args) -> bool:
+        if not bool(getattr(model_args, "use_dgp_qdti", False)):
+            return False
+        if getattr(model_args, "use_qdti_bias", None) is None:
+            return True
+        return bool(getattr(model_args, "use_qdti_bias"))
+
+    @classmethod
+    def sync_dgp_config_from_args(cls, config, model_args):
+        use_dgp = bool(getattr(model_args, "use_dgp_qdti", False))
+        config.use_dgp_qdti = use_dgp
+        config.use_qdti_bias = cls.resolve_use_qdti_bias(model_args)
+        config.dgp_fuse_dim = int(getattr(model_args, "dgp_fuse_dim", 256))
+        config.dgp_refiner_hidden_dim = int(getattr(model_args, "dgp_refiner_hidden_dim", 512))
+        config.dgp_pg_tokens = int(getattr(model_args, "dgp_pg_tokens", 1))
+        config.qdti_bias_dim = int(getattr(model_args, "qdti_bias_dim", 128))
+        config.qdti_init_std = float(getattr(model_args, "qdti_init_std", 1e-3))
+        config.qdti_max_abs = float(getattr(model_args, "qdti_max_abs", 0.01))
+        config.qdti_apply_layers = str(getattr(model_args, "qdti_apply_layers", "last3"))
+        config.qdti_scale_init = float(getattr(model_args, "qdti_scale_init", 0.0))
+        config.scale_hard_loss_weight = float(getattr(model_args, "scale_hard_loss_weight", 0.0))
+        return config
+
     def __init__(self, config, model_args=None, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None):
         super(SegEarthR2, self).__init__(config)
 
@@ -137,6 +179,127 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.initial_mask_module()
         self.post_init()
 
+    def _dgp_qdti_enabled(self) -> bool:
+        return bool(getattr(self.config, "use_dgp_qdti", False))
+
+    def _qdti_bias_enabled(self) -> bool:
+        if not self._dgp_qdti_enabled():
+            return False
+        return bool(getattr(self.config, "use_qdti_bias", True))
+
+    def _resolve_pad_token_id(self):
+        pad_id = getattr(self.config, "pad_token_id", None)
+        if pad_id is None and hasattr(self, "tokenizer") and self.tokenizer is not None:
+            pad_id = getattr(self.tokenizer, "pad_token_id", None)
+        return pad_id
+
+    def ensure_dgp_qdti_modules(self):
+        if not self._dgp_qdti_enabled():
+            return
+        llm_dim = int(self.config.hidden_size)
+        fuse_dim = int(getattr(self.config, "dgp_fuse_dim", 256))
+        refiner_hidden = int(getattr(self.config, "dgp_refiner_hidden_dim", 512))
+        pg_tokens = int(getattr(self.config, "dgp_pg_tokens", 1))
+        if getattr(self, "prompt_adapter", None) is None:
+            self.prompt_adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim, pg_tokens=pg_tokens)
+        if getattr(self, "query_refiner", None) is None:
+            self.query_refiner = PromptAwareQueryRefiner(fuse_dim, refiner_hidden)
+        if not hasattr(self, "predictor") or self.predictor is None:
+            return
+        spec = str(getattr(self.config, "qdti_apply_layers", "last3"))
+        if getattr(self.predictor, "qdti_apply_layers", None) is None:
+            self.predictor.qdti_apply_layers = spec if self._qdti_bias_enabled() else None
+        if not self._qdti_bias_enabled():
+            return
+        if getattr(self.predictor, "query_specific_text_memory_bias", None) is not None:
+            return
+        hidden_dim = int(self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.predictor.register_module(
+            "query_specific_text_memory_bias",
+            QuerySpecificTextMemoryBias(
+                text_dim=fuse_dim,
+                memory_dim=hidden_dim,
+                query_dim=hidden_dim,
+                bias_dim=int(getattr(self.config, "qdti_bias_dim", 128)),
+                init_std=float(getattr(self.config, "qdti_init_std", 1e-3)),
+                max_abs=float(getattr(self.config, "qdti_max_abs", 0.01)),
+                qdti_scale_init=float(getattr(self.config, "qdti_scale_init", 0.0)),
+            ),
+        )
+
+    @classmethod
+    def dgp_qdti_keys_in_state_dict(cls, state_dict) -> bool:
+        for key in state_dict.keys():
+            if any(marker in key for marker in cls.DGP_QDTI_STATE_KEY_MARKERS):
+                return True
+        return False
+
+    @classmethod
+    def validate_dgp_qdti_checkpoint(cls, state_dict, context: str = "checkpoint", require_qdti_bias: bool = True):
+        required = list(cls.DGP_PROMPT_KEY_MARKERS)
+        if require_qdti_bias:
+            required.append("query_specific_text_memory_bias")
+        missing = []
+        for marker in required:
+            if not any(marker in k for k in state_dict.keys()):
+                missing.append(marker)
+        if missing:
+            raise RuntimeError(
+                f"use_dgp_qdti=True but {context} is missing DGP-QDTI weights for: {missing}. "
+                f"Expected state_dict keys containing {required}."
+            )
+
+    def _repeat_text_memory_for_mask_num(self, text_memory, text_memory_mask, mask_num_tensor):
+        if text_memory is None or text_memory_mask is None:
+            return None, None
+        tm = expand_bp_for_mask_num(text_memory, mask_num_tensor)
+        mn = torch.as_tensor(mask_num_tensor, device=text_memory_mask.device, dtype=torch.long).flatten()
+        tmm = torch.repeat_interleave(text_memory_mask, mn, dim=0)
+        return tm, tmm
+
+    def _compute_seg_embedding_with_dgp(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        seg_embedding_indices: torch.Tensor,
+        image_features_indices: Optional[torch.Tensor] = None,
+        token_refer_id=None,
+        target_phrase_mask: Optional[torch.Tensor] = None,
+    ):
+        seg_mask = seg_embedding_indices.bool()
+        image_mask = image_features_indices.bool() if image_features_indices is not None else None
+
+        seg_hidden_bq, seg_valid_mask = pack_seg_hidden_states_bq(hidden_states, seg_mask)
+        seg_embedding = self.SEG_token_projector(seg_hidden_bq)
+
+        _, _, prompt_tokens, prompt_mask = self.prompt_adapter(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            seg_mask=seg_mask,
+            target_phrase_mask=target_phrase_mask,
+            image_mask=image_mask,
+            token_refer_id=token_refer_id,
+            embed_fn=self.embed_refer_ids,
+            pad_token_id=self._resolve_pad_token_id(),
+        )
+
+        q_ref = self.query_refiner(
+            seg_embedding,
+            prompt_tokens,
+            seg_query_mask=seg_valid_mask,
+            prompt_mask=prompt_mask,
+        )
+
+        B, Q, D = q_ref.shape
+        if seg_valid_mask.shape != (B, Q):
+            raise ValueError(
+                f"seg_valid_mask {tuple(seg_valid_mask.shape)} != Q_ref batch/query {(B, Q)}"
+            )
+        if prompt_tokens.shape[:2] != prompt_mask.shape:
+            raise ValueError("prompt_tokens / prompt_mask shape mismatch")
+
+        return q_ref, prompt_tokens, prompt_mask
+
     def initial_mask_module(self, pretrained_path=None, model_args=None):
         if not self.is_train_mask_decode:
             print('Initialize mask modules...')
@@ -150,6 +313,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+
+        if model_args is not None:
+            self.sync_dgp_config_from_args(self.config, model_args)
+        self.ensure_dgp_qdti_modules()
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -260,6 +427,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
 
+        qdti_apply = (
+            str(getattr(self.config, "qdti_apply_layers", "last3"))
+            if self._qdti_bias_enabled()
+            else None
+        )
+
         predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(in_channels,
                                                                      hidden_dim,
                                                                      num_queries,
@@ -271,7 +444,21 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                                      enforce_input_project,
                                                                      seg_norm,
                                                                      seg_proj,
-                                                                     seg_fuse_score,)
+                                                                     seg_fuse_score,
+                                                                     qdti_apply_layers=qdti_apply,)
+        if self._qdti_bias_enabled():
+            predictor.register_module(
+                "query_specific_text_memory_bias",
+                QuerySpecificTextMemoryBias(
+                    text_dim=int(getattr(self.config, "dgp_fuse_dim", 256)),
+                    memory_dim=int(hidden_dim),
+                    query_dim=int(hidden_dim),
+                    bias_dim=int(getattr(self.config, "qdti_bias_dim", 128)),
+                    init_std=float(getattr(self.config, "qdti_init_std", 1e-3)),
+                    max_abs=float(getattr(self.config, "qdti_max_abs", 0.01)),
+                    qdti_scale_init=float(getattr(self.config, "qdti_scale_init", 0.0)),
+                ),
+            )
         return predictor
 
 
@@ -657,7 +844,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+
+        text_memory = None
+        text_memory_mask = None
+        if self._dgp_qdti_enabled():
+            q_ref, text_memory, text_memory_mask = self._compute_seg_embedding_with_dgp(
+                hidden_states,
+                attention_mask,
+                SEG_token_embedding_indices,
+                image_features_indices=image_features_indices,
+                token_refer_id=token_refer_id,
+            )
+            if not self._qdti_bias_enabled():
+                text_memory = None
+                text_memory_mask = None
+        else:
+            SEG_embedding = self.SEG_token_projector(
+                self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+            )
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -668,7 +872,26 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        if self._dgp_qdti_enabled():
+            SEG_embedding = expand_bq_for_mask_num(q_ref, mask_num)
+            if SEG_embedding.dim() != 3:
+                raise ValueError(f"SEG_embedding must be [B,Q,256], got {tuple(SEG_embedding.shape)}")
+
+        tm_rep, tmm_rep = self._repeat_text_memory_for_mask_num(text_memory, text_memory_mask, mask_num)
+        if tm_rep is not None and tm_rep.shape[0] != SEG_embedding.shape[0]:
+            raise ValueError(
+                f"QDTI text_memory batch {tm_rep.shape[0]} != SEG_embedding batch {SEG_embedding.shape[0]}"
+            )
+
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            None,
+            SEG_embedding,
+            text_memory=tm_rep,
+            text_memory_mask=tmm_rep,
+        )
 
         # 开始计算loss
         loss = None
@@ -808,7 +1031,23 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         hidden_states = outputs.last_hidden_state   
 
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        text_memory = None
+        text_memory_mask = None
+        if self._dgp_qdti_enabled():
+            q_ref, text_memory, text_memory_mask = self._compute_seg_embedding_with_dgp(
+                hidden_states,
+                attention_mask,
+                SEG_token_embedding_indices,
+                image_features_indices=image_features_indices,
+                token_refer_id=token_refer_id,
+            )
+            if not self._qdti_bias_enabled():
+                text_memory = None
+                text_memory_mask = None
+        else:
+            SEG_embedding = self.SEG_token_projector(
+                self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+            )
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -822,7 +1061,26 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        if self._dgp_qdti_enabled():
+            SEG_embedding = expand_bq_for_mask_num(q_ref, mask_num)
+            if SEG_embedding.dim() != 3:
+                raise ValueError(f"SEG_embedding must be [B,Q,256], got {tuple(SEG_embedding.shape)}")
+
+        tm_rep, tmm_rep = self._repeat_text_memory_for_mask_num(text_memory, text_memory_mask, mask_num)
+        if tm_rep is not None and tm_rep.shape[0] != SEG_embedding.shape[0]:
+            raise ValueError(
+                f"QDTI text_memory batch {tm_rep.shape[0]} != SEG_embedding batch {SEG_embedding.shape[0]}"
+            )
+
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            None,
+            SEG_embedding,
+            text_memory=tm_rep,
+            text_memory_mask=tmm_rep,
+        )
 
         
         mask_pred_results = mask_outputs["pred_masks"]

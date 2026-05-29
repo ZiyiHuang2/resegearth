@@ -47,6 +47,18 @@ def parse_args(args):
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
+
+    parser.add_argument("--use_dgp_qdti", default=False, type=lambda x: str(x).lower() in ("1", "true", "yes"))
+    parser.add_argument("--use_qdti_bias", default=None, type=lambda x: None if str(x).lower() in ("none", "null") else str(x).lower() in ("1", "true", "yes"))
+    parser.add_argument("--dgp_fuse_dim", default=256, type=int)
+    parser.add_argument("--dgp_refiner_hidden_dim", default=512, type=int)
+    parser.add_argument("--dgp_pg_tokens", default=1, type=int)
+    parser.add_argument("--qdti_bias_dim", default=128, type=int)
+    parser.add_argument("--qdti_init_std", default=1e-3, type=float)
+    parser.add_argument("--qdti_max_abs", default=0.01, type=float)
+    parser.add_argument("--qdti_apply_layers", default="last3", type=str)
+    parser.add_argument("--qdti_scale_init", default=0.0, type=float)
+    parser.add_argument("--scale_hard_loss_weight", default=0.0, type=float)
     
     return parser.parse_args(args)
 
@@ -90,8 +102,13 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
+    use_dgp_qdti = bool(getattr(model_args, "use_dgp_qdti", False))
+    require_qdti_bias = SegEarthR2.resolve_use_qdti_bias(model_args)
+
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+
+    SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
@@ -99,6 +116,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     mask2former_ckpt = model_args.vision_tower_mask
     model.initial_mask_module(mask2former_ckpt, model_args)
+    model.ensure_dgp_qdti_modules()
 
     model.get_model().initialize_vision_modules(model_args)
 
@@ -109,6 +127,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
     ]
+    if use_dgp_qdti:
+        train_module_list.extend(["prompt_adapter", "query_refiner"])
 
     if model_args.lora_enable:
         lora_r = model_args.lora_r
@@ -129,7 +149,15 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
     model = load_state_dict_from_zero_checkpoint(model, model_path)
+    if use_dgp_qdti:
+        state_dict = model.state_dict()
+        SegEarthR2.validate_dgp_qdti_checkpoint(
+            state_dict,
+            context=f"ZeRO checkpoint {model_path}",
+            require_qdti_bias=require_qdti_bias,
+        )
     model = model.merge_and_unload()
+    SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
 
     return tokenizer, model
 
@@ -137,6 +165,8 @@ def main(args):
     args = parse_args(args)
 
     tokenizer, model = load_pretrained_model(args.model_path, model_args=args, mask_config=args.mask_config, device='cuda')
+
+    SegEarthR2.sync_dgp_config_from_args(model.config, args)
 
     state_dict = {}
     for k, v in model.state_dict().items():

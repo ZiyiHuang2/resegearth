@@ -267,6 +267,17 @@ class LLaVATrainer(Trainer):
 
         return (loss, outputs) if return_outputs else loss
 
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        step_t0 = time.perf_counter()
+        if num_items_in_batch is not None:
+            loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        else:
+            loss = super().training_step(model, inputs)
+        monitor = getattr(self, "_dgp_monitor", None)
+        if monitor is not None:
+            monitor.on_training_step_end(model, time.perf_counter() - step_t0)
+        return loss
+
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
         # Keep train drop_last behavior unchanged, but force eval to keep tail batches.
         original_drop_last = self.args.dataloader_drop_last
@@ -339,6 +350,21 @@ class LLaVATrainer(Trainer):
         ciou = float(iou - (center_dist_sq / c_diag_sq) - alpha * v)
         return giou, ciou
 
+    _PR_IOU_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
+
+    @staticmethod
+    def _mask_sample_metrics(pred_mask_np, gt_mask_np, eps=1e-7):
+        """Per-sample mask metrics (aligned with eval_val_metrics.py)."""
+        inter = float(np.logical_and(pred_mask_np > 0, gt_mask_np > 0).sum())
+        union = float(np.logical_or(pred_mask_np > 0, gt_mask_np > 0).sum())
+        pred_area = float(pred_mask_np.sum())
+        gt_area = float(gt_mask_np.sum())
+        iou = inter / (union + eps)
+        dice = (2.0 * inter) / (pred_area + gt_area + eps)
+        recall = inter / (gt_area + eps)
+        precision = inter / (pred_area + eps)
+        return iou, dice, recall, precision
+
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
@@ -356,6 +382,10 @@ class LLaVATrainer(Trainer):
         iou_sum = 0.0
         total_inter = 0.0
         total_union = 0.0
+        dice_sum = 0.0
+        recall_sum = 0.0
+        precision_sum = 0.0
+        pr_counts = {thr: 0 for thr in self._PR_IOU_THRESHOLDS}
         valid_count = 0
         eps = 1e-7
 
@@ -404,6 +434,8 @@ class LLaVATrainer(Trainer):
                 if gt_mask_np.ndim > 2:
                     gt_mask_np = np.squeeze(gt_mask_np)
                 gt_mask_np = (gt_mask_np > 0).astype(np.uint8)
+                if gt_mask_np.sum() == 0:
+                    continue
 
                 pred_mask_np = np.asarray(pred_item.get("pred"))
                 if pred_mask_np.ndim > 2:
@@ -418,36 +450,77 @@ class LLaVATrainer(Trainer):
                     )
                     pred_mask_np = (pred_mask_np > 0).astype(np.uint8)
 
+                iou, dice, recall, precision = self._mask_sample_metrics(
+                    pred_mask_np, gt_mask_np, eps=eps
+                )
                 inter = float(np.logical_and(pred_mask_np > 0, gt_mask_np > 0).sum())
                 union = float(np.logical_or(pred_mask_np > 0, gt_mask_np > 0).sum())
-                iou = inter / (union + eps)
 
                 iou_sum += iou
+                dice_sum += dice
+                recall_sum += recall
+                precision_sum += precision
                 total_inter += inter
                 total_union += union
                 valid_count += 1
+                for thr in self._PR_IOU_THRESHOLDS:
+                    if iou >= thr:
+                        pr_counts[thr] += 1
+
+        stats_list = [
+            iou_sum,
+            total_inter,
+            total_union,
+            float(valid_count),
+            dice_sum,
+            recall_sum,
+            precision_sum,
+        ] + [float(pr_counts[thr]) for thr in self._PR_IOU_THRESHOLDS]
 
         if dist.is_available() and dist.is_initialized():
-            stats = torch.tensor([iou_sum, total_inter, total_union, float(valid_count)], device=self.args.device)
+            stats = torch.tensor(stats_list, device=self.args.device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
-            iou_sum = float(stats[0].item())
-            total_inter = float(stats[1].item())
-            total_union = float(stats[2].item())
-            valid_count = int(stats[3].item())
+            stats_list = stats.tolist()
+
+        (
+            iou_sum,
+            total_inter,
+            total_union,
+            valid_count,
+            dice_sum,
+            recall_sum,
+            precision_sum,
+        ) = stats_list[:7]
+        pr_count_values = stats_list[7:]
+        valid_count = int(valid_count)
 
         if valid_count > 0:
             eval_giou = iou_sum / valid_count
             eval_ciou = total_inter / (total_union + eps)
+            eval_mdice = dice_sum / valid_count
+            eval_mrecall = recall_sum / valid_count
+            eval_mprecision = precision_sum / valid_count
         else:
             eval_giou = 0.0
             eval_ciou = 0.0
-        eval_score = 0.5 * eval_giou + 0.5 * eval_ciou
+            eval_mdice = 0.0
+            eval_mrecall = 0.0
+            eval_mprecision = 0.0
+        eval_pr_at_0_9 = float(pr_count_values[-1] / valid_count) if valid_count > 0 else 0.0
+        eval_score = 0.45 * eval_giou + 0.35 * eval_ciou + 0.20 * eval_pr_at_0_9
 
         metrics = {
             f"{metric_key_prefix}_giou": float(eval_giou),
             f"{metric_key_prefix}_ciou": float(eval_ciou),
             f"{metric_key_prefix}_score": float(eval_score),
+            f"{metric_key_prefix}_mdice": float(eval_mdice),
+            f"{metric_key_prefix}_mrecall": float(eval_mrecall),
+            f"{metric_key_prefix}_mprecision": float(eval_mprecision),
         }
+        for thr, pr_count in zip(self._PR_IOU_THRESHOLDS, pr_count_values):
+            thr_key = str(thr).replace(".", "_")
+            pr_at = float(pr_count / valid_count) if valid_count > 0 else 0.0
+            metrics[f"{metric_key_prefix}_pr_at_{thr_key}"] = pr_at
         self.log(metrics)
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
         self._memory_tracker.stop_and_update_metrics(metrics)

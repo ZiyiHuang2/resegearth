@@ -41,6 +41,17 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    use_dgp_qdti: bool = field(default=False)
+    use_qdti_bias: Optional[bool] = field(default=None)
+    dgp_fuse_dim: int = field(default=256)
+    dgp_refiner_hidden_dim: int = field(default=512)
+    dgp_pg_tokens: int = field(default=1)
+    qdti_bias_dim: int = field(default=128)
+    qdti_init_std: float = field(default=1e-3)
+    qdti_max_abs: float = field(default=0.01)
+    qdti_apply_layers: str = field(default="last3")
+    qdti_scale_init: float = field(default=0.0)
+    scale_hard_loss_weight: float = field(default=0.0)
 
 @dataclass
 class DataArguments:
@@ -97,6 +108,8 @@ class TrainingArguments(transformers.TrainingArguments):
     lora_weight_path: str = ""
     lora_bias: str = "none"
     dataloader_drop_last: bool = True
+    dgp_monitor_wandb: bool = field(default=False)
+    dgp_monitor_steps: int = field(default=10)
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -292,6 +305,9 @@ def train():
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+    else:
+        SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
+        model.ensure_dgp_qdti_modules()
 
     model.config.use_cache = False
 
@@ -357,6 +373,8 @@ def train():
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
     ]
+    if getattr(model_args, "use_dgp_qdti", False):
+        train_module_list.extend(["prompt_adapter", "query_refiner"])
 
     if model_args.train_swin_backbone:
         train_module_list.append('vision_tower_mask')
@@ -386,6 +404,23 @@ def train():
 
                 p.requires_grad = True
 
+        if training_args.local_rank in (-1, 0):
+            total = sum(p.numel() for p in model.parameters())
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            dgp_keywords = (
+                "prompt_adapter", "query_refiner", "query_specific_text_memory_bias",
+                "qdti", "gate", "qdti_scale",
+            )
+            dgp_trainable = sum(
+                p.numel() for n, p in model.named_parameters()
+                if p.requires_grad and any(k in n for k in dgp_keywords)
+            )
+            pct = 100.0 * trainable / total if total else 0.0
+            print(
+                f"[REAL_TRAINABLE_AFTER_UNFREEZE] trainable={trainable:,} "
+                f"all={total:,} trainable%={pct:.6f}% dgp_trainable={dgp_trainable:,}"
+            )
+
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
     
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
@@ -410,6 +445,9 @@ def train():
                            tokenizer=tokenizer,
                            args=training_args,
                            **data_module)
+    if getattr(training_args, "dgp_monitor_wandb", False):
+        from segearth_r2.train.dgp_wandb_monitor import attach_dgp_wandb_monitor
+        attach_dgp_wandb_monitor(trainer, model)
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
     else:

@@ -56,6 +56,18 @@ class DataArguments:
     split: str = "val"             # train / val / test (rrsisd/refsegrs/risbench)
     zip_results: bool = True       # 是否自动打包输出目录
 
+    use_dgp_qdti: bool = False
+    use_qdti_bias: Optional[bool] = None
+    dgp_fuse_dim: int = 256
+    dgp_refiner_hidden_dim: int = 512
+    dgp_pg_tokens: int = 1
+    qdti_bias_dim: int = 128
+    qdti_init_std: float = 1e-3
+    qdti_max_abs: float = 0.01
+    qdti_apply_layers: str = "last3"
+    qdti_scale_init: float = 0.0
+    scale_hard_loss_weight: float = 0.0
+
 
 def init_distributed_mode(args):
     args.distributed = True

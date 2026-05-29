@@ -1,7 +1,7 @@
 setup.py
-/home/wangchengjun/huangziyi/reseg/SegearthR2/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/vision.cpp
-/home/wangchengjun/huangziyi/reseg/SegearthR2/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/cpu/ms_deform_attn_cpu.cpp
-/home/wangchengjun/huangziyi/reseg/SegearthR2/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu
+/root/rivermind-data/huangziyi/reseg/segearth+base/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/vision.cpp
+/root/rivermind-data/huangziyi/reseg/segearth+base/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/cpu/ms_deform_attn_cpu.cpp
+/root/rivermind-data/huangziyi/reseg/segearth+base/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.cu
 MultiScaleDeformableAttention.egg-info/PKG-INFO
 MultiScaleDeformableAttention.egg-info/SOURCES.txt
 MultiScaleDeformableAttention.egg-info/dependency_links.txt
