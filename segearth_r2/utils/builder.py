@@ -66,6 +66,32 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     if not hasattr(model.config, "text_film_force_alpha"):
         model.config.text_film_force_alpha = 1.0
 
+    if not hasattr(model.config, "use_query_aware_decoder_bias"):
+        model.config.use_query_aware_decoder_bias = False
+    if not hasattr(model.config, "use_qdti_mask_feedback"):
+        model.config.use_qdti_mask_feedback = False
+    if not hasattr(model.config, "use_qdti_rank_loss"):
+        model.config.use_qdti_rank_loss = False
+    if not hasattr(model.config, "use_qdti_neg_loss"):
+        model.config.use_qdti_neg_loss = False
+    if not hasattr(model.config, "use_qdti_div_loss"):
+        model.config.use_qdti_div_loss = False
+    if not hasattr(model.config, "qdti_rank_loss_weight"):
+        model.config.qdti_rank_loss_weight = 0.001
+    if not hasattr(model.config, "qdti_rank_margin"):
+        model.config.qdti_rank_margin = 0.1
+    if not hasattr(model.config, "qdti_neg_loss_weight"):
+        model.config.qdti_neg_loss_weight = 0.001
+    if not hasattr(model.config, "qdti_div_loss_weight"):
+        model.config.qdti_div_loss_weight = 0.001
+    if not hasattr(model.config, "qdti_neg_iou_thresh"):
+        model.config.qdti_neg_iou_thresh = 0.3
+    if not hasattr(model.config, "qdti_gate_init"):
+        model.config.qdti_gate_init = 0.0
+    if not hasattr(model.config, "qdti_warmup_steps"):
+        model.config.qdti_warmup_steps = 500
+    if not hasattr(model.config, "allow_random_qdti_init"):
+        model.config.allow_random_qdti_init = False
     if not hasattr(model.config, "use_decoder_attn_bias"):
         model.config.use_decoder_attn_bias = False
     if not hasattr(model.config, "decoder_attn_bias_dim"):
@@ -73,7 +99,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     if not hasattr(model.config, "decoder_attn_bias_init_std"):
         model.config.decoder_attn_bias_init_std = 1e-3
     if not hasattr(model.config, "decoder_attn_bias_max_abs"):
-        model.config.decoder_attn_bias_max_abs = 0.01
+        model.config.decoder_attn_bias_max_abs = 0.02
     if not hasattr(model.config, "decoder_attn_bias_apply_layers"):
         model.config.decoder_attn_bias_apply_layers = "last3"
     if not hasattr(model.config, "decoder_attn_bias_eval_mode"):
@@ -92,8 +118,18 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     image_processor = vision_tower.image_processor
 
     model.resize_token_embeddings(len(tokenizer))
+    allow_random_qdti = bool(getattr(model_args, "allow_random_qdti_init", False)) if model_args is not None else False
+    if getattr(model.config, "use_query_aware_decoder_bias", False):
+        model.validate_qdti_core_weights(
+            checkpoint_path=model_path,
+            allow_random_init=allow_random_qdti,
+            context="load_pretrained",
+            fresh_training_init=False,
+        )
     if hasattr(model, "ensure_text_film_branch"):
         model.ensure_text_film_branch()
+    if hasattr(model, "ensure_qdti_core_branch"):
+        model.ensure_qdti_core_branch(allow_init=allow_random_qdti)
     if hasattr(model, "ensure_decoder_attn_bias_branch"):
         model.ensure_decoder_attn_bias_branch()
 

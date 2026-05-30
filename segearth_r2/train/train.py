@@ -43,10 +43,23 @@ class ModelArguments:
     text_film_init_std: float = field(default=1e-3)
     text_film_branch_alpha: float = field(default=1.0)
     text_film_visual_dim: int = field(default=512)
+    use_query_aware_decoder_bias: bool = field(default=False)
+    use_qdti_mask_feedback: bool = field(default=False)
+    use_qdti_rank_loss: bool = field(default=False)
+    use_qdti_neg_loss: bool = field(default=False)
+    use_qdti_div_loss: bool = field(default=False)
+    qdti_rank_loss_weight: float = field(default=0.001)
+    qdti_rank_margin: float = field(default=0.1)
+    qdti_neg_loss_weight: float = field(default=0.001)
+    qdti_div_loss_weight: float = field(default=0.001)
+    qdti_neg_iou_thresh: float = field(default=0.3)
+    qdti_gate_init: float = field(default=0.0)
+    qdti_warmup_steps: int = field(default=500)
+    allow_random_qdti_init: bool = field(default=False)
     use_decoder_attn_bias: bool = field(default=False)
     decoder_attn_bias_dim: int = field(default=128)
     decoder_attn_bias_init_std: float = field(default=1e-3)
-    decoder_attn_bias_max_abs: float = field(default=0.01)
+    decoder_attn_bias_max_abs: float = field(default=0.02)
     decoder_attn_bias_apply_layers: str = field(default="last3")
     use_decoder_attn_bias_rank_loss: bool = field(default=False)
     decoder_attn_bias_rank_margin: float = field(default=0.1)
@@ -412,7 +425,16 @@ def train():
     if model_args.use_text_film and model_args.use_mstva:
         print("[train] use_text_film=True: forcing use_mstva=False (mutually exclusive).")
         model_args.use_mstva = False
-    if getattr(model_args, "use_decoder_attn_bias", False):
+    if getattr(model_args, "use_query_aware_decoder_bias", False):
+        model_args.use_decoder_attn_bias = False
+        if model_args.use_text_film:
+            print("[train] use_query_aware_decoder_bias=True: forcing use_text_film=False.")
+            model_args.use_text_film = False
+        if model_args.use_mstva or model_args.use_mstva_loss:
+            print("[train] use_query_aware_decoder_bias=True: forcing use_mstva=False and use_mstva_loss=False.")
+            model_args.use_mstva = False
+            model_args.use_mstva_loss = False
+    elif getattr(model_args, "use_decoder_attn_bias", False):
         if model_args.use_text_film:
             print("[train] use_decoder_attn_bias=True: forcing use_text_film=False (mutually exclusive).")
             model_args.use_text_film = False
@@ -456,10 +478,23 @@ def train():
     model.config.text_film_visual_dim = model_args.text_film_visual_dim
     model.config.text_film_eval_mode = "normal"
     model.config.text_film_force_alpha = 1.0
+    model.config.use_query_aware_decoder_bias = bool(getattr(model_args, "use_query_aware_decoder_bias", False))
+    model.config.use_qdti_mask_feedback = bool(getattr(model_args, "use_qdti_mask_feedback", False))
+    model.config.use_qdti_rank_loss = bool(getattr(model_args, "use_qdti_rank_loss", False))
+    model.config.use_qdti_neg_loss = bool(getattr(model_args, "use_qdti_neg_loss", False))
+    model.config.use_qdti_div_loss = bool(getattr(model_args, "use_qdti_div_loss", False))
+    model.config.qdti_rank_loss_weight = float(getattr(model_args, "qdti_rank_loss_weight", 0.001))
+    model.config.qdti_rank_margin = float(getattr(model_args, "qdti_rank_margin", 0.1))
+    model.config.qdti_neg_loss_weight = float(getattr(model_args, "qdti_neg_loss_weight", 0.001))
+    model.config.qdti_div_loss_weight = float(getattr(model_args, "qdti_div_loss_weight", 0.001))
+    model.config.qdti_neg_iou_thresh = float(getattr(model_args, "qdti_neg_iou_thresh", 0.3))
+    model.config.qdti_gate_init = float(getattr(model_args, "qdti_gate_init", 0.0))
+    model.config.qdti_warmup_steps = int(getattr(model_args, "qdti_warmup_steps", 500))
+    model.config.allow_random_qdti_init = bool(getattr(model_args, "allow_random_qdti_init", False))
     model.config.use_decoder_attn_bias = bool(getattr(model_args, "use_decoder_attn_bias", False))
     model.config.decoder_attn_bias_dim = int(getattr(model_args, "decoder_attn_bias_dim", 128))
     model.config.decoder_attn_bias_init_std = float(getattr(model_args, "decoder_attn_bias_init_std", 1e-3))
-    model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.01))
+    model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.02))
     model.config.decoder_attn_bias_apply_layers = str(getattr(model_args, "decoder_attn_bias_apply_layers", "last3"))
     model.config.decoder_attn_bias_eval_mode = "normal"
     model.config.decoder_attn_bias_force_scale = 1.0
@@ -480,6 +515,32 @@ def train():
         model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.ensure_text_film_branch()
+    if getattr(model_args, "use_query_aware_decoder_bias", False):
+        allow_random_qdti = bool(model_args.allow_random_qdti_init)
+        ckpt_path = model_args.model_name_or_path
+        ckpt_has_qdti = (
+            ckpt_path
+            and os.path.isdir(str(ckpt_path))
+            and model.checkpoint_contains_qdti_weights(str(ckpt_path))
+        )
+        has_qdti_module = (
+            hasattr(model, "predictor")
+            and model.predictor is not None
+            and getattr(model.predictor, "qdti_core", None) is not None
+        )
+        if hasattr(model, "ensure_qdti_core_branch"):
+            # A: fresh mask init (predictor_init) already has qdti_core.
+            # B: merged baseline (is_train_mask_decode) needs --allow_random_qdti_init True.
+            allow_init = allow_random_qdti or (
+                not has_qdti_module and not model.is_train_mask_decode
+            )
+            model.ensure_qdti_core_branch(allow_init=allow_init)
+        model.validate_qdti_core_weights(
+            checkpoint_path=ckpt_path,
+            allow_random_init=allow_random_qdti,
+            context="train_init",
+            fresh_training_init=not ckpt_has_qdti,
+        )
     if hasattr(model, "ensure_decoder_attn_bias_branch"):
         model.ensure_decoder_attn_bias_branch()
 

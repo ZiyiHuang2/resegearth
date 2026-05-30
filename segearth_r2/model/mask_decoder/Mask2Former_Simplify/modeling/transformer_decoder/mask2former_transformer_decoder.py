@@ -737,11 +737,16 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         predictions_mask.append(outputs_mask)
 
         dac_mod = getattr(self, "decoder_token_attn_bias", None)
+        qdti_mod = getattr(self, "qdti_core", None)
         dac_stats_accum = []
         self._last_decoder_attn_bias_log = None
+        self._last_qdti_log = None
         # 每次前向清空：收集所有启用 bias 的层的 P 与空间尺寸，供 ranking loss 逐层监督（勿只存最后一层）
         self._last_decoder_attn_bias_maps_for_rank = []
-        if dac_mod is not None and self.decoder_attn_bias_apply_layers:
+        self._last_qdti_maps_for_rank = []
+        use_qdti_mask_feedback = bool(getattr(self, "use_qdti_mask_feedback", False))
+        active_bias_mod = qdti_mod if qdti_mod is not None else dac_mod
+        if active_bias_mod is not None and self.decoder_attn_bias_apply_layers:
             if text_tokens is None or text_mask is None:
                 if not self._warn_decoder_attn_bias_no_tokens:
                     self._warn_decoder_attn_bias_no_tokens = True
@@ -756,7 +761,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
 
             layer_attn_bias = None
             if (
-                dac_mod is not None
+                active_bias_mod is not None
                 and self._decoder_bias_layer_active(i)
                 and text_tokens is not None
                 and text_mask is not None
@@ -779,69 +784,101 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                     # PyTorch <2.0: Tensor.any() does not accept dim as a tuple.
                     spatial_allowed_flat = (~am).any(dim=1).any(dim=1)
 
-                attn_bias_t, st = dac_mod(
-                    src[level_index],
-                    text_tokens,
-                    text_mask,
-                    self.num_heads,
-                    output.shape[0],
-                    eval_mode=str(dac_eval_mode),
-                    force_scale=float(dac_force_scale),
-                )
+                mask_fb = None
+                if use_qdti_mask_feedback and qdti_mod is not None and outputs_mask is not None:
+                    om = outputs_mask.detach()
+                    if om.dim() == 4 and om.shape[-2] * om.shape[-1] != Ssz:
+                        om = F.interpolate(om.float(), size=(hl, wl), mode="bilinear", align_corners=False)
+                    mask_fb = torch.sigmoid(om).flatten(2)
+
+                if qdti_mod is not None:
+                    qdti_step = getattr(self, "_qdti_global_step", None)
+                    qdti_warmup = int(getattr(self, "_qdti_warmup_steps", 0) or 0)
+                    attn_bias_t, st = qdti_mod(
+                        src[level_index],
+                        output,
+                        text_tokens,
+                        text_mask,
+                        self.num_heads,
+                        layer_idx=i,
+                        global_step=qdti_step,
+                        warmup_steps=qdti_warmup,
+                        eval_mode=str(dac_eval_mode),
+                        force_scale=float(dac_force_scale),
+                        mask_feedback=mask_fb,
+                    )
+                else:
+                    attn_bias_t, st = dac_mod(
+                        src[level_index],
+                        text_tokens,
+                        text_mask,
+                        self.num_heads,
+                        output.shape[0],
+                        eval_mode=str(dac_eval_mode),
+                        force_scale=float(dac_force_scale),
+                    )
                 P_flat = st.pop("P_bias_flat", None) if isinstance(st, dict) else None
+                P_qs = st.pop("P_bias_qs", None) if isinstance(st, dict) else None
+                if P_qs is not None:
+                    P_flat = P_qs
                 if P_flat is not None:
-                    if P_flat.dim() != 2 or P_flat.shape[1] != Ssz:
+                    per_query = P_flat.dim() == 3
+                    shape_ok = (
+                        (per_query and P_flat.shape[2] == Ssz)
+                        or (not per_query and P_flat.dim() == 2 and P_flat.shape[1] == Ssz)
+                    )
+                    if not shape_ok:
                         msg = (
-                            f"[DecoderAttnBiasRank] P_flat shape {tuple(P_flat.shape)} invalid for "
-                            f"layer={i} expected (*,{Ssz}). Fallback to all-accessible is FORBIDDEN during training."
+                            f"[QDTICore] P shape {tuple(P_flat.shape)} invalid for layer={i} "
+                            f"expected [B,Q,{Ssz}] or [B,{Ssz}]."
                         )
                         if self.training:
                             raise ValueError(msg)
                         print("[WARNING]" + msg + " Skip rank map append in eval.", flush=True)
-                    else:
+                        P_flat = None
+                    if P_flat is not None:
+                        Bp = P_flat.shape[0]
+                        acc_spatial_shape = (Bp, Ssz)
                         if spatial_allowed_flat is None:
                             msg = (
                                 f"[DecoderAttnBiasRank] cannot derive spatial_allowed from attn_mask "
-                                f"shape={tuple(attn_mask.shape)} nh={nh} Ssz={Ssz} for P_flat={tuple(P_flat.shape)} "
-                                f"layer={i}. Fallback to all-accessible is FORBIDDEN during training."
+                                f"shape={tuple(attn_mask.shape)} nh={nh} Ssz={Ssz} layer={i}."
                             )
                             if self.training:
                                 raise ValueError(msg)
-                            print(
-                                "[WARNING]" + msg + " Use all-accessible fallback only in eval.",
-                                flush=True,
-                            )
+                            print("[WARNING]" + msg + " Use all-accessible fallback only in eval.", flush=True)
                             spatial_allowed_flat = torch.ones(
-                                P_flat.shape, device=P_flat.device, dtype=torch.bool
+                                acc_spatial_shape, device=P_flat.device, dtype=torch.bool
                             )
-                        elif spatial_allowed_flat.shape != P_flat.shape:
-                            msg = (
-                                f"[DecoderAttnBiasRank] spatial_allowed_flat shape {tuple(spatial_allowed_flat.shape)} "
-                                f"mismatch P_flat {tuple(P_flat.shape)} at layer {i}. "
-                                f"attn_mask shape {tuple(attn_mask.shape)}. "
-                                f"Fallback to all-accessible is FORBIDDEN during training."
-                            )
+                        elif spatial_allowed_flat.shape != acc_spatial_shape:
                             if self.training:
-                                raise ValueError(msg)
-                            print(
-                                "[WARNING]" + msg + " Use all-accessible fallback only in eval.",
-                                flush=True,
-                            )
+                                raise ValueError(
+                                    f"[DecoderAttnBiasRank] spatial_allowed {tuple(spatial_allowed_flat.shape)} "
+                                    f"!= expected {acc_spatial_shape} layer={i}."
+                                )
                             spatial_allowed_flat = torch.ones(
-                                P_flat.shape, device=P_flat.device, dtype=torch.bool
+                                acc_spatial_shape, device=P_flat.device, dtype=torch.bool
                             )
-                        spatial_allowed_hw = spatial_allowed_flat.view(P_flat.shape[0], hl, wl).detach()
-                        P_store = P_flat if self.training else P_flat.detach()
-                        P_map = P_store.view(P_flat.shape[0], hl, wl)
-                        self._last_decoder_attn_bias_maps_for_rank.append(
-                            {
-                                "P": P_map,
-                                "H": hl,
-                                "W": wl,
-                                "layer_idx": i,
-                                "spatial_allowed": spatial_allowed_hw,
-                            }
-                        )
+                        if per_query:
+                            Bp, Qp, _ = P_flat.shape
+                            spatial_allowed_hw = spatial_allowed_flat.view(Bp, hl, wl).detach()
+                            P_store = P_flat if self.training else P_flat.detach()
+                            P_map = P_store.view(Bp, Qp, hl, wl)
+                        else:
+                            spatial_allowed_hw = spatial_allowed_flat.view(P_flat.shape[0], hl, wl).detach()
+                            P_store = P_flat if self.training else P_flat.detach()
+                            P_map = P_store.view(P_flat.shape[0], hl, wl)
+                        rank_entry = {
+                            "P": P_map,
+                            "H": hl,
+                            "W": wl,
+                            "layer_idx": i,
+                            "spatial_allowed": spatial_allowed_hw,
+                            "per_query": per_query,
+                        }
+                        self._last_decoder_attn_bias_maps_for_rank.append(rank_entry)
+                        if qdti_mod is not None:
+                            self._last_qdti_maps_for_rank.append(rank_entry)
                 if attn_bias_t is not None:
                     assert attn_bias_t.shape == attn_mask.shape, (
                         f"attn_bias shape {tuple(attn_bias_t.shape)} != attn_mask shape {tuple(attn_mask.shape)}"
@@ -892,8 +929,11 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         assert len(predictions_SEG_class) == self.num_layers + 1
 
         if dac_stats_accum:
-            self._last_decoder_attn_bias_log = dac_stats_accum[-1]
-        elif dac_mod is not None and self.decoder_attn_bias_apply_layers:
+            last_st = dac_stats_accum[-1]
+            self._last_decoder_attn_bias_log = last_st
+            if qdti_mod is not None:
+                self._last_qdti_log = last_st
+        elif active_bias_mod is not None and self.decoder_attn_bias_apply_layers:
             zv = predictions_mask[-1].new_zeros(())
             zo = predictions_mask[-1].new_tensor(0.0)
             self._last_decoder_attn_bias_log = {

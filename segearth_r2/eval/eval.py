@@ -64,6 +64,7 @@ class DataArguments:
     # Decoder cross-attn token bias：eval 临时覆盖，不写回 checkpoint
     decoder_attn_bias_eval_mode: str = "normal"  # normal | bypass | force_scale
     decoder_attn_bias_force_scale: float = 1.0
+    allow_random_qdti_init: bool = False
 
 
 def init_distributed_mode(args):

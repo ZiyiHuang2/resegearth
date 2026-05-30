@@ -1,3 +1,5 @@
+import os
+import json
 from typing import List, Optional, Tuple, Union
 from addict import Dict
 from dataclasses import dataclass
@@ -21,6 +23,7 @@ from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2forme
     MultiScaleMaskedTransformerDecoderForOPTPreTrain,
     DecoderTokenAttnBias,
 )
+from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.qdti_core import QDTICore
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
 
@@ -123,6 +126,16 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     decoder_attn_bias_rank_valid_count: Optional[torch.FloatTensor] = None
     decoder_attn_bias_rank_num_layers: Optional[torch.FloatTensor] = None
     decoder_attn_bias_rank_layer_indices: Optional[str] = None
+    loss_qdti_rank: Optional[torch.FloatTensor] = None
+    qdti_rank_loss_raw: Optional[torch.FloatTensor] = None
+    loss_qdti_neg: Optional[torch.FloatTensor] = None
+    loss_qdti_div: Optional[torch.FloatTensor] = None
+    qdti_bias_abs_mean: Optional[torch.FloatTensor] = None
+    qdti_enabled: Optional[torch.FloatTensor] = None
+    qdti_rank_valid_count: Optional[torch.FloatTensor] = None
+    qdti_alpha_l: Optional[torch.FloatTensor] = None
+    qdti_gate_eff: Optional[torch.FloatTensor] = None
+    qdti_warmup_factor: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -163,7 +176,7 @@ class SegEarthR2Model(MiphaPhiModel):
             use_mstva = getattr(config, "use_mstva", False)
             if getattr(config, "use_text_film", False) and use_mstva:
                 use_mstva = False
-            if getattr(config, "use_decoder_attn_bias", False):
+            if getattr(config, "use_query_aware_decoder_bias", False) or getattr(config, "use_decoder_attn_bias", False):
                 if use_mstva or getattr(config, "use_text_film", False):
                     print(
                         "[SegEarthR2Model] use_decoder_attn_bias=True: forcing use_mstva=False and use_text_film=False "
@@ -219,16 +232,18 @@ class SegEarthR2Model(MiphaPhiModel):
         self.config.text_film_init_std = float(getattr(model_args, "text_film_init_std", 1e-3))
         self.config.text_film_branch_alpha = float(getattr(model_args, "text_film_branch_alpha", 1.0))
         self.config.text_film_visual_dim = int(getattr(model_args, "text_film_visual_dim", 512))
-        use_dac = getattr(model_args, "use_decoder_attn_bias", False)
+        use_qdti = getattr(model_args, "use_query_aware_decoder_bias", False)
+        use_dac = getattr(model_args, "use_decoder_attn_bias", False) and not use_qdti
+        self.config.use_query_aware_decoder_bias = bool(use_qdti)
         self.config.use_decoder_attn_bias = bool(use_dac)
         use_mstva_arg = getattr(model_args, "use_mstva", False)
         if self.config.use_text_film and use_mstva_arg:
             print("[initialize_vision_modules] use_text_film=True: forcing use_mstva=False for Swin.")
             use_mstva_arg = False
-        if use_dac:
+        if use_qdti or use_dac:
             if use_mstva_arg or getattr(model_args, "use_text_film", False):
                 print(
-                    "[initialize_vision_modules] use_decoder_attn_bias=True: forcing use_mstva=False and "
+                    "[initialize_vision_modules] query-aware decoder bias enabled: forcing use_mstva=False and "
                     "use_text_film=False for Swin."
                 )
             use_mstva_arg = False
@@ -278,10 +293,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "(mutually exclusive; MSTVA module not built in Swin when use_text_film is on)."
             )
             config.use_mstva = False
-        if getattr(config, "use_decoder_attn_bias", False):
+        if getattr(config, "use_query_aware_decoder_bias", False) or getattr(config, "use_decoder_attn_bias", False):
             if getattr(config, "use_mstva", False) or getattr(config, "use_text_film", False):
                 print(
-                    "[SegEarthR2] use_decoder_attn_bias=True: forcing config.use_mstva=False and "
+                    "[SegEarthR2] query-aware decoder bias enabled: forcing config.use_mstva=False and "
                     "config.use_text_film=False (mutually exclusive)."
                 )
             config.use_mstva = False
@@ -327,8 +342,130 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return
         self._init_text_film_branch_from_config()
 
+    def _use_qdti_core(self) -> bool:
+        return bool(getattr(self.config, "use_query_aware_decoder_bias", False))
+
+    @staticmethod
+    def checkpoint_contains_qdti_weights(checkpoint_path: str) -> bool:
+        """Return True if checkpoint files contain predictor.qdti_core.* tensors."""
+        if not checkpoint_path or not os.path.isdir(checkpoint_path):
+            return False
+        index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            weight_map = idx.get("weight_map", idx)
+            return any("qdti_core" in str(k) for k in weight_map.keys())
+        single = os.path.join(checkpoint_path, "model.safetensors")
+        if os.path.isfile(single):
+            try:
+                from safetensors import safe_open
+                with safe_open(single, framework="pt") as f:
+                    return any("qdti_core" in k for k in f.keys())
+            except Exception:
+                pass
+        pytorch_bin = os.path.join(checkpoint_path, "pytorch_model.bin")
+        if os.path.isfile(pytorch_bin):
+            try:
+                sd = torch.load(pytorch_bin, map_location="cpu")
+                return any("qdti_core" in k for k in sd.keys())
+            except Exception:
+                pass
+        return False
+
+    def validate_qdti_core_weights(
+        self,
+        *,
+        checkpoint_path: Optional[str] = None,
+        allow_random_init: bool = False,
+        context: str = "load",
+        fresh_training_init: bool = False,
+    ) -> None:
+        """
+        Fail-fast when QDTI is enabled but checkpoint lacks qdti_core weights.
+        fresh_training_init=True skips file check (predictor_init already built qdti_core).
+        """
+        if not self._use_qdti_core():
+            return
+        if fresh_training_init:
+            if not hasattr(self, "predictor") or getattr(self.predictor, "qdti_core", None) is None:
+                raise RuntimeError(
+                    f"[QDTI][{context}] fresh_training_init=True but predictor.qdti_core is missing."
+                )
+            return
+        if checkpoint_path and os.path.isdir(str(checkpoint_path)):
+            if not self.checkpoint_contains_qdti_weights(str(checkpoint_path)):
+                if not allow_random_init:
+                    raise RuntimeError(
+                        f"[QDTI][{context}] use_query_aware_decoder_bias=True but checkpoint "
+                        f"'{checkpoint_path}' has no predictor.qdti_core.* weights. "
+                        "Set allow_random_qdti_init=True to override (not recommended for eval)."
+                    )
+                print(
+                    f"[WARNING][QDTI][{context}] checkpoint missing qdti_core weights; "
+                    "allow_random_qdti_init=True — random QDTI init will be used.",
+                    flush=True,
+                )
+        has_module = hasattr(self, "predictor") and getattr(self.predictor, "qdti_core", None) is not None
+        if not has_module:
+            if not allow_random_init:
+                raise RuntimeError(
+                    f"[QDTI][{context}] use_query_aware_decoder_bias=True but predictor.qdti_core "
+                    "is not present. Load a QDTI checkpoint or set allow_random_qdti_init=True."
+                )
+            return
+        in_model = any("qdti_core" in n for n, _ in self.named_parameters())
+        if not in_model and not allow_random_init:
+            raise RuntimeError(
+                f"[QDTI][{context}] qdti_core submodule exists but has no registered parameters."
+            )
+
+    def ensure_qdti_core_branch(self, allow_init: bool = False):
+        """Attach QDTI-Core when enabled. Random init only if allow_init or allow_random_qdti_init."""
+        if not self._use_qdti_core():
+            return
+        if not hasattr(self, "predictor") or self.predictor is None:
+            return
+        spec = str(getattr(self.config, "decoder_attn_bias_apply_layers", "last3"))
+        if getattr(self.predictor, "decoder_attn_bias_apply_layers", None) is None:
+            self.predictor.decoder_attn_bias_apply_layers = spec
+        self.predictor.use_qdti_mask_feedback = bool(getattr(self.config, "use_qdti_mask_feedback", False))
+        if getattr(self.predictor, "qdti_core", None) is not None:
+            return
+        allow_random = bool(getattr(self.config, "allow_random_qdti_init", False))
+        if not allow_init and not allow_random:
+            raise RuntimeError(
+                "[QDTI] predictor.qdti_core missing and random init not allowed. "
+                "Load a checkpoint with qdti_core weights or set allow_random_qdti_init=True."
+            )
+        dec_layers = int(self.predictor.num_layers)
+        hidden_dim = int(self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.predictor.register_module(
+            "qdti_core",
+            QDTICore(
+                text_dim=int(self.config.hidden_size),
+                memory_dim=hidden_dim,
+                query_dim=hidden_dim,
+                bias_dim=int(getattr(self.config, "decoder_attn_bias_dim", 128)),
+                init_std=float(getattr(self.config, "decoder_attn_bias_init_std", 1e-3)),
+                max_abs=float(getattr(self.config, "decoder_attn_bias_max_abs", 0.02)),
+                num_decoder_layers=dec_layers,
+                alpha_init=float(getattr(self.config, "qdti_gate_init", 0.0)),
+            ),
+        )
+        print("[WARNING][QDTI] Initialized new random predictor.qdti_core (allow_init/allow_random).", flush=True)
+
+    def _sync_qdti_runtime_to_predictor(self, global_step: Optional[int] = None) -> None:
+        if not self._use_qdti_core() or not hasattr(self, "predictor") or self.predictor is None:
+            return
+        self.predictor._qdti_global_step = global_step
+        self.predictor._qdti_warmup_steps = int(getattr(self.config, "qdti_warmup_steps", 0))
+
     def ensure_decoder_attn_bias_branch(self):
         """If config enables decoder attn bias but predictor has no submodule (e.g. config toggled after load), attach it."""
+        if self._use_qdti_core():
+            self.ensure_qdti_core_branch(allow_init=False)
+            return
         if not getattr(self.config, "use_decoder_attn_bias", False):
             return
         if not hasattr(self, "predictor") or self.predictor is None:
@@ -537,8 +674,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
 
-        use_dac = getattr(self.config, "use_decoder_attn_bias", False)
-        dac_apply = str(getattr(self.config, "decoder_attn_bias_apply_layers", "last3")) if use_dac else None
+        use_qdti = getattr(self.config, "use_query_aware_decoder_bias", False)
+        use_dac = getattr(self.config, "use_decoder_attn_bias", False) and not use_qdti
+        dac_apply = str(getattr(self.config, "decoder_attn_bias_apply_layers", "last3")) if (use_dac or use_qdti) else None
 
         predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(
             in_channels,
@@ -555,7 +693,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_fuse_score,
             decoder_attn_bias_apply_layers=dac_apply,
         )
-        if use_dac:
+        if use_qdti:
+            predictor.use_qdti_mask_feedback = bool(getattr(self.config, "use_qdti_mask_feedback", False))
+            predictor.register_module(
+                "qdti_core",
+                QDTICore(
+                    text_dim=int(self.config.hidden_size),
+                    memory_dim=int(hidden_dim),
+                    query_dim=int(hidden_dim),
+                    bias_dim=int(getattr(self.config, "decoder_attn_bias_dim", 128)),
+                    init_std=float(getattr(self.config, "decoder_attn_bias_init_std", 1e-3)),
+                    max_abs=float(getattr(self.config, "decoder_attn_bias_max_abs", 0.02)),
+                    num_decoder_layers=int(dec_layers),
+                    alpha_init=float(getattr(self.config, "qdti_gate_init", 0.0)),
+                ),
+            )
+        elif use_dac:
             predictor.register_module(
                 "decoder_token_attn_bias",
                 DecoderTokenAttnBias(
@@ -1029,6 +1182,208 @@ class SegEarthR2(MiphaPhiForCausalLM):
             gap_m.to(dtype=torch.float32, device=loss_mean.device),
         )
 
+    @staticmethod
+    def _mask_iou(pred: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        pred_b = (pred.sigmoid() if pred.dtype.is_floating_point else pred.float()) > 0.5
+        gt_b = gt > 0.5
+        inter = (pred_b & gt_b).sum(dim=(-2, -1)).float()
+        union = (pred_b | gt_b).sum(dim=(-2, -1)).float() + eps
+        return inter / union
+
+    def _resolve_positive_negative_queries(
+        self,
+        mask_outputs: dict,
+        targets: list,
+        iou_thresh: float,
+    ) -> Tuple[List[Optional[int]], List[List[int]]]:
+        """Positive: Hungarian match else max-IoU query. Negative: unmatched with IoU < thresh."""
+        pred_masks = mask_outputs.get("pred_masks")
+        if pred_masks is None or targets is None:
+            return [], []
+        B, Q = pred_masks.shape[0], pred_masks.shape[1]
+        positives: List[Optional[int]] = []
+        negatives: List[List[int]] = []
+        with torch.no_grad():
+            indices = self.criterion.matcher(mask_outputs, targets)
+        for b in range(B):
+            pos_q = None
+            src_idx, _ = indices[b]
+            if len(src_idx) > 0:
+                pos_q = int(src_idx[0].item())
+            tgt_masks = targets[b].get("masks")
+            if tgt_masks is None or not torch.is_tensor(tgt_masks) or tgt_masks.numel() == 0:
+                positives.append(None)
+                negatives.append([])
+                continue
+            gt = tgt_masks.float()
+            if gt.ndim == 3:
+                gt = gt.max(dim=0, keepdim=True).values
+            if pos_q is None:
+                ious = []
+                for q in range(Q):
+                    pm = F.interpolate(
+                        pred_masks[b : b + 1, q : q + 1].float(),
+                        size=gt.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    ious.append(float(self._mask_iou(pm.squeeze(0), gt.squeeze(0)).item()))
+                if ious:
+                    pos_q = int(max(range(len(ious)), key=lambda i: ious[i]))
+            neg_qs = []
+            if pos_q is not None:
+                for q in range(Q):
+                    if q == pos_q:
+                        continue
+                    pm = F.interpolate(
+                        pred_masks[b : b + 1, q : q + 1].float(),
+                        size=gt.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    iou = float(self._mask_iou(pm.squeeze(0), gt.squeeze(0)).item())
+                    if iou < float(iou_thresh):
+                        neg_qs.append(q)
+            positives.append(pos_q)
+            negatives.append(neg_qs)
+        return positives, negatives
+
+    def _qdti_positive_query_rank_loss(
+        self,
+        bias_maps,
+        seg_info,
+        margin: float,
+        positive_queries: List[Optional[int]],
+        zero_base: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Rank loss on positive query channels only; skip sample/layer when no valid positive."""
+        z0 = zero_base * 0.0
+        if bias_maps is None or len(bias_maps) == 0 or seg_info is None:
+            return z0, z0, z0
+        ref = bias_maps[0]["P"]
+        gt = self._build_binary_gt_mask(seg_info=seg_info, ref_tensor=ref)
+        if gt is None:
+            return (ref * 0.0).sum(), z0, z0
+        B = ref.shape[0]
+        if gt.shape[0] != B:
+            return (ref * 0.0).sum(), z0, z0
+        m = float(margin)
+        layer_losses = []
+        valid_n = 0
+        eps = 1e-6
+        for entry in bias_maps:
+            P = entry["P"]
+            H, W = int(entry["H"]), int(entry["W"])
+            per_query = bool(entry.get("per_query", P.dim() == 4))
+            acc = entry.get("spatial_allowed", None)
+            if acc is None or acc.shape != (B, H, W):
+                if self.training:
+                    raise ValueError("[QDTIRank] missing spatial_allowed for bias map entry.")
+                acc = torch.ones((B, H, W), device=P.device, dtype=torch.bool)
+            gt_s = F.interpolate(gt.float(), size=(H, W), mode="nearest")
+            fg = (gt_s > 0.5).squeeze(1)
+            for b in range(B):
+                pos_q = positive_queries[b] if b < len(positive_queries) else None
+                if pos_q is None:
+                    continue
+                if per_query:
+                    if pos_q >= P.shape[1]:
+                        continue
+                    P_b = P[b, pos_q].float()
+                else:
+                    P_b = P[b].float()
+                fg_b = fg[b].float()
+                acc_b = acc[b].float()
+                fg_eff = fg_b * acc_b
+                bg_eff = (1.0 - fg_b) * acc_b
+                if fg_eff.sum() < eps or bg_eff.sum() < eps:
+                    continue
+                inside = (P_b * fg_eff).sum() / (fg_eff.sum() + eps)
+                outside = (P_b * bg_eff).sum() / (bg_eff.sum() + eps)
+                layer_losses.append(F.relu(P_b.new_tensor(m) - inside + outside))
+                valid_n += 1
+        if not layer_losses:
+            return (ref * 0.0).sum(), z0, ref.new_tensor(0.0)
+        loss_mean = sum(layer_losses) / float(len(layer_losses))
+        return loss_mean, ref.new_tensor(float(valid_n)), loss_mean.detach()
+
+    def _qdti_negative_query_loss(
+        self,
+        bias_maps,
+        seg_info,
+        margin: float,
+        positive_queries: List[Optional[int]],
+        negative_queries: List[List[int]],
+        zero_base: torch.Tensor,
+    ) -> torch.Tensor:
+        z0 = zero_base * 0.0
+        if bias_maps is None or len(bias_maps) == 0:
+            return z0
+        ref = bias_maps[0]["P"]
+        gt = self._build_binary_gt_mask(seg_info=seg_info, ref_tensor=ref)
+        if gt is None:
+            return z0
+        B = ref.shape[0]
+        losses = []
+        eps = 1e-6
+        m = float(margin)
+        for entry in bias_maps:
+            P = entry["P"]
+            if not entry.get("per_query", P.dim() == 4):
+                continue
+            H, W = int(entry["H"]), int(entry["W"])
+            acc = entry.get("spatial_allowed")
+            gt_s = F.interpolate(gt.float(), size=(H, W), mode="nearest")
+            fg = (gt_s > 0.5).squeeze(1)
+            for b in range(B):
+                pos_q = positive_queries[b] if b < len(positive_queries) else None
+                neg_qs = negative_queries[b] if b < len(negative_queries) else []
+                if pos_q is None or not neg_qs:
+                    continue
+                acc_b = acc[b].float() if acc is not None else torch.ones((H, W), device=P.device)
+                fg_eff = fg[b].float() * acc_b
+                if fg_eff.sum() < eps:
+                    continue
+                pos_inside = (P[b, pos_q].float() * fg_eff).sum() / (fg_eff.sum() + eps)
+                for nq in neg_qs:
+                    if nq >= P.shape[1]:
+                        continue
+                    neg_inside = (P[b, nq].float() * fg_eff).sum() / (fg_eff.sum() + eps)
+                    losses.append(F.relu(P.new_tensor(m) + neg_inside - pos_inside))
+        if not losses:
+            return z0
+        return sum(losses) / float(len(losses))
+
+    def _qdti_diversity_loss(self, bias_maps, negative_queries: List[List[int]], zero_base: torch.Tensor) -> torch.Tensor:
+        z0 = zero_base * 0.0
+        if bias_maps is None or len(bias_maps) == 0:
+            return z0
+        ref = bias_maps[0]["P"]
+        losses = []
+        for entry in bias_maps:
+            P = entry["P"]
+            if not entry.get("per_query", P.dim() == 4) or P.shape[1] < 2:
+                continue
+            B = P.shape[0]
+            for b in range(B):
+                neg_qs = negative_queries[b] if b < len(negative_queries) else []
+                if len(neg_qs) < 2:
+                    continue
+                neg_idx = [q for q in neg_qs if q < P.shape[1]]
+                if len(neg_idx) < 2:
+                    continue
+                vecs = P[b, neg_idx].float().flatten(1)
+                vecs = F.normalize(vecs, dim=-1, eps=1e-6)
+                sim = torch.matmul(vecs, vecs.transpose(0, 1))
+                n_neg = sim.shape[0]
+                eye = torch.eye(n_neg, device=sim.device, dtype=torch.bool)
+                off_diag = sim.masked_select(~eye)
+                if off_diag.numel() > 0:
+                    losses.append(off_diag.abs().mean())
+        if not losses:
+            return z0
+        return sum(losses) / float(len(losses))
+
     def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
         assert len(image_token_indices) == 1, 'not supporting multi image index'
@@ -1306,6 +1661,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 use_midstage_gate_loss = getattr(self.config, "use_midstage_gate_loss", False)
                 use_mstva = getattr(self.config, "use_mstva", False)
                 use_mstva_loss = getattr(self.config, "use_mstva_loss", False)
+                use_qdti = self._use_qdti_core()
                 use_decoder_attn_bias = getattr(self.config, "use_decoder_attn_bias", False)
                 text_cond = self.build_text_condition(
                     token_refer_id=token_refer_id,
@@ -1314,7 +1670,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 )
                 text_tokens = None
                 text_mask = None
-                if use_mstva or use_mstva_loss or use_decoder_attn_bias:
+                if use_mstva or use_mstva_loss or use_decoder_attn_bias or use_qdti:
                     text_tokens, text_mask = self.build_text_tokens(
                         token_refer_id=token_refer_id,
                         batch_size=input_ids.shape[0],
@@ -1370,6 +1726,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         dac_mode = str(getattr(self.config, "decoder_attn_bias_eval_mode", "normal"))
         dac_fscale = float(getattr(self.config, "decoder_attn_bias_force_scale", 1.0))
+        self._sync_qdti_runtime_to_predictor(global_step=global_step)
         tt_rep, tm_rep = self._repeat_text_tokens_for_mask_num(text_tokens, text_mask, mask_num)
         if tt_rep is not None:
             if tt_rep.shape[0] != SEG_embedding.shape[0]:
@@ -1411,6 +1768,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             llm_loss = loss_fct(shift_logits, shift_labels)
             
         mask_loss = None
+        targets = None
         if seg_info is not None:
             if 'padding_mask' in seg_info[0]:
                 if isinstance(seg_info[0]["instances"], list):
@@ -1581,14 +1939,32 @@ class SegEarthR2(MiphaPhiForCausalLM):
         dac_rank_outside = torch.zeros_like(zero_base)
         dac_rank_gap = torch.zeros_like(zero_base)
         dac_rank_layer_indices_str = ""
+        use_qdti = self._use_qdti_core()
         use_dac_rank = (
             bool(getattr(self.config, "use_decoder_attn_bias_rank_loss", False))
             and bool(getattr(self.config, "use_decoder_attn_bias", False))
+            and not use_qdti
+            and self.training
+        )
+        use_qdti_rank = (
+            bool(getattr(self.config, "use_qdti_rank_loss", False))
+            and use_qdti
             and self.training
         )
         dac_rank_w = float(getattr(self.config, "decoder_attn_bias_rank_loss_weight", 0.001))
+        qdti_rank_w = float(getattr(self.config, "qdti_rank_loss_weight", 0.001))
         dac_rank_margin = float(getattr(self.config, "decoder_attn_bias_rank_margin", 0.1))
-        bias_maps = getattr(self.predictor, "_last_decoder_attn_bias_maps_for_rank", None)
+        qdti_rank_margin = float(getattr(self.config, "qdti_rank_margin", 0.1))
+        bias_maps = getattr(self.predictor, "_last_qdti_maps_for_rank", None) if use_qdti else getattr(
+            self.predictor, "_last_decoder_attn_bias_maps_for_rank", None
+        )
+        loss_qdti_rank_weighted = torch.zeros_like(zero_base)
+        qdti_rank_lr_raw = torch.zeros_like(zero_base)
+        qdti_rank_valid = torch.zeros_like(zero_base)
+        loss_qdti_neg_weighted = torch.zeros_like(zero_base)
+        loss_qdti_div_weighted = torch.zeros_like(zero_base)
+        pos_queries: List[Optional[int]] = []
+        neg_queries: List[List[int]] = []
         if bias_maps:
             dac_rank_num_layers = zero_base + float(len(bias_maps))
             dac_rank_layer_indices_str = ",".join(str(int(x["layer_idx"])) for x in bias_maps)
@@ -1612,6 +1988,46 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         flush=True,
                     )
                     self._decoder_attn_bias_rank_meta_logged = True
+        if use_qdti and seg_info is not None and targets is not None:
+            iou_thresh = float(getattr(self.config, "qdti_neg_iou_thresh", 0.3))
+            pos_queries, neg_queries = self._resolve_positive_negative_queries(
+                mask_outputs, targets, iou_thresh
+            )
+        if use_qdti_rank and qdti_rank_w > 0.0 and seg_info is not None and bias_maps:
+            lr_q, qdti_rank_valid, qdti_rank_lr_raw = self._qdti_positive_query_rank_loss(
+                bias_maps, seg_info, qdti_rank_margin, pos_queries, zero_base
+            )
+            qdti_rank_lr_raw = qdti_rank_lr_raw.detach().float().to(zero_base.device)
+            qdti_rank_valid = zero_base + qdti_rank_valid.detach().float().to(zero_base.device)
+            loss_qdti_rank_weighted = qdti_rank_w * lr_q
+            if not torch.isfinite(lr_q).all():
+                raise ValueError("[QDTIRank] non-finite positive-query rank loss.")
+            if not getattr(self, "_qdti_rank_meta_logged", False) and float(qdti_rank_valid.detach().item()) > 0:
+                print(
+                    f"[QDTIRank] layers={len(bias_maps)} valid={float(qdti_rank_valid.detach().item())}",
+                    flush=True,
+                )
+                self._qdti_rank_meta_logged = True
+        if (
+            use_qdti
+            and bool(getattr(self.config, "use_qdti_neg_loss", False))
+            and self.training
+            and bias_maps
+        ):
+            neg_w = float(getattr(self.config, "qdti_neg_loss_weight", 0.001))
+            if neg_w > 0:
+                loss_qdti_neg_weighted = neg_w * self._qdti_negative_query_loss(
+                    bias_maps, seg_info, qdti_rank_margin, pos_queries, neg_queries, zero_base
+                )
+        if (
+            use_qdti
+            and bool(getattr(self.config, "use_qdti_div_loss", False))
+            and self.training
+            and bias_maps
+        ):
+            div_w = float(getattr(self.config, "qdti_div_loss_weight", 0.001))
+            if div_w > 0:
+                loss_qdti_div_weighted = div_w * self._qdti_diversity_loss(bias_maps, neg_queries, zero_base)
 
         loss = llm_loss + mask_loss
         if use_attention_loss:
@@ -1620,7 +2036,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss = loss + midstage_gate_loss_weight * loss_midstage_gate
         if use_mstva_loss and mstva_loss_weight > 0:
             loss = loss + mstva_loss_weight * loss_mstva_align
-        loss = loss + loss_dac_rank_weighted
+        loss = loss + loss_dac_rank_weighted + loss_qdti_rank_weighted + loss_qdti_neg_weighted + loss_qdti_div_weighted
 
         text_film_gamma_norm = torch.zeros_like(zero_base)
         text_film_beta_norm = torch.zeros_like(zero_base)
@@ -1633,20 +2049,36 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 text_film_beta_norm = br._last_beta_norm.detach().float().to(zero_base.device)
             text_film_branch_alpha_log = br.branch_alpha.detach().float().to(zero_base.device)
 
-        dac_log = getattr(self.predictor, "_last_decoder_attn_bias_log", None)
+        dac_log = getattr(self.predictor, "_last_qdti_log", None) if use_qdti else getattr(
+            self.predictor, "_last_decoder_attn_bias_log", None
+        )
         z0 = zero_base * 0
+        dac_abs_mean = z0
+        dac_raw_std = z0
+        dac_max = z0
+        dac_min = z0
+        dac_enabled = z0
+        qdti_abs_mean = z0
+        qdti_enabled = z0
+        qdti_alpha_log = z0
+        qdti_gate_eff_log = z0
+        qdti_warmup_log = z0
         if dac_log is not None:
-            dac_abs_mean = z0 + dac_log["decoder_attn_bias_abs_mean"].detach().float().to(zero_base.device)
-            dac_raw_std = z0 + dac_log["decoder_attn_bias_raw_std"].detach().float().to(zero_base.device)
-            dac_max = z0 + dac_log["decoder_attn_bias_max"].detach().float().to(zero_base.device)
-            dac_min = z0 + dac_log["decoder_attn_bias_min"].detach().float().to(zero_base.device)
-            dac_enabled = z0 + dac_log["decoder_attn_bias_enabled"].detach().float().to(zero_base.device)
-        else:
-            dac_abs_mean = z0
-            dac_raw_std = z0
-            dac_max = z0
-            dac_min = z0
-            dac_enabled = z0
+            if use_qdti:
+                qdti_abs_mean = z0 + dac_log.get("qdti_bias_abs_mean", z0).detach().float().to(zero_base.device)
+                qdti_enabled = z0 + dac_log.get("qdti_enabled", z0).detach().float().to(zero_base.device)
+                if dac_log.get("qdti_alpha_l") is not None:
+                    qdti_alpha_log = z0 + dac_log["qdti_alpha_l"].detach().float().to(zero_base.device)
+                if dac_log.get("qdti_gate_eff") is not None:
+                    qdti_gate_eff_log = z0 + dac_log["qdti_gate_eff"].detach().float().to(zero_base.device)
+                if dac_log.get("qdti_warmup_factor") is not None:
+                    qdti_warmup_log = z0 + dac_log["qdti_warmup_factor"].detach().float().to(zero_base.device)
+            else:
+                dac_abs_mean = z0 + dac_log["decoder_attn_bias_abs_mean"].detach().float().to(zero_base.device)
+                dac_raw_std = z0 + dac_log["decoder_attn_bias_raw_std"].detach().float().to(zero_base.device)
+                dac_max = z0 + dac_log["decoder_attn_bias_max"].detach().float().to(zero_base.device)
+                dac_min = z0 + dac_log["decoder_attn_bias_min"].detach().float().to(zero_base.device)
+                dac_enabled = z0 + dac_log["decoder_attn_bias_enabled"].detach().float().to(zero_base.device)
 
         return CausalOutputWithMask(
             loss=loss,
@@ -1682,6 +2114,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
             decoder_attn_bias_rank_valid_count=dac_rank_valid.detach(),
             decoder_attn_bias_rank_num_layers=dac_rank_num_layers.detach(),
             decoder_attn_bias_rank_layer_indices=dac_rank_layer_indices_str,
+            loss_qdti_rank=loss_qdti_rank_weighted.detach(),
+            qdti_rank_loss_raw=qdti_rank_lr_raw.detach(),
+            loss_qdti_neg=loss_qdti_neg_weighted.detach(),
+            loss_qdti_div=loss_qdti_div_weighted.detach(),
+            qdti_bias_abs_mean=qdti_abs_mean.detach(),
+            qdti_enabled=qdti_enabled.detach(),
+            qdti_rank_valid_count=qdti_rank_valid.detach(),
+            qdti_alpha_l=qdti_alpha_log.detach(),
+            qdti_gate_eff=qdti_gate_eff_log.detach(),
+            qdti_warmup_factor=qdti_warmup_log.detach(),
         )
     
     def eval_seg(
@@ -1713,10 +2155,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
 
         use_mstva = getattr(self.config, "use_mstva", False)
+        use_qdti = self._use_qdti_core()
         use_decoder_attn_bias = getattr(self.config, "use_decoder_attn_bias", False)
         text_tokens = None
         text_mask = None
-        if use_mstva or use_decoder_attn_bias:
+        if use_mstva or use_decoder_attn_bias or use_qdti:
             text_tokens, text_mask = self.build_text_tokens(
                 token_refer_id,
                 batch_size=input_ids.shape[0] if input_ids is not None else None,
@@ -1729,12 +2172,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         "[WARNING][eval_seg] use_mstva=True but text_tokens is None "
                         "(token_refer_id is None or yielded no valid tokens); MSTVA bypassed in eval."
                     )
-            elif text_tokens is None and use_decoder_attn_bias:
-                if not getattr(self, "_eval_seg_dac_bypass_warned", False):
-                    self._eval_seg_dac_bypass_warned = True
+            elif text_tokens is None and (use_decoder_attn_bias or use_qdti):
+                if not getattr(self, "_eval_seg_qdti_bypass_warned", False):
+                    self._eval_seg_qdti_bypass_warned = True
                     print(
-                        "[WARNING][eval_seg][DecoderAttnBias] use_decoder_attn_bias=True but text_tokens is None "
-                        "(token_refer_id is None or yielded no valid tokens); decoder attention bias bypassed."
+                        "[WARNING][eval_seg][QDTI] query-aware decoder bias enabled but text_tokens is None "
+                        "(token_refer_id is None or yielded no valid tokens); QDTI-Core bypassed."
                     )
             elif use_mstva and text_tokens is not None and not getattr(self, "_eval_seg_mstva_debug_logged", False):
                 self._eval_seg_mstva_debug_logged = True
@@ -1791,6 +2234,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         dac_mode = str(getattr(self.config, "decoder_attn_bias_eval_mode", "normal"))
         dac_fscale = float(getattr(self.config, "decoder_attn_bias_force_scale", 1.0))
+        if use_qdti:
+            # Eval: warmup is complete so trained alpha_l applies (avoid global_step=None -> factor=0).
+            qdti_wu = int(getattr(self.config, "qdti_warmup_steps", 0) or 0)
+            self._sync_qdti_runtime_to_predictor(
+                global_step=qdti_wu if qdti_wu > 0 else 0
+            )
         tt_rep, tm_rep = self._repeat_text_tokens_for_mask_num(text_tokens, text_mask, mask_num)
         if tt_rep is not None:
             if tt_rep.shape[0] != SEG_embedding.shape[0]:

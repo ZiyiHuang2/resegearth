@@ -73,6 +73,15 @@ def parse_args(args):
     parser.add_argument("--decoder_attn_bias_rank_margin", default=0.1, type=float)
     parser.add_argument("--decoder_attn_bias_rank_loss_weight", default=0.001, type=float)
 
+    parser.add_argument("--use_query_aware_decoder_bias", default=False, type=_str2bool)
+    parser.add_argument("--use_qdti_mask_feedback", default=False, type=_str2bool)
+    parser.add_argument("--use_qdti_rank_loss", default=False, type=_str2bool)
+    parser.add_argument("--use_qdti_neg_loss", default=False, type=_str2bool)
+    parser.add_argument("--use_qdti_div_loss", default=False, type=_str2bool)
+    parser.add_argument("--qdti_gate_init", default=0.0, type=float)
+    parser.add_argument("--qdti_warmup_steps", default=500, type=int)
+    parser.add_argument("--allow_random_qdti_init", default=False, type=_str2bool)
+
     parser.add_argument("--lora_enable", default=True, type=_str2bool)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
@@ -104,6 +113,35 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
             lora_module_names.add(name)
             
     return sorted(list(lora_module_names))
+
+
+def _apply_qdti_config(model, model_args):
+    use_qdti = bool(getattr(model_args, "use_query_aware_decoder_bias", False))
+    model.config.use_query_aware_decoder_bias = use_qdti
+    model.config.use_qdti_mask_feedback = bool(getattr(model_args, "use_qdti_mask_feedback", False))
+    model.config.use_qdti_rank_loss = bool(getattr(model_args, "use_qdti_rank_loss", False))
+    model.config.use_qdti_neg_loss = bool(getattr(model_args, "use_qdti_neg_loss", False))
+    model.config.use_qdti_div_loss = bool(getattr(model_args, "use_qdti_div_loss", False))
+    model.config.qdti_gate_init = float(getattr(model_args, "qdti_gate_init", 0.0))
+    model.config.qdti_warmup_steps = int(getattr(model_args, "qdti_warmup_steps", 500))
+    model.config.allow_random_qdti_init = bool(getattr(model_args, "allow_random_qdti_init", False))
+    model.config.decoder_attn_bias_dim = int(getattr(model_args, "decoder_attn_bias_dim", 128))
+    model.config.decoder_attn_bias_init_std = float(getattr(model_args, "decoder_attn_bias_init_std", 1e-3))
+    model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.02))
+    model.config.decoder_attn_bias_apply_layers = str(
+        getattr(model_args, "decoder_attn_bias_apply_layers", "last3")
+    )
+    if use_qdti:
+        model.config.use_decoder_attn_bias = False
+        model.config.use_mstva = False
+        model.config.use_mstva_loss = False
+        model.config.use_text_film = False
+        setattr(model_args, "use_decoder_attn_bias", False)
+        setattr(model_args, "use_mstva", False)
+        setattr(model_args, "use_mstva_loss", False)
+        setattr(model_args, "use_text_film", False)
+    return use_qdti
+
 
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
@@ -147,17 +185,24 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     if hasattr(model_args, "mstva_pool_large_scale"):
         model.config.mstva_pool_large_scale = bool(getattr(model_args, "mstva_pool_large_scale"))
 
-    use_dac = bool(getattr(model_args, "use_decoder_attn_bias", False))
+    use_qdti = _apply_qdti_config(model, model_args)
+
+    use_dac = bool(getattr(model_args, "use_decoder_attn_bias", False)) and not use_qdti
     model.config.use_decoder_attn_bias = use_dac
-    model.config.decoder_attn_bias_dim = int(getattr(model_args, "decoder_attn_bias_dim", 128))
-    model.config.decoder_attn_bias_init_std = float(getattr(model_args, "decoder_attn_bias_init_std", 1e-3))
-    model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.01))
-    model.config.decoder_attn_bias_apply_layers = str(getattr(model_args, "decoder_attn_bias_apply_layers", "last3"))
+    if not use_qdti:
+        model.config.decoder_attn_bias_dim = int(getattr(model_args, "decoder_attn_bias_dim", 128))
+        model.config.decoder_attn_bias_init_std = float(getattr(model_args, "decoder_attn_bias_init_std", 1e-3))
+        model.config.decoder_attn_bias_max_abs = float(getattr(model_args, "decoder_attn_bias_max_abs", 0.01))
+        model.config.decoder_attn_bias_apply_layers = str(
+            getattr(model_args, "decoder_attn_bias_apply_layers", "last3")
+        )
     model.config.decoder_attn_bias_eval_mode = str(getattr(model_args, "decoder_attn_bias_eval_mode", "normal"))
     model.config.decoder_attn_bias_force_scale = float(getattr(model_args, "decoder_attn_bias_force_scale", 1.0))
     model.config.use_decoder_attn_bias_rank_loss = bool(getattr(model_args, "use_decoder_attn_bias_rank_loss", False))
     model.config.decoder_attn_bias_rank_margin = float(getattr(model_args, "decoder_attn_bias_rank_margin", 0.1))
-    model.config.decoder_attn_bias_rank_loss_weight = float(getattr(model_args, "decoder_attn_bias_rank_loss_weight", 0.001))
+    model.config.decoder_attn_bias_rank_loss_weight = float(
+        getattr(model_args, "decoder_attn_bias_rank_loss_weight", 0.001)
+    )
     if use_dac:
         model.config.use_mstva = False
         model.config.use_text_film = False
@@ -167,14 +212,15 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
-    
 
     mask2former_ckpt = model_args.vision_tower_mask
     model.initial_mask_module(mask2former_ckpt, model_args)
 
     model.get_model().initialize_vision_modules(model_args)
     model.ensure_text_film_branch()
-    if hasattr(model, "ensure_decoder_attn_bias_branch"):
+    if use_qdti and hasattr(model, "ensure_qdti_core_branch"):
+        model.ensure_qdti_core_branch(allow_init=bool(getattr(model_args, "allow_random_qdti_init", False)))
+    elif hasattr(model, "ensure_decoder_attn_bias_branch"):
         model.ensure_decoder_attn_bias_branch()
 
     vision_tower = model.get_model().get_vision_tower_mask()
@@ -207,6 +253,14 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     model = load_state_dict_from_zero_checkpoint(model, model_path)
     model = model.merge_and_unload()
 
+    _apply_qdti_config(model, model_args)
+    if use_qdti:
+        has_qdti = any("qdti_core" in n for n, _ in model.named_parameters())
+        if not has_qdti:
+            raise RuntimeError(
+                "[QDTI][merge] use_query_aware_decoder_bias=True but merged model has no qdti_core parameters."
+            )
+
     return tokenizer, model
 
 def main(args):
@@ -215,13 +269,23 @@ def main(args):
     tokenizer, model = load_pretrained_model(args.model_path, model_args=args, mask_config=args.mask_config, device='cuda')
 
     state_dict = {}
+    qdti_keys = []
     for k, v in model.state_dict().items():
-        print(k)
         state_dict[k] = v
+        if "qdti_core" in k:
+            qdti_keys.append(k)
+    if bool(getattr(args, "use_query_aware_decoder_bias", False)):
+        print(f"[QDTI][merge] state_dict qdti_core keys={len(qdti_keys)}")
+        if qdti_keys:
+            print(f"[QDTI][merge] sample keys: {qdti_keys[:3]}")
+        if len(qdti_keys) == 0:
+            raise RuntimeError("[QDTI][merge] no predictor.qdti_core.* in merged state_dict.")
     model._hf_peft_config_loaded = False
     model.save_pretrained(args.save_path, state_dict=state_dict)
 
     tokenizer.save_pretrained(args.save_path)
+    print(f"[OK] saved merged model to {args.save_path}")
+    print(f"[OK] config use_query_aware_decoder_bias={getattr(model.config, 'use_query_aware_decoder_bias', False)}")
     
 if __name__ == "__main__":
     main(sys.argv[1:])
