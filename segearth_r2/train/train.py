@@ -14,6 +14,11 @@ from deepspeed.profiling.flops_profiler import get_model_profile
 from segearth_r2.datasets.dataset import *
 from llava_trainer import LLaVATrainer
 from segearth_r2.model.language_model.llava_phi import SegEarthR2
+from segearth_r2.train.a3_training_utils import (
+    apply_a3_frozen_training,
+    assert_no_forbidden_trainables,
+    print_trainable_parameter_report,
+)
 
 warnings.filterwarnings('ignore')
 local_rank = None
@@ -42,6 +47,19 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
+    # A3: pre-decoder set conditioning (LaSeRS multi-[SEG])
+    use_set_conditioner: bool = field(default=False)
+    set_conditioner_layers: int = field(default=1)
+    set_conditioner_heads: int = field(default=4)
+    set_conditioner_gate_init: float = field(default=1e-3)
+    use_set_count_loss: bool = field(default=False)
+    use_set_category_loss: bool = field(default=False)
+    lambda_set_count: float = field(default=0.05)
+    lambda_set_category: float = field(default=0.1)
+    a3_train_only_set_modules: bool = field(default=False)
+    set_max_count: int = field(default=10)
+    lasers_category_vocab_path: Optional[str] = field(default=None)
+
 @dataclass
 class DataArguments:
     lazy_preprocess: bool = True
@@ -54,6 +72,9 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
+    # LaSeRS: official data has train+test only; hold out part of train for val during training
+    lasers_holdout_ratio: float = field(default=0.05)
+    lasers_holdout_seed: int = field(default=42)
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -206,17 +227,22 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 split="val"
             )
         elif dataset_name == "lasers":
+            holdout_seed = int(getattr(data_args, "lasers_holdout_seed", training_args.data_seed))
             train_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                split="train_data.json"
+                split="train_data.json",
+                holdout_mode="train",
+                holdout_seed=holdout_seed,
             )
             eval_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                split="val_data.json"
+                split="train_data.json",
+                holdout_mode="eval",
+                holdout_seed=holdout_seed,
             )
         elif dataset_name == "refsegrs":
             train_dataset = RefSegRSDataset(
@@ -268,6 +294,8 @@ def train():
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    if getattr(data_args, "lasers_category_vocab_path", None) is None:
+        data_args.lasers_category_vocab_path = model_args.lasers_category_vocab_path
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
@@ -292,6 +320,8 @@ def train():
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+    else:
+        model.init_set_conditioning_modules(model_args)
 
     model.config.use_cache = False
 
@@ -354,37 +384,63 @@ def train():
 
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
-    train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
-    ]
 
-    if model_args.train_swin_backbone:
-        train_module_list.append('vision_tower_mask')
-        
-    if training_args.lora_enable:
-        lora_r = training_args.lora_r
-        lora_alpha = training_args.lora_alpha
-        lora_dropout = training_args.lora_dropout
-        lora_target_modules = find_linear_layers(model, train_module_list=train_module_list)
-        lora_config = LoraConfig(
-            r=lora_r,
-            lora_alpha=lora_alpha,
-            target_modules=lora_target_modules,
-            lora_dropout=lora_dropout,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        model = get_peft_model(model, lora_config)
-        model.print_trainable_parameters()
+    a3_modules_active = (
+        model_args.use_set_conditioner
+        or model_args.use_set_count_loss
+        or model_args.use_set_category_loss
+    )
+    if model_args.a3_train_only_set_modules:
+        if not a3_modules_active:
+            raise ValueError(
+                "a3_train_only_set_modules=True requires at least one of "
+                "use_set_conditioner / use_set_count_loss / use_set_category_loss."
+            )
+        if training_args.lora_enable:
+            print(
+                "[WARN] a3_train_only_set_modules=True: disabling LoRA "
+                "(A3-frozen trains only set_conditioner / count_head / category_set_head)."
+            )
+            training_args.lora_enable = False
+        apply_a3_frozen_training(model, strict_forbidden=True)
+        print_trainable_parameter_report(model, title="A3-frozen trainable parameters")
+    else:
+        train_module_list = [
+            "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        ]
+        if a3_modules_active:
+            train_module_list.extend(["set_conditioner", "count_head", "category_set_head"])
 
-        for n, p in model.named_parameters():
-            if any(
-                [
-                    x in n
-                    for x in train_module_list
-                ]):
+        if model_args.train_swin_backbone:
+            train_module_list.append('vision_tower_mask')
 
-                p.requires_grad = True
+        if training_args.lora_enable:
+            lora_r = training_args.lora_r
+            lora_alpha = training_args.lora_alpha
+            lora_dropout = training_args.lora_dropout
+            lora_target_modules = find_linear_layers(model, train_module_list=train_module_list)
+            lora_config = LoraConfig(
+                r=lora_r,
+                lora_alpha=lora_alpha,
+                target_modules=lora_target_modules,
+                lora_dropout=lora_dropout,
+                bias="none",
+                task_type="CAUSAL_LM",
+            )
+            model = get_peft_model(model, lora_config)
+            model.print_trainable_parameters()
+
+            for n, p in model.named_parameters():
+                if any(x in n for x in train_module_list):
+                    p.requires_grad = True
+
+        if a3_modules_active:
+            forbidden = assert_no_forbidden_trainables(model, strict=False)
+            if forbidden:
+                print(
+                    "[WARN] A3 enabled without a3_train_only_set_modules: "
+                    "baseline modules may also be trainable (weakens A3 attribution)."
+                )
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
     
@@ -392,17 +448,24 @@ def train():
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
-    if hasattr(training_args, "evaluation_strategy"):
-        training_args.evaluation_strategy = "steps"
-    if hasattr(training_args, "eval_strategy"):
-        training_args.eval_strategy = "steps"
     training_args.save_strategy = "steps"
     if training_args.save_steps is None or training_args.save_steps <= 0:
         training_args.save_steps = 500
-    training_args.eval_steps = training_args.save_steps
-    training_args.load_best_model_at_end = True
-    training_args.metric_for_best_model = "eval_score"
-    training_args.greater_is_better = True
+    eval_disabled = (
+        getattr(training_args, "evaluation_strategy", None) == "no"
+        or getattr(training_args, "eval_strategy", None) == "no"
+    )
+    if not eval_disabled:
+        if hasattr(training_args, "evaluation_strategy"):
+            training_args.evaluation_strategy = "steps"
+        if hasattr(training_args, "eval_strategy"):
+            training_args.eval_strategy = "steps"
+        training_args.eval_steps = training_args.save_steps
+        training_args.load_best_model_at_end = True
+        training_args.metric_for_best_model = "eval_score"
+        training_args.greater_is_better = True
+    else:
+        training_args.load_best_model_at_end = False
     if training_args.save_total_limit is None or training_args.save_total_limit > 2:
         training_args.save_total_limit = 2
     

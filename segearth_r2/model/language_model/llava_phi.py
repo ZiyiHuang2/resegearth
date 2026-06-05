@@ -1,6 +1,7 @@
 from typing import List, Optional, Tuple, Union
 from addict import Dict
 from dataclasses import dataclass
+import logging
 import torch.nn.functional as F
 import fvcore.nn.weight_init as weight_init
 import numpy as np
@@ -28,6 +29,18 @@ from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criteri
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
 
+from segearth_r2.model.set_conditioner import (
+    CategorySetHead,
+    CountHead,
+    SetConditioner,
+    compute_set_category_loss,
+    compute_set_count_loss,
+    load_lasers_category_vocab,
+    warn_category_labels_missing_once,
+)
+
+logger = logging.getLogger(__name__)
+
 @dataclass
 class CausalOutputWithMask(CausalLMOutputWithPast):
     loss: Optional[torch.FloatTensor] = None
@@ -39,6 +52,10 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_set_count: Optional[torch.FloatTensor] = None
+    loss_set_category: Optional[torch.FloatTensor] = None
+    set_gate_value: Optional[float] = None
+    target_count_acc: Optional[float] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -126,6 +143,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.init_config = config
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
+        self._set_conditioning_initialized = False
 
         self.lm_head = nn.Linear(config.hidden_size, 51200, bias=False)
 
@@ -152,6 +170,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
+        self.init_set_conditioning_modules(model_args)
         if pretrained_path is not None:
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
@@ -601,6 +620,111 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
+
+    def init_set_conditioning_modules(self, model_args=None):
+        args = model_args if model_args is not None else self.init_config
+        self.use_set_conditioner = bool(getattr(args, "use_set_conditioner", False))
+        self.use_set_count_loss = bool(getattr(args, "use_set_count_loss", False))
+        self.use_set_category_loss = bool(getattr(args, "use_set_category_loss", False))
+        self.lambda_set_count = float(getattr(args, "lambda_set_count", 0.05))
+        self.lambda_set_category = float(getattr(args, "lambda_set_category", 0.1))
+        self.set_max_count = int(getattr(args, "set_max_count", 10))
+
+        if hasattr(self, "config"):
+            for name in (
+                "use_set_conditioner",
+                "use_set_count_loss",
+                "use_set_category_loss",
+                "set_conditioner_layers",
+                "set_conditioner_heads",
+                "set_conditioner_gate_init",
+                "lambda_set_count",
+                "lambda_set_category",
+                "set_max_count",
+                "lasers_category_vocab_path",
+            ):
+                if hasattr(args, name):
+                    setattr(self.config, name, getattr(args, name))
+
+        need_modules = (
+            self.use_set_conditioner or self.use_set_count_loss or self.use_set_category_loss
+        )
+        if not need_modules:
+            self.set_conditioner = None
+            self.count_head = None
+            self.category_set_head = None
+            self._set_conditioning_initialized = True
+            return
+
+        hidden_dim = self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+        self.set_conditioner = SetConditioner(
+            hidden_dim=hidden_dim,
+            num_layers=int(getattr(args, "set_conditioner_layers", 1)),
+            num_heads=int(getattr(args, "set_conditioner_heads", 4)),
+            gate_init=float(getattr(args, "set_conditioner_gate_init", 1e-3)),
+        )
+        self.count_head = CountHead(hidden_dim, set_max_count=self.set_max_count)
+        vocab = load_lasers_category_vocab(getattr(args, "lasers_category_vocab_path", None))
+        self.lasers_category_vocab = vocab
+        self.category_set_head = CategorySetHead(hidden_dim, vocab_size=len(vocab))
+        self._set_conditioning_initialized = True
+
+    def _apply_set_conditioning(
+        self,
+        seg_embedding: torch.Tensor,
+        mask_num,
+        category_set_labels=None,
+    ):
+        loss_set_count = None
+        loss_set_category = None
+        target_count_acc = None
+        set_gate_value = None
+        q_set = None
+
+        if not getattr(self, "use_set_conditioner", False):
+            return (
+                seg_embedding,
+                loss_set_count,
+                loss_set_category,
+                set_gate_value,
+                target_count_acc,
+            )
+
+        if self.set_conditioner is None:
+            raise RuntimeError("SetConditioner is not initialized but use_set_conditioner=True.")
+
+        refined_seg_embedding, q_set, _, gate_mean, _ = self.set_conditioner(
+            seg_embedding, mask_num
+        )
+        set_gate_value = float(gate_mean.detach().item()) if gate_mean.numel() else 0.0
+
+        if self.use_set_count_loss and self.count_head is not None and q_set is not None:
+            loss_set_count, target_count_acc = compute_set_count_loss(
+                self.count_head,
+                q_set,
+                mask_num,
+                self.set_max_count,
+            )
+
+        if self.use_set_category_loss and self.category_set_head is not None and q_set is not None:
+            if category_set_labels is None:
+                warn_category_labels_missing_once()
+            else:
+                if category_set_labels.dim() == 1:
+                    category_set_labels = category_set_labels.unsqueeze(0)
+                loss_set_category = compute_set_category_loss(
+                    self.category_set_head,
+                    q_set,
+                    category_set_labels.to(q_set.device),
+                )
+
+        return (
+            refined_seg_embedding,
+            loss_set_count,
+            loss_set_category,
+            set_gate_value,
+            target_count_acc,
+        )
            
     def forward(
             self,
@@ -620,7 +744,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             global_step=None,
             mask_num=None,
-            dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
+            dataset_type=None,
+            category_set_labels=None,) -> Union[Tuple, CausalLMOutputWithPast]:
         
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
@@ -656,9 +781,28 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        if outputs.attentions is not None:
+            attentions = [
+                attention_item.sum(dim=1)
+                for attention_item in outputs.attentions
+                if attention_item is not None
+            ]
+        else:
+            attentions = []
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        
+
+        (
+            SEG_embedding,
+            loss_set_count,
+            loss_set_category,
+            set_gate_value,
+            target_count_acc,
+        ) = self._apply_set_conditioning(
+            SEG_embedding,
+            mask_num,
+            category_set_labels=category_set_labels,
+        )
+
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
         mask_num = torch.tensor(mask_num, device=mask_features.device)
@@ -741,7 +885,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         masks_down = masks_down.view(masks_down.size(0), -1)
         masks_down[masks_down > 0] = 1
         
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
+        loss_device = mask_loss.device if mask_loss is not None else hidden_states.device
+        loss_attention = torch.tensor(0.0, device=loss_device)
         for full_attention_map in attentions:
             batch_attentions_list = []
             for batch_idx in range(bs):
@@ -754,6 +899,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
         loss = llm_loss + mask_loss + 0.01 * loss_attention
+        if loss_set_count is not None:
+            loss = loss + self.lambda_set_count * loss_set_count
+        if loss_set_category is not None:
+            loss = loss + self.lambda_set_category * loss_set_category
 
         return CausalOutputWithMask(
             loss=loss,
@@ -765,6 +914,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            loss_set_count=loss_set_count.detach() if loss_set_count is not None else None,
+            loss_set_category=loss_set_category.detach() if loss_set_category is not None else None,
+            set_gate_value=set_gate_value,
+            target_count_acc=target_count_acc.detach().item() if target_count_acc is not None else None,
         )
     
     def eval_seg(
@@ -809,6 +962,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state   
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        SEG_embedding, _, _, _, _ = self._apply_set_conditioning(SEG_embedding, mask_num)
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)

@@ -43,7 +43,13 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
-    
+
+    if getattr(model.config, "use_set_conditioner", False) and getattr(model, "set_conditioner", None) is None:
+        model.init_set_conditioning_modules(model.config)
+
+    if hasattr(model, "get_model") and hasattr(model.get_model(), "initialize_vision_modules"):
+        model.get_model().initialize_vision_modules(model_args)
+
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor

@@ -38,7 +38,24 @@ def parse_args(args):
         "--mask_config", default="./segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
     )
 
-    parser.add_argument("--lora_enable", default=True, type=bool)
+    parser.add_argument("--lora_enable", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--a3_only",
+        action="store_true",
+        help="Merge A3-frozen checkpoint (no LoRA; only set modules were trained).",
+    )
+    parser.add_argument(
+        "--baseline_model_path",
+        default="",
+        type=str,
+        help="LaSeRS baseline merged_model path (required for --a3_only).",
+    )
+    parser.add_argument(
+        "--lasers_category_vocab_path",
+        default="",
+        type=str,
+        help="Path to lasers_category_vocab.json (required for A3 category_set_head shape).",
+    )
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
@@ -90,15 +107,32 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    init_path = model_path
+    if getattr(model_args, "a3_only", False):
+        baseline = getattr(model_args, "baseline_model_path", "") or ""
+        if not baseline:
+            raise ValueError("--a3_only requires --baseline_model_path (LaSeRS baseline merged_model).")
+        init_path = baseline
+
+    tokenizer = AutoTokenizer.from_pretrained(init_path, use_fast=True)
+    model = SegEarthR2.from_pretrained(init_path, mask_decoder_cfg=mask_cfg, **kwargs)
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
-    
 
     mask2former_ckpt = model_args.vision_tower_mask
-    model.initial_mask_module(mask2former_ckpt, model_args)
+    if model.is_train_mask_decode:
+        init_args = model.config
+        if not getattr(init_args, "use_set_conditioner", False):
+            init_args.use_set_conditioner = True
+            init_args.use_set_count_loss = True
+            init_args.use_set_category_loss = True
+        vocab_path = getattr(model_args, "lasers_category_vocab_path", "") or ""
+        if vocab_path and not getattr(init_args, "lasers_category_vocab_path", ""):
+            init_args.lasers_category_vocab_path = vocab_path
+        model.init_set_conditioning_modules(init_args)
+    else:
+        model.initial_mask_module(mask2former_ckpt, model_args=model.config)
 
     model.get_model().initialize_vision_modules(model_args)
 
@@ -106,9 +140,16 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     vision_tower.to(device=device)
 
-    train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
-    ]
+    if getattr(model_args, "a3_only", False):
+        model_args.lora_enable = False
+        train_module_list = [
+            "set_conditioner", "count_head", "category_set_head",
+        ]
+    else:
+        train_module_list = [
+            "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+            "set_conditioner", "count_head", "category_set_head",
+        ]
 
     if model_args.lora_enable:
         lora_r = model_args.lora_r
@@ -129,7 +170,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
     model = load_state_dict_from_zero_checkpoint(model, model_path)
-    model = model.merge_and_unload()
+    if hasattr(model, "merge_and_unload"):
+        model = model.merge_and_unload()
 
     return tokenizer, model
 
