@@ -17,8 +17,6 @@ from segearth_r2.utils.builder import load_pretrained_model
 from segearth_r2.datasets.dataset import (
     DataCollatorForCOCODatasetV2,
     LaSeRSDataset,
-    RefSegRSDataset,
-    RISBenchDataset,
     RRSISDDataset,
 )
 
@@ -48,12 +46,10 @@ class DataArguments:
     eval_batch_size: int = 1
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
-    load_8bit: bool = False
-    load_4bit: bool = False
 
     # 新增：数据集类型与 split
-    dataset_name: str = "lasers"   # lasers / rrsisd / refsegrs / risbench
-    split: str = "val"             # train / val / test (rrsisd/refsegrs/risbench)
+    dataset_name: str = "lasers"   # "lasers" or "rrsisd"
+    split: str = "val"             # for rrsisd: train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
 
@@ -129,40 +125,6 @@ def build_eval_datasets(data_args, tokenizer):
         split_name = f"{split}.json"
         return [(split_name, eval_dataset)]
 
-    elif dataset_name == "refsegrs":
-        split = data_args.split.lower()
-        if split not in ["train", "val", "test"]:
-            raise ValueError(f"Unsupported RefSegRS split: {split}. Must be train / val / test")
-
-        if data_args.local_rank == 0:
-            print(f"------ cur benchmark is RefSegRS {split} subset -------")
-
-        eval_dataset = RefSegRSDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            split=split,
-        )
-        split_name = f"{split}.json"
-        return [(split_name, eval_dataset)]
-
-    elif dataset_name == "risbench":
-        split = data_args.split.lower()
-        if split not in ["train", "val", "test"]:
-            raise ValueError(f"Unsupported RISBench split: {split}. Must be train / val / test")
-
-        if data_args.local_rank == 0:
-            print(f"------ cur benchmark is RISBench {split} subset -------")
-
-        eval_dataset = RISBenchDataset(
-            base_data_path=data_args.base_data_path,
-            tokenizer=tokenizer,
-            data_args=data_args,
-            split=split,
-        )
-        split_name = f"{split}.json"
-        return [(split_name, eval_dataset)]
-
     else:
         raise ValueError(f"Unsupported dataset_name: {data_args.dataset_name}")
 
@@ -182,17 +144,11 @@ def evaluation():
         model_path,
         model_args=data_args,
         mask_config=data_args.mask_config,
-        load_8bit=data_args.load_8bit,
-        load_4bit=data_args.load_4bit,
         device="cuda",
     )
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
-    if data_args.load_8bit or data_args.load_4bit:
-        model.to(device=device)
-    else:
-        # fp16 inference saves VRAM vs casting the whole model to fp32
-        model.to(dtype=torch.float16, device=device)
+    model.to(dtype=torch.float32, device=device)
 
     data_args.is_multimodal = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
@@ -240,7 +196,6 @@ def evaluation():
 def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
     model.eval()
     processed_samples = 0
-    infer_dtype = next(model.parameters()).dtype
 
     if data_args.distributed:
         distributed.barrier()
@@ -260,8 +215,8 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
             outputs = model.eval_seg(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
-                images=inputs["images"].to(device=device, dtype=infer_dtype),
-                images_clip=inputs["images_clip"].to(device=device, dtype=infer_dtype),
+                images=inputs["images"].float(),
+                images_clip=inputs["images_clip"].float(),
                 seg_info=inputs["seg_info"],
                 token_refer_id=inputs["token_refer_id"],
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
