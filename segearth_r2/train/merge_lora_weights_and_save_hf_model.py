@@ -7,6 +7,7 @@ sys.path.insert(0, project_root)
 import argparse
 import glob
 import copy
+import json
 
 import numpy as np
 import torch
@@ -56,6 +57,12 @@ def parse_args(args):
         type=str,
         help="Path to lasers_category_vocab.json (required for A3 category_set_head shape).",
     )
+    parser.add_argument(
+        "--use_explicit_set_token",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Load/merge C-lite-v2 SET_token_projector and q_set_fusion modules.",
+    )
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
     parser.add_argument("--lora_dropout", default=0.05, type=float)
@@ -87,6 +94,36 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
             
     return sorted(list(lora_module_names))
 
+
+def resolve_init_path(model_path):
+    """DeepSpeed checkpoints often lack config.json; load architecture from LoRA base."""
+    if os.path.isfile(os.path.join(model_path, "config.json")):
+        return model_path
+    adapter_path = os.path.join(model_path, "adapter_config.json")
+    if os.path.isfile(adapter_path):
+        with open(adapter_path, encoding="utf-8") as f:
+            base = json.load(f).get("base_model_name_or_path")
+        if base and os.path.isdir(base):
+            return base
+    return model_path
+
+
+def apply_set_training_config(init_args, model_args):
+    vocab_path = getattr(model_args, "lasers_category_vocab_path", "") or ""
+    use_explicit = getattr(model_args, "use_explicit_set_token", False)
+    a3_only = getattr(model_args, "a3_only", False)
+    if not (vocab_path or use_explicit or a3_only):
+        return
+    if not getattr(init_args, "use_set_conditioner", False):
+        init_args.use_set_conditioner = True
+        init_args.use_set_count_loss = True
+        init_args.use_set_category_loss = True
+    if vocab_path and not getattr(init_args, "lasers_category_vocab_path", ""):
+        init_args.lasers_category_vocab_path = vocab_path
+    if use_explicit:
+        init_args.use_explicit_set_token = True
+
+
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
     kwargs = {"device_map": 'cpu'}
@@ -113,26 +150,22 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         if not baseline:
             raise ValueError("--a3_only requires --baseline_model_path (LaSeRS baseline merged_model).")
         init_path = baseline
+    else:
+        init_path = resolve_init_path(model_path)
 
-    tokenizer = AutoTokenizer.from_pretrained(init_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(init_path, mask_decoder_cfg=mask_cfg, **kwargs)
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
 
     mask2former_ckpt = model_args.vision_tower_mask
+    init_args = model.config
+    apply_set_training_config(init_args, model_args)
     if model.is_train_mask_decode:
-        init_args = model.config
-        if not getattr(init_args, "use_set_conditioner", False):
-            init_args.use_set_conditioner = True
-            init_args.use_set_count_loss = True
-            init_args.use_set_category_loss = True
-        vocab_path = getattr(model_args, "lasers_category_vocab_path", "") or ""
-        if vocab_path and not getattr(init_args, "lasers_category_vocab_path", ""):
-            init_args.lasers_category_vocab_path = vocab_path
         model.init_set_conditioning_modules(init_args)
     else:
-        model.initial_mask_module(mask2former_ckpt, model_args=model.config)
+        model.initial_mask_module(mask2former_ckpt, model_args=init_args)
 
     model.get_model().initialize_vision_modules(model_args)
 
@@ -150,6 +183,9 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
             "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
             "set_conditioner", "count_head", "category_set_head",
         ]
+    # C-lite-v2: 显式 [SET] token 相关模块
+    if getattr(model_args, "use_explicit_set_token", False):
+        train_module_list.extend(["SET_token_projector", "q_set_fusion"])
 
     if model_args.lora_enable:
         lora_r = model_args.lora_r
@@ -175,6 +211,42 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     return tokenizer, model
 
+
+def persist_set_config(model, args):
+    """Write SET / C-lite-v2 flags into config.json so eval can reload modules."""
+    set_config_fields = (
+        "use_set_conditioner",
+        "use_set_count_loss",
+        "use_set_category_loss",
+        "set_conditioner_layers",
+        "set_conditioner_heads",
+        "set_conditioner_gate_init",
+        "lambda_set_count",
+        "lambda_set_category",
+        "set_max_count",
+        "lasers_category_vocab_path",
+        "use_explicit_set_token",
+        "q_set_fusion_hidden",
+    )
+    for name in set_config_fields:
+        value = getattr(model.config, name, None)
+        if value is None and hasattr(args, name):
+            value = getattr(args, name)
+        if value is not None:
+            setattr(model.config, name, value)
+
+    vocab_path = getattr(args, "lasers_category_vocab_path", "") or ""
+    if vocab_path and not getattr(model.config, "lasers_category_vocab_path", ""):
+        model.config.lasers_category_vocab_path = vocab_path
+
+    if getattr(model, "set_conditioner", None) is not None:
+        model.config.use_set_conditioner = True
+        if not getattr(model.config, "use_set_count_loss", False):
+            model.config.use_set_count_loss = True
+        if not getattr(model.config, "use_set_category_loss", False):
+            model.config.use_set_category_loss = True
+
+
 def main(args):
     args = parse_args(args)
 
@@ -185,6 +257,7 @@ def main(args):
         print(k)
         state_dict[k] = v
     model._hf_peft_config_loaded = False
+    persist_set_config(model, args)
     model.save_pretrained(args.save_path, state_dict=state_dict)
 
     tokenizer.save_pretrained(args.save_path)

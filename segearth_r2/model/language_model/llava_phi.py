@@ -381,7 +381,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         embedded_refer = self.get_model().embed_tokens(refer_ids)
         return embedded_refer
 
-    def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
+    def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, SET_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
         assert len(image_token_indices) == 1, 'not supporting multi image index'
         
@@ -394,6 +394,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             cur_new_label = None
         
         cur_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        cur_SET_token_embedding_indices = [] if SET_token_embedding_indices is not None else None
         
         chunks = []
         current_chunk = []
@@ -418,6 +419,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(torch.full((img_feature.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if SET_token_embedding_indices is not None:
+                    cur_SET_token_embedding_indices.append(torch.full((img_feature.shape[0],), 0, device=input_id.device,
+                                   dtype=input_id.dtype))
                 if label is not None:
                     cur_new_label.append(
                         torch.full((img_feature.shape[0],), IGNORE_INDEX, device=label.device,
@@ -435,6 +439,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     cur_SEG_token_embedding_indices.append(
                         torch.full((refer_embed.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if SET_token_embedding_indices is not None:
+                    cur_SET_token_embedding_indices.append(
+                        torch.full((refer_embed.shape[0],), 0, device=input_id.device,
+                                   dtype=input_id.dtype))
                 if label is not None:
                     cur_new_label.append(
                         torch.full((refer_embed.shape[0],), IGNORE_INDEX, device=label.device,
@@ -447,6 +455,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(SEG_token_embedding_indices[:chunk_len])
+                if SET_token_embedding_indices is not None:
+                    cur_SET_token_embedding_indices.append(SET_token_embedding_indices[:chunk_len])
                 if label is not None:
                     cur_new_label.append(label[:chunk_len])
 
@@ -454,6 +464,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             
             if SEG_token_embedding_indices is not None:
                 SEG_token_embedding_indices = SEG_token_embedding_indices[chunk_len:]
+            if SET_token_embedding_indices is not None:
+                SET_token_embedding_indices = SET_token_embedding_indices[chunk_len:]
             if label is not None:
                 label = label[chunk_len:]
 
@@ -467,13 +479,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
             cur_SEG_token_embedding_indices = [x.to(device=self.device) for x in cur_SEG_token_embedding_indices]
             cur_SEG_token_embedding_indices = torch.cat(cur_SEG_token_embedding_indices, dim=0)
         
+        if SET_token_embedding_indices is not None:
+            cur_SET_token_embedding_indices = [x.to(device=self.device) for x in cur_SET_token_embedding_indices]
+            cur_SET_token_embedding_indices = torch.cat(cur_SET_token_embedding_indices, dim=0)
+        
         if image_features_indices:
             image_features_indices = [x.to(device=self.device) for x in image_features_indices]
             image_features_indices = torch.cat(image_features_indices, dim=0)
 
-        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, image_features_indices
+        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, cur_SET_token_embedding_indices, image_features_indices
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, attention_mask, past_key_values, labels, images, token_refer_id=None, SEG_token_embedding_indices=None):
+    def prepare_inputs_labels_for_multimodal(self, input_ids, attention_mask, past_key_values, labels, images, token_refer_id=None, SEG_token_embedding_indices=None, SET_token_embedding_indices=None):
 
         vision_tower = self.get_vision_tower()
         
@@ -482,7 +498,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 1] == 1:
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                                             dtype=attention_mask.dtype, device=attention_mask.device)
-            return input_ids, attention_mask, past_key_values, None, labels, None, None
+            return input_ids, attention_mask, past_key_values, None, labels, None, None, None
 
         image_features = self.encode_images(images)
 
@@ -491,10 +507,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         new_image_features_indices = []
         
         new_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        new_SET_token_embedding_indices = [] if SET_token_embedding_indices is not None else None
         for batch_idx, cur_input_ids in enumerate(input_ids):
             cur_image_feature = image_features[batch_idx]
             
             cur_SEG_token_embedding_indices = SEG_token_embedding_indices[batch_idx] if SEG_token_embedding_indices is not None else None
+            cur_SET_token_embedding_indices = SET_token_embedding_indices[batch_idx] if SET_token_embedding_indices is not None else None
             
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
                 # multimodal LLM, but the current sample is not multimodal
@@ -519,11 +537,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             cur_refer_embedding = self.embed_refer_ids(cur_token_refer_id)
 
-            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_image_features_indices= self.concat_image_seg_cls_embeds(
+            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_SET_token_embedding_indices, cur_image_features_indices= self.concat_image_seg_cls_embeds(
                 input_id=cur_input_ids,
                 img_feature=cur_image_feature,
                 label=cur_label,
                 SEG_token_embedding_indices=cur_SEG_token_embedding_indices,
+                SET_token_embedding_indices=cur_SET_token_embedding_indices,
                 refer_embedding=cur_refer_embedding
             )
 
@@ -533,6 +552,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices.append(cur_SEG_token_embedding_indices)
+
+            if SET_token_embedding_indices is not None:
+                new_SET_token_embedding_indices.append(cur_SET_token_embedding_indices)
 
             if new_image_features_indices is not None:
                 new_image_features_indices.append(cur_image_features_indices)
@@ -569,6 +591,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     new_SEG_token_embedding_indices_align.append(new_SEG_token_embedding_indice)
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices_align, dim=0)
             
+            if SET_token_embedding_indices is not None:
+                new_SET_token_embedding_indices_align = []
+                for new_SET_token_embedding_indice in new_SET_token_embedding_indices:
+                    new_SET_token_embedding_indice = torch.cat(
+                        (new_SET_token_embedding_indice,
+                         torch.zeros((max_len - new_SET_token_embedding_indice.shape[0]),dtype=new_SET_token_embedding_indice.dtype, device=new_SET_token_embedding_indice.device)),
+                        dim=0)
+                    new_SET_token_embedding_indices_align.append(new_SET_token_embedding_indice)
+                new_SET_token_embedding_indices = torch.stack(new_SET_token_embedding_indices_align, dim=0)
+            
             if new_image_features_indices is not None:
                 new_image_features_indices_align = []
                 for new_image_features_indice in new_image_features_indices:
@@ -602,6 +634,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices, dim=0)
 
+            if SET_token_embedding_indices is not None:
+                new_SET_token_embedding_indices = torch.stack(new_SET_token_embedding_indices, dim=0)
+
             if new_image_features_indices is not None:
                 new_image_features_indices = torch.stack(new_image_features_indices, dim=0)
             
@@ -612,7 +647,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
    
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices
+        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_SET_token_embedding_indices, new_image_features_indices
     
     def get_SEG_embedding(self, hidden_states, SEG_embedding_indices):
         SEG_embedding_list = []
@@ -620,6 +655,26 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
+
+    def get_SET_embedding(self, hidden_states, SET_embedding_indices):
+        """C-lite-v2: 提取 [SET] token 的 hidden state（每个样本一个）"""
+        SET_embedding_list = []
+        for current_hidden_state, current_token_indice in zip(hidden_states, SET_embedding_indices):
+            # 找到 [SET] token 的位置
+            set_positions = current_token_indice.bool()
+            if set_positions.sum() > 0:
+                # 取第一个 [SET] token 的 hidden state
+                set_state = current_hidden_state[set_positions][0:1]  # [1, hidden_size]
+                SET_embedding_list.append(set_state)
+            else:
+                # 如果没有 [SET] token，用零向量填充（后续会被 mask 掉）
+                set_state = torch.zeros(1, current_hidden_state.shape[-1],
+                                       device=current_hidden_state.device,
+                                       dtype=current_hidden_state.dtype)
+                SET_embedding_list.append(set_state)
+        if len(SET_embedding_list) == 0:
+            return None
+        return torch.cat(SET_embedding_list, dim=0)  # [B, hidden_size]
 
     def init_set_conditioning_modules(self, model_args=None):
         args = model_args if model_args is not None else self.init_config
@@ -629,6 +684,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.lambda_set_count = float(getattr(args, "lambda_set_count", 0.05))
         self.lambda_set_category = float(getattr(args, "lambda_set_category", 0.1))
         self.set_max_count = int(getattr(args, "set_max_count", 10))
+        # C-lite-v2: 显式 [SET] token 支持
+        self.use_explicit_set_token = bool(getattr(args, "use_explicit_set_token", False))
 
         if hasattr(self, "config"):
             for name in (
@@ -642,6 +699,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "lambda_set_category",
                 "set_max_count",
                 "lasers_category_vocab_path",
+                "use_explicit_set_token",
+                "q_set_fusion_hidden",
             ):
                 if hasattr(args, name):
                     setattr(self.config, name, getattr(args, name))
@@ -653,6 +712,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.set_conditioner = None
             self.count_head = None
             self.category_set_head = None
+            self.SET_token_projector = None
+            self.q_set_fusion = None
             self._set_conditioning_initialized = True
             return
 
@@ -667,6 +728,27 @@ class SegEarthR2(MiphaPhiForCausalLM):
         vocab = load_lasers_category_vocab(getattr(args, "lasers_category_vocab_path", None))
         self.lasers_category_vocab = vocab
         self.category_set_head = CategorySetHead(hidden_dim, vocab_size=len(vocab))
+        
+        # C-lite-v2: 显式 [SET] token 的 projector 和 fusion 模块
+        if self.use_explicit_set_token:
+            # SET_token_projector: 将 [SET] hidden state 投影到 mask decoder 维度
+            self.SET_token_projector = nn.Linear(self.config.hidden_size, hidden_dim)
+            # q_set_fusion: 融合 explicit q_set 和 implicit q_set
+            fusion_hidden = getattr(args, "q_set_fusion_hidden", None) or hidden_dim
+            self.q_set_fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 2, fusion_hidden),
+                nn.GELU(),
+                nn.Linear(fusion_hidden, hidden_dim)
+            )
+            # Residual-safe init: delta=0 at step 0, but layer0 xavier keeps explicit path trainable.
+            nn.init.xavier_uniform_(self.q_set_fusion[0].weight)
+            nn.init.zeros_(self.q_set_fusion[0].bias)
+            nn.init.zeros_(self.q_set_fusion[2].weight)
+            nn.init.zeros_(self.q_set_fusion[2].bias)
+        else:
+            self.SET_token_projector = None
+            self.q_set_fusion = None
+        
         self._set_conditioning_initialized = True
 
     def _apply_set_conditioning(
@@ -674,6 +756,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_embedding: torch.Tensor,
         mask_num,
         category_set_labels=None,
+        q_set_explicit=None,  # C-lite-v2: 来自 [SET] hidden state 的 explicit q_set
     ):
         loss_set_count = None
         loss_set_category = None
@@ -693,9 +776,32 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if self.set_conditioner is None:
             raise RuntimeError("SetConditioner is not initialized but use_set_conditioner=True.")
 
-        refined_seg_embedding, q_set, _, gate_mean, _ = self.set_conditioner(
-            seg_embedding, mask_num
-        )
+        # C-lite-v2: 如果有 explicit q_set，需要与 implicit q_set 融合
+        if self.use_explicit_set_token and q_set_explicit is not None and self.q_set_fusion is not None:
+            # 先获取 implicit q_set（从 seg_embedding pooling）
+            # 需要临时调用 set_conditioner 的 _pool_q_set
+            from segearth_r2.model.set_conditioner import regroup_seg_embeddings
+            seg_group, valid_mask, counts = regroup_seg_embeddings(seg_embedding, mask_num)
+            if seg_group.numel() > 0:
+                q_set_implicit = self.set_conditioner._pool_q_set(seg_group, valid_mask)
+                # 融合 explicit 和 implicit q_set
+                # q_set_explicit: [B, hidden_dim], q_set_implicit: [B, hidden_dim]
+                q_set_concat = torch.cat([q_set_explicit, q_set_implicit], dim=-1)  # [B, 2*hidden_dim]
+                q_set_fused = q_set_implicit + self.q_set_fusion(q_set_concat)  # zero-init -> implicit
+                # 使用 fused q_set 覆盖 set_conditioner 的 pooling 结果
+                # 需要修改 set_conditioner 的 forward 来接受 q_set_override
+                refined_seg_embedding, q_set, _, gate_mean, _ = self.set_conditioner(
+                    seg_embedding, mask_num, q_set_override=q_set_fused
+                )
+            else:
+                # 如果没有有效的 seg_embedding，fallback 到原始逻辑
+                refined_seg_embedding, q_set, _, gate_mean, _ = self.set_conditioner(
+                    seg_embedding, mask_num
+                )
+        else:
+            refined_seg_embedding, q_set, _, gate_mean, _ = self.set_conditioner(
+                seg_embedding, mask_num
+            )
         set_gate_value = float(gate_mean.detach().item()) if gate_mean.numel() else 0.0
 
         if self.use_set_count_loss and self.count_head is not None and q_set is not None:
@@ -742,6 +848,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
+            SET_token_embedding_indices=None,  # C-lite-v2: 显式 [SET] token indices
             global_step=None,
             mask_num=None,
             dataset_type=None,
@@ -757,6 +864,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # C-lite-v2: 处理 SET_token_embedding_indices（与 SEG_token_embedding_indices 类似）
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
             # for generative mode only the 1th stage need
@@ -764,9 +872,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 image_features = self.get_vision_tower_feature(images)
                 bs = input_ids.shape[0]
             
-            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
+            # C-lite-v2: 传递 SET_token_embedding_indices
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, SET_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
-                token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
+                token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices,
+                SET_token_embedding_indices=SET_token_embedding_indices)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -791,6 +901,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
             attentions = []
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
 
+        # C-lite-v2: 提取 [SET] hidden state 并计算 q_set_explicit
+        q_set_explicit = None
+        if self.use_explicit_set_token and SET_token_embedding_indices is not None:
+            if (SET_token_embedding_indices == 1).sum() != 0:
+                # 获取 [SET] hidden state（每个样本一个）
+                SET_embedding = self.get_SET_embedding(hidden_states, SET_token_embedding_indices)
+                if SET_embedding is not None and self.SET_token_projector is not None:
+                    q_set_explicit = self.SET_token_projector(SET_embedding)  # [B, hidden_dim]
+
         (
             SEG_embedding,
             loss_set_count,
@@ -801,6 +920,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_embedding,
             mask_num,
             category_set_labels=category_set_labels,
+            q_set_explicit=q_set_explicit,
         )
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
@@ -936,6 +1056,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
+            SET_token_embedding_indices=None,  # C-lite-v2: 显式 [SET] token indices
             mask_num = None):
         
         output_attentions = False
@@ -944,9 +1065,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         image_features = self.get_vision_tower_feature(images)
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
+        # C-lite-v2: 传递 SET_token_embedding_indices
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, SET_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
-            token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
+            token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices,
+            SET_token_embedding_indices=SET_token_embedding_indices)
     
         outputs = self.model(
             input_ids=input_ids,
@@ -959,10 +1082,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return_dict=return_dict
         )
 
-        hidden_states = outputs.last_hidden_state   
+        hidden_states = outputs.last_hidden_state
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        SEG_embedding, _, _, _, _ = self._apply_set_conditioning(SEG_embedding, mask_num)
+        
+        # C-lite-v2: 提取 [SET] hidden state 并计算 q_set_explicit
+        q_set_explicit = None
+        if self.use_explicit_set_token and SET_token_embedding_indices is not None:
+            if (SET_token_embedding_indices == 1).sum() != 0:
+                SET_embedding = self.get_SET_embedding(hidden_states, SET_token_embedding_indices)
+                if SET_embedding is not None and self.SET_token_projector is not None:
+                    q_set_explicit = self.SET_token_projector(SET_embedding)
+        
+        SEG_embedding, _, _, _, _ = self._apply_set_conditioning(SEG_embedding, mask_num, q_set_explicit=q_set_explicit)
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)

@@ -59,6 +59,9 @@ class ModelArguments:
     a3_train_only_set_modules: bool = field(default=False)
     set_max_count: int = field(default=10)
     lasers_category_vocab_path: Optional[str] = field(default=None)
+    # C-lite-v2: explicit [SET] token + q_set fusion
+    use_explicit_set_token: bool = field(default=False)
+    q_set_fusion_hidden: Optional[int] = field(default=None)
 
 @dataclass
 class DataArguments:
@@ -296,6 +299,7 @@ def train():
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
     if getattr(data_args, "lasers_category_vocab_path", None) is None:
         data_args.lasers_category_vocab_path = model_args.lasers_category_vocab_path
+    data_args.use_explicit_set_token = model_args.use_explicit_set_token
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
@@ -383,6 +387,8 @@ def train():
                 p.requires_grad = False
 
     tokenizer.add_tokens("[SEG]")
+    if model_args.use_explicit_set_token:
+        tokenizer.add_tokens("[SET]")
     model.resize_token_embeddings(len(tokenizer))
 
     a3_modules_active = (
@@ -410,6 +416,8 @@ def train():
         ]
         if a3_modules_active:
             train_module_list.extend(["set_conditioner", "count_head", "category_set_head"])
+        if model_args.use_explicit_set_token:
+            train_module_list.extend(["SET_token_projector", "q_set_fusion"])
 
         if model_args.train_swin_backbone:
             train_module_list.append('vision_tower_mask')

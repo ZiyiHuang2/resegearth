@@ -412,6 +412,12 @@ class LaSeRSDataset(RS_Base_Dataset):
         self.LaSeRS_image_path, self.LaSeRS_json_path = resolve_lasers_split_paths(base_data_path, split)
 
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        # C-lite-v2: 显式 [SET] token
+        self.use_explicit_set_token = getattr(data_args, 'use_explicit_set_token', False)
+        if self.use_explicit_set_token:
+            self.SET_token_id = self.tokenizer.convert_tokens_to_ids("[SET]")
+        else:
+            self.SET_token_id = None
         
         with open(self.LaSeRS_json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -441,7 +447,11 @@ class LaSeRSDataset(RS_Base_Dataset):
         answer = data_info['answer']
         data_id = data_info['id']
 
-        if "mask" in data_info:        
+        # C-lite-v2: 在 answer 开头自动插入 [SET] token（仅当有 [SEG] 时）
+        if self.use_explicit_set_token and "[SEG]" in answer and "[SET]" not in answer:
+            answer = "[SET] " + answer
+
+        if "mask" in data_info:
             rle_list = data_info['mask']
             masks = []
             for rle in rle_list:
@@ -495,6 +505,12 @@ class LaSeRSDataset(RS_Base_Dataset):
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
         
+        # C-lite-v2: 添加 SET_token_embedding_indices
+        if self.use_explicit_set_token:
+            SET_token_embedding_indices = torch.zeros_like(input_ids)
+            SET_token_embedding_indices[input_ids == self.SET_token_id] = 1
+            data_dict['SET_token_embedding_indices'] = SET_token_embedding_indices
+        
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
         
@@ -502,7 +518,7 @@ class LaSeRSDataset(RS_Base_Dataset):
         data_dict['labels'] = text_dict['labels'][0]
         data_dict['dataset_type'] = 'rs_reason_seg'
         
-        data_dict['token_refer_id'] = token_refer_id    
+        data_dict['token_refer_id'] = token_refer_id
         data_dict['refer_embedding_indices'] = refer_embedding_indices
         data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
         
@@ -994,6 +1010,15 @@ class DataCollatorForCOCODatasetV2(object):
                 batch_first=True,
                 padding_value=0)
             batch['SEG_token_embedding_indices'] = SEG_token_embedding_indices
+        
+        # C-lite-v2: 批处理 SET_token_embedding_indices
+        if 'SET_token_embedding_indices' in instances[0]:
+            SET_token_embedding_indices = [instance['SET_token_embedding_indices'] for instance in instances]
+            SET_token_embedding_indices = torch.nn.utils.rnn.pad_sequence(
+                SET_token_embedding_indices,
+                batch_first=True,
+                padding_value=0)
+            batch['SET_token_embedding_indices'] = SET_token_embedding_indices
         
         if 'mask_num' in instances[0]:
             batch['mask_num'] = [instance['mask_num'] for instance in instances]

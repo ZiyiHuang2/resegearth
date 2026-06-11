@@ -409,6 +409,7 @@ class LLaVATrainer(Trainer):
                     seg_info=inputs["seg_info"],
                     token_refer_id=token_refer_id,
                     SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
+                    SET_token_embedding_indices=inputs.get("SET_token_embedding_indices"),  # C-lite-v2
                     labels=inputs["labels"],
                     mask_num=inputs["mask_num"],
                 )

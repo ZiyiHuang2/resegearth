@@ -255,6 +255,7 @@ class SetConditioner(nn.Module):
         self,
         seg_embedding: torch.Tensor,
         mask_num: Union[List[int], torch.Tensor],
+        q_set_override: Optional[torch.Tensor] = None,  # C-lite-v2: 允许外部传入 fused q_set
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         seg_group, valid_mask, counts = regroup_seg_embeddings(seg_embedding, mask_num)
         if seg_group.numel() == 0:
@@ -263,7 +264,11 @@ class SetConditioner(nn.Module):
             return seg_embedding, empty_q, valid_mask, empty_gate, empty_gate
 
         seg_group_orig = seg_group
-        q_set = self._pool_q_set(seg_group_orig, valid_mask)
+        # C-lite-v2: 如果有 q_set_override，使用它替代 pooling 结果
+        if q_set_override is not None:
+            q_set = q_set_override
+        else:
+            q_set = self._pool_q_set(seg_group_orig, valid_mask)
         q_set_expand = q_set.unsqueeze(1).expand(-1, seg_group_orig.shape[1], -1)
         seg_with_set = seg_group_orig + self.set_proj(q_set_expand)
         padding_mask = ~valid_mask

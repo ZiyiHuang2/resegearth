@@ -195,6 +195,7 @@ def build_seg_batch(
     model_answer: str,
     sample_meta: dict,
     seg_token_id: int,
+    set_token_id: Optional[int] = None,  # C-lite-v2: [SET] token id
 ):
     sources = build_full_sources(description, model_answer)
     text_dict = dataset.preprocess_llama2(sources, tokenizer)
@@ -203,6 +204,14 @@ def build_seg_batch(
     seg_indices = torch.zeros_like(input_ids)
     seg_indices[input_ids == seg_token_id] = 1
     generated_seg_count = model_answer.count("[SEG]")
+    
+    # C-lite-v2: 统计 [SET] token
+    set_indices = None
+    generated_set_count = 0
+    if set_token_id is not None:
+        set_indices = torch.zeros_like(input_ids)
+        set_indices[input_ids == set_token_id] = 1
+        generated_set_count = model_answer.count("[SET]")
 
     seg_info = []
     for i in range(generated_seg_count):
@@ -212,14 +221,18 @@ def build_seg_batch(
             "image_id": os.path.splitext(sample_meta["image_name"])[0],
         })
 
-    return {
+    result = {
         "input_ids": input_ids.unsqueeze(0),
         "labels": labels.unsqueeze(0),
         "attention_mask": input_ids.unsqueeze(0).ne(tokenizer.pad_token_id),
         "SEG_token_embedding_indices": seg_indices.unsqueeze(0),
         "mask_num": [generated_seg_count],
         "seg_info": seg_info,
+        "generated_SET_count": generated_set_count,  # C-lite-v2: 记录 [SET] 数量
     }
+    if set_indices is not None:
+        result["SET_token_embedding_indices"] = set_indices.unsqueeze(0)
+    return result
 
 
 def compute_iou_diagnostics(gt_masks: List[np.ndarray], pred_masks: List[np.ndarray]):
@@ -322,6 +335,10 @@ def main():
 
     clip_image_processor = SiglipImageProcessor.from_pretrained(args.vision_tower)
     seg_token_id = tokenizer.convert_tokens_to_ids("[SEG]")
+    # C-lite-v2: 获取 [SET] token id
+    set_token_id = tokenizer.convert_tokens_to_ids("[SET]")
+    if set_token_id is None or set_token_id == tokenizer.unk_token_id:
+        set_token_id = None  # 模型未使用 [SET] token
 
     benchmarks = list_lasers_benchmarks(args.base_data_path, args.lasers_benchmark)
     processed = 0
@@ -384,6 +401,7 @@ def main():
                     args.max_new_tokens,
                 )
                 generated_seg_count = model_answer.count("[SEG]")
+                generated_set_count = model_answer.count("[SET]")
 
                 pred_masks = []
                 per_seg_paths = []
@@ -391,8 +409,12 @@ def main():
 
                 if generated_seg_count > 0:
                     seg_batch = build_seg_batch(
-                        dataset, tokenizer, description, model_answer, sample, seg_token_id
+                        dataset, tokenizer, description, model_answer, sample, seg_token_id,
+                        set_token_id=set_token_id,  # C-lite-v2
                     )
+                    set_indices = seg_batch.get("SET_token_embedding_indices")
+                    if set_indices is not None:
+                        set_indices = set_indices.to(device)
                     outputs = model.eval_seg(
                         input_ids=seg_batch["input_ids"].to(device),
                         attention_mask=seg_batch["attention_mask"].to(device),
@@ -401,6 +423,7 @@ def main():
                         seg_info=seg_batch["seg_info"],
                         token_refer_id=[token_refer_id.to(device)],
                         SEG_token_embedding_indices=seg_batch["SEG_token_embedding_indices"].to(device),
+                        SET_token_embedding_indices=set_indices,
                         labels=seg_batch["labels"].to(device),
                         mask_num=seg_batch["mask_num"],
                     )
@@ -428,6 +451,7 @@ def main():
                     "raw_generated_text": raw_generated_text,
                     "generated_token_ids": generated_token_ids,
                     "generated_SEG_count": generated_seg_count,
+                    "generated_SET_count": generated_set_count,
                     "gt_mask_count": gt_mask_count,
                     "pred_mask_count": len(pred_masks),
                     "per_SEG_mask_path": per_seg_paths,

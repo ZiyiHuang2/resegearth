@@ -223,6 +223,8 @@ def evaluation():
         model.to(dtype=torch.float16, device=device)
 
     data_args.is_multimodal = True
+    if getattr(model.config, "use_explicit_set_token", False):
+        data_args.use_explicit_set_token = True
     conversation_lib.default_conversation = conversation_lib.conv_templates[data_args.version]
 
     clip_image_processor = SiglipImageProcessor.from_pretrained(data_args.vision_tower)
@@ -300,7 +302,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                     processed_samples += len(seg_info)
                     continue
 
-            outputs = model.eval_seg(
+            eval_kwargs = dict(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 images=inputs["images"].to(device=device, dtype=infer_dtype),
@@ -311,6 +313,9 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
             )
+            if "SET_token_embedding_indices" in inputs:
+                eval_kwargs["SET_token_embedding_indices"] = inputs["SET_token_embedding_indices"]
+            outputs = model.eval_seg(**eval_kwargs)
 
             for output in outputs:
                 pred_mask = output["pred"]
