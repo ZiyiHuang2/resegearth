@@ -241,6 +241,8 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
 
+    _PR_IOU_THRESHOLDS = (0.5, 0.6, 0.7, 0.8, 0.9)
+
     def evaluate(
         self,
         eval_dataset: Optional[Dataset] = None,
@@ -256,10 +258,15 @@ class LLaVATrainer(Trainer):
         model.eval()
 
         device = self.args.device
+        eps = 1e-7
         inter_sum = torch.tensor(0.0, device=device)
         union_sum = torch.tensor(0.0, device=device)
-        ciou_sum = torch.tensor(0.0, device=device)
-        ciou_count = torch.tensor(0.0, device=device)
+        iou_sum = torch.tensor(0.0, device=device)
+        dice_sum = torch.tensor(0.0, device=device)
+        recall_sum = torch.tensor(0.0, device=device)
+        precision_sum = torch.tensor(0.0, device=device)
+        valid_count = torch.tensor(0.0, device=device)
+        pr_counts = torch.zeros(len(self._PR_IOU_THRESHOLDS), device=device)
 
         with torch.no_grad():
             for inputs in eval_dataloader:
@@ -285,7 +292,7 @@ class LLaVATrainer(Trainer):
                     key = (
                         str(gt_item.get("image_id", "")),
                         str(gt_item.get("data_id", "")),
-                        int(gt_item.get("mask_id", -1)),
+                        str(gt_item.get("mask_id", "")),
                     )
                     gt_map[key] = gt_mask
 
@@ -293,7 +300,7 @@ class LLaVATrainer(Trainer):
                     key = (
                         str(pred_item.get("image_name", "")),
                         str(pred_item.get("id", "")),
-                        int(pred_item.get("mask_id", -1)),
+                        str(pred_item.get("mask_id", "")),
                     )
                     if key not in gt_map:
                         continue
@@ -309,38 +316,77 @@ class LLaVATrainer(Trainer):
                     gt = gt > 0
 
                     if gt.shape != pred.shape:
-                        gt = F.interpolate(
-                            gt.float().unsqueeze(0).unsqueeze(0),
-                            size=pred.shape[-2:],
+                        pred = F.interpolate(
+                            pred.float().unsqueeze(0).unsqueeze(0),
+                            size=gt.shape[-2:],
                             mode="nearest",
                         ).squeeze(0).squeeze(0) > 0
 
+                    gt_area = gt.sum().float()
+                    if gt_area == 0:
+                        continue
+
                     inter = (pred & gt).sum().float()
                     union = (pred | gt).sum().float()
-                    if union > 0:
-                        inter_sum += inter
-                        union_sum += union
-                        ciou_sum += inter / union
-                        ciou_count += 1.0
+                    pred_area = pred.sum().float()
+                    sample_iou = inter / (union + eps)
+                    sample_dice = (2.0 * inter) / (pred_area + gt_area + eps)
+                    sample_recall = inter / (gt_area + eps)
+                    sample_precision = inter / (pred_area + eps)
 
+                    inter_sum += inter
+                    union_sum += union
+                    iou_sum += sample_iou
+                    dice_sum += sample_dice
+                    recall_sum += sample_recall
+                    precision_sum += sample_precision
+                    valid_count += 1.0
+                    for idx, thr in enumerate(self._PR_IOU_THRESHOLDS):
+                        if sample_iou >= thr:
+                            pr_counts[idx] += 1.0
+
+        stats = torch.cat(
+            [
+                inter_sum.unsqueeze(0),
+                union_sum.unsqueeze(0),
+                valid_count.unsqueeze(0),
+                iou_sum.unsqueeze(0),
+                dice_sum.unsqueeze(0),
+                recall_sum.unsqueeze(0),
+                precision_sum.unsqueeze(0),
+                pr_counts,
+            ]
+        )
         if dist.is_available() and dist.is_initialized():
-            dist.all_reduce(inter_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(union_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(ciou_sum, op=dist.ReduceOp.SUM)
-            dist.all_reduce(ciou_count, op=dist.ReduceOp.SUM)
+            dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-        # mask-level definition:
-        # gIoU: mean IoU over masks
-        # cIoU: global IoU over all mask pixels
-        eval_giou = (ciou_sum / ciou_count.clamp(min=1.0)).item()
-        eval_ciou = (inter_sum / (union_sum + 1e-6)).item()
-        eval_score = 0.5 * eval_giou + 0.5 * eval_ciou
+        inter_sum, union_sum, valid_count, iou_sum, dice_sum, recall_sum, precision_sum = stats[:7]
+        pr_counts = stats[7:]
+        vc = float(valid_count.item())
+
+        if vc > 0:
+            eval_giou = float((iou_sum / valid_count).item())
+            eval_ciou = float((inter_sum / (union_sum + eps)).item())
+            eval_mdice = float((dice_sum / valid_count).item())
+            eval_mrecall = float((recall_sum / valid_count).item())
+            eval_mprecision = float((precision_sum / valid_count).item())
+        else:
+            eval_giou = eval_ciou = eval_mdice = eval_mrecall = eval_mprecision = 0.0
+        eval_pr_at_0_9 = float(pr_counts[-1].item() / vc) if vc > 0 else 0.0
+        eval_score = 0.45 * eval_giou + 0.35 * eval_ciou + 0.20 * eval_pr_at_0_9
 
         metrics = {
             f"{metric_key_prefix}_giou": eval_giou,
             f"{metric_key_prefix}_ciou": eval_ciou,
             f"{metric_key_prefix}_score": eval_score,
+            f"{metric_key_prefix}_mdice": eval_mdice,
+            f"{metric_key_prefix}_mrecall": eval_mrecall,
+            f"{metric_key_prefix}_mprecision": eval_mprecision,
         }
+        for thr, pr_count in zip(self._PR_IOU_THRESHOLDS, pr_counts.tolist()):
+            thr_key = str(thr).replace(".", "_")
+            metrics[f"{metric_key_prefix}_pr_at_{thr_key}"] = float(pr_count / vc) if vc > 0 else 0.0
+
         self.log(metrics)
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
 
