@@ -55,4 +55,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     else:
         context_len = 2048
 
+    use_tcpd = getattr(model.config, "use_tcpd", False)
+    tcpd_source = getattr(model.config, "tcpd_condition_source", "seg")
+    print(f"[load] use_tcpd={use_tcpd}, tcpd_condition_source={tcpd_source}")
+
     return tokenizer, model, image_processor, context_len

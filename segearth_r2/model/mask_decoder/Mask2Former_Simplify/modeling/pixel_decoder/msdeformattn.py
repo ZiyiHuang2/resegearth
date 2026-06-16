@@ -22,6 +22,7 @@ from torch.nn import functional as F
 from ..transformer_decoder.position_encoding import PositionEmbeddingSine
 from ..transformer_decoder.transformer import _get_clones, _get_activation_fn
 from .ops.modules import MSDeformAttn
+from .tcpd_modules import TargetConditionEncoder, TCPDScaleFusion, TCPDFPNFusion
 
 # MSDeformAttn Transformer encoder in deformable detr
 class MSDeformAttnTransformerEncoderLayer(nn.Module):
@@ -54,9 +55,19 @@ class MSDeformAttnTransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, padding_mask=None):
+    def forward(self, src, pos, reference_points, spatial_shapes, level_start_index, padding_mask=None, tcpd_z=None, tcpd_spatial_mode="spatial", tcpd_condition_msdeform=True):
         # self attention
-        src2 = self.self_attn(self.with_pos_embed(src, pos), reference_points, src, spatial_shapes, level_start_index, padding_mask)
+        src2 = self.self_attn(
+            self.with_pos_embed(src, pos),
+            reference_points,
+            src,
+            spatial_shapes,
+            level_start_index,
+            padding_mask,
+            tcpd_z=tcpd_z,
+            tcpd_spatial_mode=tcpd_spatial_mode,
+            tcpd_condition_msdeform=tcpd_condition_msdeform,
+        )
         src = src + self.dropout1(src2)
         src = self.norm1(src)
 
@@ -86,11 +97,14 @@ class MSDeformAttnTransformerEncoder(nn.Module):
         reference_points = reference_points[:, :, None] * valid_ratios[:, None]
         return reference_points
 
-    def forward(self, src, spatial_shapes, level_start_index, valid_ratios, pos=None, padding_mask=None):
+    def forward(self, src, spatial_shapes, level_start_index, valid_ratios, pos=None, padding_mask=None, tcpd_z=None, tcpd_spatial_mode="spatial", tcpd_condition_msdeform=True):
         output = src
         reference_points = self.get_reference_points(spatial_shapes, valid_ratios, device=src.device)
         for _, layer in enumerate(self.layers):
-            output = layer(output, pos, reference_points, spatial_shapes, level_start_index, padding_mask)
+            output = layer(
+                output, pos, reference_points, spatial_shapes, level_start_index, padding_mask,
+                tcpd_z=tcpd_z, tcpd_spatial_mode=tcpd_spatial_mode, tcpd_condition_msdeform=tcpd_condition_msdeform,
+            )
 
         return output
 
@@ -133,7 +147,7 @@ class MSDeformAttnTransformerEncoderOnly(nn.Module):
         valid_ratio = torch.stack([valid_ratio_w, valid_ratio_h], -1)
         return valid_ratio
 
-    def forward(self, srcs, pos_embeds):
+    def forward(self, srcs, pos_embeds, tcpd_z=None, tcpd_spatial_mode="spatial", tcpd_condition_msdeform=True):
         masks = [torch.zeros((x.size(0), x.size(2), x.size(3)), device=x.device, dtype=torch.bool) for x in srcs]
         # prepare input for encoder
         src_flatten = []
@@ -159,7 +173,17 @@ class MSDeformAttnTransformerEncoderOnly(nn.Module):
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
 
         # encoder
-        memory = self.encoder(src_flatten, spatial_shapes, level_start_index, valid_ratios, lvl_pos_embed_flatten, mask_flatten)
+        memory = self.encoder(
+            src_flatten,
+            spatial_shapes,
+            level_start_index,
+            valid_ratios,
+            lvl_pos_embed_flatten,
+            mask_flatten,
+            tcpd_z=tcpd_z,
+            tcpd_spatial_mode=tcpd_spatial_mode,
+            tcpd_condition_msdeform=tcpd_condition_msdeform,
+        )
 
         return memory, spatial_shapes, level_start_index
 
@@ -265,7 +289,29 @@ class MSDeformAttnPixelDecoder(nn.Module):
         self.lateral_convs = lateral_convs[::-1]
         self.output_convs = output_convs[::-1]
 
-    def forward_features(self, features):
+        self.tcpd_target_encoder = TargetConditionEncoder(dim=conv_dim)
+        self.tcpd_fpn_fusion = TCPDFPNFusion(hidden_dim=conv_dim, num_levels=self.num_fpn_levels)
+        self.tcpd_scale_fusion = TCPDScaleFusion(hidden_dim=conv_dim, num_levels=3)
+
+    def forward_features(
+        self,
+        features,
+        tcpd_condition=None,
+        tcpd_spatial_mode="spatial",
+        tcpd_condition_msdeform=True,
+        tcpd_condition_fpn=True,
+        tcpd_condition_output_scale=True,
+    ):
+        """
+        Args:
+            features: dict of backbone feature maps (res2..res5).
+            tcpd_condition: optional [N, C] or [N, 1, C] projected [SEG] embedding.
+            tcpd_spatial_mode: "global" (v1) or "spatial" (v2).
+        """
+        tcpd_z = None
+        if tcpd_condition is not None:
+            tcpd_z = self.tcpd_target_encoder(tcpd_condition)
+
         srcs = []
         pos = []
         # Reverse feature maps into top-down order (from low to high resolution), 'res5' -> 'res3'
@@ -275,7 +321,11 @@ class MSDeformAttnPixelDecoder(nn.Module):
             srcs.append(self.input_proj[idx](x))
             pos.append(self.pe_layer(x).to(x.dtype))
 
-        y, spatial_shapes, level_start_index = self.transformer(srcs, pos)
+        y, spatial_shapes, level_start_index = self.transformer(
+            srcs, pos, tcpd_z=tcpd_z,
+            tcpd_spatial_mode=tcpd_spatial_mode,
+            tcpd_condition_msdeform=tcpd_condition_msdeform,
+        )
         bs = y.shape[0]
 
         split_size_or_sections = [None] * self.transformer_num_feature_levels
@@ -302,8 +352,11 @@ class MSDeformAttnPixelDecoder(nn.Module):
             lateral_conv = self.lateral_convs[idx]
             output_conv = self.output_convs[idx]
             cur_fpn = lateral_conv(x)
-            # Following FPN implementation, we use nearest upsampling here
-            y = cur_fpn + F.interpolate(out[-1].float(), size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False).to(x.dtype)
+            td = F.interpolate(out[-1].float(), size=cur_fpn.shape[-2:], mode="bilinear", align_corners=False).to(x.dtype)
+            if tcpd_z is not None and tcpd_condition_fpn:
+                y = self.tcpd_fpn_fusion(cur_fpn, td, tcpd_z, level_idx=idx)
+            else:
+                y = cur_fpn + td
             y = output_conv(y)
             out.append(y)
 
@@ -312,4 +365,11 @@ class MSDeformAttnPixelDecoder(nn.Module):
                 multi_scale_features.append(o)
                 num_cur_levels += 1
 
-        return self.mask_features(out[-1]), out[0], multi_scale_features
+        mask_features = self.mask_features(out[-1])
+        if tcpd_z is not None:
+            multi_scale_features, mask_features = self.tcpd_scale_fusion(
+                multi_scale_features, mask_features, tcpd_z,
+                enabled=tcpd_condition_output_scale,
+            )
+
+        return mask_features, out[0], multi_scale_features

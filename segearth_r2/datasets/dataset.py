@@ -685,6 +685,146 @@ class RISBenchDataset(RS_Base_Dataset):
         return data_dict
 
 
+def build_earthreason_samples(base_data_path, split="test"):
+    """Expand EarthReason QAs into per-question eval samples."""
+    split = split.lower()
+    split_root = os.path.join(base_data_path, split)
+    if not os.path.isdir(split_root):
+        if os.path.isdir(os.path.join(base_data_path, "QAs")):
+            split_root = base_data_path
+        else:
+            raise FileNotFoundError(f"EarthReason split dir not found: {split_root}")
+
+    image_dir = os.path.join(split_root, "images")
+    label_dir = os.path.join(split_root, "labels")
+    qa_dir = os.path.join(split_root, "QAs")
+    for path in (image_dir, label_dir, qa_dir):
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"EarthReason dir not found: {path}")
+
+    samples = []
+    sample_idx = 0
+    for qa_path in sorted(glob.glob(os.path.join(qa_dir, "*.json"))):
+        sid = os.path.splitext(os.path.basename(qa_path))[0]
+        image_path = os.path.join(image_dir, f"{sid}.jpg")
+        label_path = os.path.join(label_dir, f"{sid}.png")
+        if not os.path.isfile(image_path) or not os.path.isfile(label_path):
+            continue
+
+        with open(qa_path, "r", encoding="utf-8") as f:
+            qa = json.load(f)
+        questions = [str(q).strip() for q in qa.get("questions", []) if q is not None and str(q).strip()]
+        answers = [str(a).strip() for a in qa.get("answer", []) if a is not None and str(a).strip()]
+        if not questions:
+            continue
+
+        mask = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read EarthReason label: {label_path}")
+        gt_mask = (mask > 0).astype(np.uint8)
+
+        for q_idx, question in enumerate(questions):
+            answer = answers[q_idx % len(answers)] if answers else ""
+            samples.append({
+                "id": sample_idx,
+                "image_id": sid,
+                "image_stem": sid,
+                "image_name": f"{sid}.jpg",
+                "image_path": image_path,
+                "label_path": label_path,
+                "question_idx": q_idx,
+                "description": question,
+                "answer": answer,
+                "split_name": split,
+                "gt_mask": gt_mask,
+            })
+            sample_idx += 1
+
+    return samples
+
+
+class EarthReasonDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split="test"):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.split = split.lower()
+        self.reason_file = build_earthreason_samples(base_data_path, split=self.split)
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        instruction = rec["description"]
+        image_path = rec["image_path"]
+        sample_id = rec["id"]
+        image_stem = rec["image_stem"]
+
+        image_BGR = cv2.imread(image_path)
+        if image_BGR is None:
+            raise FileNotFoundError(f"EarthReason image missing: {image_path}")
+
+        gt_mask = rec["gt_mask"]
+        data_dict = {}
+        data_dict["file_name"] = image_path
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = image_stem
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        data_dict["annotations"] = [{
+            "data_id": int(sample_id),
+            "mask_id": 0,
+            "mask": np.expand_dims(gt_mask, axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": image_stem,
+        }]
+
+        prefix_inst = (
+            "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, "
+            "please doing Reasoning Segmentation according to the following instruction:"
+        )
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SEG]"},
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+
+        SEG_token_embedding_indices = torch.zeros_like(text_dict["input_ids"][0])
+        SEG_token_embedding_indices[text_dict["input_ids"][0] == self.SEG_token_id] = 1
+        refer_embedding_indices = torch.zeros_like(text_dict["input_ids"][0])
+        refer_embedding_indices[text_dict["input_ids"][0] == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["mask_num"] = 1
+
+        return data_dict
+
+
 @dataclass
 class DataCollatorForCOCODatasetV2(object):
     """Collate examples for supervised fine-tuning."""

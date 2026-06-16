@@ -21,7 +21,8 @@ Follow the guidelines below to set up, train and evaluate:
 * [Preparation ⚙️](docs/Preparation.md): Instructions for organizing datasets and pretrained weights for proper model training and inference.
 * [Installation 💻](docs/Installation.md): Set up the `segearthr2` conda environment, install dependencies, and clone the repo.
 * [Training 🏋️‍♂️](docs/Training.md): Run `scripts/train.sh` with DeepSpeed, modifying parameters like data and model paths for training.
-* [Evaluation 🎯](docs/Evaluation.md): Run `scripts/eval.sh` to evaluate the model, updating paths as needed. 
+* [Evaluation 🎯](docs/Evaluation.md): Run `scripts/eval.sh` to evaluate the model, updating paths as needed.
+* [Test 4 (query-side smoke) 🧪](docs/Test4.md): Unfreeze LLM last 2 layers + freeze `pixel_decoder`; see `scripts/test4_smoke_train.sh`.
 
 ## ⭐️ Citation
 

@@ -1,4 +1,5 @@
 import os
+import re
 import torch
 import numpy as np
 import cv2
@@ -182,7 +183,80 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
     return to_return
 
 
+def _param_in_llm_layer_indices(param_name: str, layer_indices):
+    if not layer_indices:
+        return False
+    match = re.search(r"\.layers\.(\d+)\.", param_name)
+    if match is None:
+        return False
+    return int(match.group(1)) in layer_indices
+
+
+def _is_mask_head_param(param_name: str) -> bool:
+    return any(k in param_name for k in ("SEG_token_projector", "predictor", "lm_head"))
+
+
 class LLaVATrainer(Trainer):
+
+    def create_optimizer(self):
+        if self.optimizer is not None:
+            return self.optimizer
+
+        use_test4_lr = (
+            getattr(self.args, "test4_mode", False)
+            or getattr(self.args, "unfreeze_llm_last_n", 0) > 0
+        )
+        layer_indices = getattr(self.args, "test4_unfrozen_layer_indices", None) or []
+
+        if use_test4_lr and layer_indices:
+            opt_model = self.model
+            llm_params = []
+            mask_params = []
+            other_params = []
+
+            for name, param in opt_model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if _param_in_llm_layer_indices(name, layer_indices):
+                    llm_params.append(param)
+                elif _is_mask_head_param(name):
+                    mask_params.append(param)
+                else:
+                    other_params.append(param)
+
+            optimizer_grouped_parameters = []
+            if llm_params:
+                optimizer_grouped_parameters.append({
+                    "params": [p for p in llm_params if p.requires_grad],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.llm_lr,
+                })
+            if mask_params:
+                optimizer_grouped_parameters.append({
+                    "params": [p for p in mask_params if p.requires_grad],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.mask_lr,
+                })
+            if other_params:
+                optimizer_grouped_parameters.append({
+                    "params": [p for p in other_params if p.requires_grad],
+                    "weight_decay": self.args.weight_decay,
+                    "lr": self.args.learning_rate,
+                })
+
+            if optimizer_grouped_parameters:
+                optimizer_cls, optimizer_kwargs = self.get_optimizer_cls_and_kwargs(self.args)
+                self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+                if self.args.local_rank in (-1, 0):
+                    for i, group in enumerate(self.optimizer.param_groups):
+                        n_params = sum(p.numel() for p in group["params"])
+                        print(
+                            f"[Test4] optimizer param_group[{i}] lr={group['lr']} "
+                            f"trainable_params={n_params:,}"
+                        )
+                return self.optimizer
+
+        return super().create_optimizer()
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

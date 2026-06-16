@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Legacy: points to segearth+base; for Test 4 use scripts/test4_smoke_eval.sh
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES=0
 export NCCL_P2P_DISABLE=1

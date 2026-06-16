@@ -1,13 +1,6 @@
 # ------------------------------------------------------------------------------------------------
-# Deformable DETR
-# Copyright (c) 2020 SenseTime. All Rights Reserved.
-# Licensed under the Apache License, Version 2.0 [see LICENSE for details]
+# Deformable DETR + SEG-conditioned TCPD-v1/v2 residuals
 # ------------------------------------------------------------------------------------------------
-# Modified from https://github.com/chengdazhi/Deformable-Convolution-V2-PyTorch/tree/pytorch_1.0.0
-# ------------------------------------------------------------------------------------------------
-
-# Copyright (c) Facebook, Inc. and its affiliates.
-# Modified by Bowen Cheng from https://github.com/fundamentalvision/Deformable-DETR
 
 from __future__ import absolute_import
 from __future__ import print_function
@@ -33,24 +26,16 @@ def _is_power_of_2(n):
 
 class MSDeformAttn(nn.Module):
     def __init__(self, d_model=256, n_levels=4, n_heads=8, n_points=4):
-        """
-        Multi-Scale Deformable Attention Module
-        :param d_model      hidden dimension
-        :param n_levels     number of feature levels
-        :param n_heads      number of attention heads
-        :param n_points     number of sampling points per attention head per feature level
-        """
         super().__init__()
         if d_model % n_heads != 0:
             raise ValueError('d_model must be divisible by n_heads, but got {} and {}'.format(d_model, n_heads))
         _d_per_head = d_model // n_heads
-        # you'd better set _d_per_head to a power of 2 which is more efficient in our CUDA implementation
         if not _is_power_of_2(_d_per_head):
-            warnings.warn("You'd better set d_model in MSDeformAttn to make the dimension of each attention head a power of 2 "
-                          "which is more efficient in our CUDA implementation.")
+            warnings.warn(
+                "You'd better set d_model in MSDeformAttn to make the dimension of each attention head a power of 2 "
+                "which is more efficient in our CUDA implementation.")
 
         self.im2col_step = 128
-
         self.d_model = d_model
         self.n_levels = n_levels
         self.n_heads = n_heads
@@ -60,6 +45,27 @@ class MSDeformAttn(nn.Module):
         self.attention_weights = nn.Linear(d_model, n_heads * n_levels * n_points)
         self.value_proj = nn.Linear(d_model, d_model)
         self.output_proj = nn.Linear(d_model, d_model)
+
+        # TCPD-v1 global (target-level broadcast)
+        self.tcpd_gate_offset = nn.Parameter(torch.zeros(1))
+        self.tcpd_gate_attn = nn.Parameter(torch.zeros(1))
+        self.tcpd_delta_offset = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        self.tcpd_delta_attn = nn.Linear(d_model, n_heads * n_levels * n_points)
+        xavier_uniform_(self.tcpd_delta_offset.weight)
+        constant_(self.tcpd_delta_offset.bias, 0.0)
+        xavier_uniform_(self.tcpd_delta_attn.weight)
+        constant_(self.tcpd_delta_attn.bias, 0.0)
+
+        # TCPD-v2 spatial (query + target joint)
+        self.tcpd_spatial_q_proj = nn.Linear(d_model, d_model)
+        self.tcpd_spatial_z_proj = nn.Linear(d_model, d_model)
+        self.tcpd_joint_norm = nn.LayerNorm(d_model)
+        self.tcpd_spatial_delta_offset = nn.Linear(d_model, n_heads * n_levels * n_points * 2)
+        self.tcpd_spatial_delta_attn = nn.Linear(d_model, n_heads * n_levels * n_points)
+        xavier_uniform_(self.tcpd_spatial_delta_offset.weight)
+        constant_(self.tcpd_spatial_delta_offset.bias, 0.0)
+        xavier_uniform_(self.tcpd_spatial_delta_attn.weight)
+        constant_(self.tcpd_spatial_delta_attn.bias, 0.0)
 
         self._reset_parameters()
 
@@ -79,18 +85,45 @@ class MSDeformAttn(nn.Module):
         xavier_uniform_(self.output_proj.weight.data)
         constant_(self.output_proj.bias.data, 0.)
 
-    def forward(self, query, reference_points, input_flatten, input_spatial_shapes, input_level_start_index, input_padding_mask=None):
-        """
-        :param query                       (N, Length_{query}, C)
-        :param reference_points            (N, Length_{query}, n_levels, 2), range in [0, 1], top-left (0,0), bottom-right (1, 1), including padding area
-                                        or (N, Length_{query}, n_levels, 4), add additional (w, h) to form reference boxes
-        :param input_flatten               (N, \sum_{l=0}^{L-1} H_l \cdot W_l, C)
-        :param input_spatial_shapes        (n_levels, 2), [(H_0, W_0), (H_1, W_1), ..., (H_{L-1}, W_{L-1})]
-        :param input_level_start_index     (n_levels, ), [0, H_0*W_0, H_0*W_0+H_1*W_1, H_0*W_0+H_1*W_1+H_2*W_2, ..., H_0*W_0+H_1*W_1+...+H_{L-1}*W_{L-1}]
-        :param input_padding_mask          (N, \sum_{l=0}^{L-1} H_l \cdot W_l), True for padding elements, False for non-padding elements
+    def _apply_tcpd_global(self, sampling_offsets, attention_logits, tcpd_z):
+        N = tcpd_z.shape[0]
+        delta_offset = self.tcpd_delta_offset(tcpd_z).view(
+            N, 1, self.n_heads, self.n_levels, self.n_points, 2
+        )
+        sampling_offsets = sampling_offsets + self.tcpd_gate_offset * delta_offset
+        delta_attn = self.tcpd_delta_attn(tcpd_z).view(
+            N, 1, self.n_heads, self.n_levels * self.n_points
+        )
+        attention_logits = attention_logits + self.tcpd_gate_attn * delta_attn
+        return sampling_offsets, attention_logits
 
-        :return output                     (N, Length_{query}, C)
-        """
+    def _apply_tcpd_spatial(self, query, sampling_offsets, attention_logits, tcpd_z):
+        N, Len_q, _ = query.shape
+        z_proj = self.tcpd_spatial_z_proj(tcpd_z).unsqueeze(1)
+        q_proj = self.tcpd_spatial_q_proj(query)
+        joint = F.gelu(self.tcpd_joint_norm(q_proj + z_proj))
+        delta_offset = self.tcpd_spatial_delta_offset(joint).view(
+            N, Len_q, self.n_heads, self.n_levels, self.n_points, 2
+        )
+        sampling_offsets = sampling_offsets + self.tcpd_gate_offset * delta_offset
+        delta_attn = self.tcpd_spatial_delta_attn(joint).view(
+            N, Len_q, self.n_heads, self.n_levels * self.n_points
+        )
+        attention_logits = attention_logits + self.tcpd_gate_attn * delta_attn
+        return sampling_offsets, attention_logits
+
+    def forward(
+        self,
+        query,
+        reference_points,
+        input_flatten,
+        input_spatial_shapes,
+        input_level_start_index,
+        input_padding_mask=None,
+        tcpd_z=None,
+        tcpd_spatial_mode="spatial",
+        tcpd_condition_msdeform=True,
+    ):
         N, Len_q, _ = query.shape
         N, Len_in, _ = input_flatten.shape
         assert (input_spatial_shapes[:, 0] * input_spatial_shapes[:, 1]).sum() == Len_in
@@ -101,24 +134,54 @@ class MSDeformAttn(nn.Module):
         value = value.view(N, Len_in, self.n_heads, self.d_model // self.n_heads)
         self.sampling_offsets.bias = self.sampling_offsets.bias.to(self.sampling_offsets.weight.dtype)
         sampling_offsets = self.sampling_offsets(query).view(N, Len_q, self.n_heads, self.n_levels, self.n_points, 2)
-        attention_weights = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
-        attention_weights = F.softmax(attention_weights, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+        attention_logits = self.attention_weights(query).view(N, Len_q, self.n_heads, self.n_levels * self.n_points)
 
-        # N, Len_q, n_heads, n_levels, n_points, 3        
-        # input_spatial_shapes是以(h, w)格式存储，reference_points中以(x, y)格式存储，所以需要调换input_spatial_shapes中(h,w)的顺序
+        if tcpd_z is not None and tcpd_condition_msdeform:
+            if tcpd_spatial_mode == "spatial":
+                sampling_offsets, attention_logits = self._apply_tcpd_spatial(
+                    query, sampling_offsets, attention_logits, tcpd_z
+                )
+            else:
+                sampling_offsets, attention_logits = self._apply_tcpd_global(
+                    sampling_offsets, attention_logits, tcpd_z
+                )
+
+        attention_weights = F.softmax(attention_logits, -1).view(N, Len_q, self.n_heads, self.n_levels, self.n_points)
+
         offset_normalizer = torch.stack([input_spatial_shapes[..., 1], input_spatial_shapes[..., 0]], -1)
-        sampling_locations = reference_points[:, :, None, :, None, :] + sampling_offsets / offset_normalizer[None, None, None, :, None, :]    
+        sampling_locations = reference_points[:, :, None, :, None, :] + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
 
         try:
             data_type = value.dtype
-            output = MSDeformAttnFunction.apply(value.float(), input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights.float(), self.im2col_step)
+            output = MSDeformAttnFunction.apply(
+                value.float(), input_spatial_shapes, input_level_start_index,
+                sampling_locations, attention_weights.float(), self.im2col_step,
+            )
             output = output.to(data_type)
-            # output = MSDeformAttnFunction.apply(value, input_spatial_shapes, input_level_start_index, sampling_locations, attention_weights, self.im2col_step)
-        except:
-            # CPU, for debug or test only
+        except Exception:
             output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
 
-        # For FLOPs calculation only
-        # output = ms_deform_attn_core_pytorch(value, input_spatial_shapes, sampling_locations, attention_weights)
         output = self.output_proj(output)
         return output
+
+    def compute_tcpd_deltas(self, query, tcpd_z, tcpd_spatial_mode="spatial"):
+        """Expose offset deltas for spatial adaptivity smoke tests."""
+        if tcpd_spatial_mode == "spatial":
+            z_proj = self.tcpd_spatial_z_proj(tcpd_z).unsqueeze(1)
+            q_proj = self.tcpd_spatial_q_proj(query)
+            joint = F.gelu(self.tcpd_joint_norm(q_proj + z_proj))
+            delta_offset = self.tcpd_spatial_delta_offset(joint).view(
+                query.shape[0], query.shape[1], self.n_heads, self.n_levels, self.n_points, 2
+            )
+            delta_attn = self.tcpd_spatial_delta_attn(joint).view(
+                query.shape[0], query.shape[1], self.n_heads, self.n_levels * self.n_points
+            )
+        else:
+            N = tcpd_z.shape[0]
+            delta_offset = self.tcpd_delta_offset(tcpd_z).view(
+                N, 1, self.n_heads, self.n_levels, self.n_points, 2
+            ).expand(-1, query.shape[1], -1, -1, -1, -1)
+            delta_attn = self.tcpd_delta_attn(tcpd_z).view(
+                N, 1, self.n_heads, self.n_levels * self.n_points
+            ).expand(-1, query.shape[1], -1, -1)
+        return delta_offset, delta_attn

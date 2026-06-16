@@ -195,6 +195,42 @@ class SegEarthR2(MiphaPhiForCausalLM):
             'res5': features[3], # bs, 1024, 32, 32
         }
         return features_dict
+
+    @staticmethod
+    def _repeat_image_features(features_dict, mask_num):
+        """Repeat per-image Swin features to align batch dim with sum_K [SEG] targets."""
+        repeats = torch.tensor(mask_num, device=next(iter(features_dict.values())).device, dtype=torch.long)
+        return {k: torch.repeat_interleave(v, repeats=repeats, dim=0) for k, v in features_dict.items()}
+
+    def _resolve_use_tcpd(self, use_tcpd):
+        if use_tcpd is None:
+            return getattr(self.config, 'use_tcpd', False)
+        return use_tcpd
+
+    def _log_tcpd_config_once(self):
+        if getattr(self, "_tcpd_config_logged", False):
+            return
+        cfg = self.config
+        print(
+            "[TCPD] "
+            f"use_tcpd={getattr(cfg, 'use_tcpd', False)}, "
+            f"tcpd_condition_source={getattr(cfg, 'tcpd_condition_source', 'seg')}, "
+            f"tcpd_spatial_mode={getattr(cfg, 'tcpd_spatial_mode', 'spatial')}, "
+            f"tcpd_condition_msdeform={getattr(cfg, 'tcpd_condition_msdeform', True)}, "
+            f"tcpd_condition_fpn={getattr(cfg, 'tcpd_condition_fpn', True)}, "
+            f"tcpd_condition_output_scale={getattr(cfg, 'tcpd_condition_output_scale', True)}"
+        )
+        self._tcpd_config_logged = True
+
+    def _get_tcpd_forward_kwargs(self):
+        cfg = self.config
+        return dict(
+            tcpd_spatial_mode=getattr(cfg, "tcpd_spatial_mode", "spatial"),
+            tcpd_condition_msdeform=getattr(cfg, "tcpd_condition_msdeform", True),
+            tcpd_condition_fpn=getattr(cfg, "tcpd_condition_fpn", True),
+            tcpd_condition_output_scale=getattr(cfg, "tcpd_condition_output_scale", True),
+        )
+
     def mask_decoder_training_init(self, cfg):
         # Loss parameters:
         deep_supervision = cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION
@@ -620,8 +656,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             SEG_token_embedding_indices=None,
             global_step=None,
             mask_num=None,
-            dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
+            dataset_type=None,
+            use_tcpd: Optional[bool] = None,) -> Union[Tuple, CausalLMOutputWithPast]:
         
+        use_tcpd = self._resolve_use_tcpd(use_tcpd)
+        self._log_tcpd_config_once()
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -658,15 +697,20 @@ class SegEarthR2(MiphaPhiForCausalLM):
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        
-        mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
-            image_features)
-        mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
-        multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
-            for feat in multi_scale_features
-        ]
+
+        if use_tcpd:
+            pd_features = self._repeat_image_features(image_features, mask_num)
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                pd_features, tcpd_condition=SEG_embedding, **self._get_tcpd_forward_kwargs())
+        else:
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                image_features)
+            mask_num = torch.tensor(mask_num, device=mask_features.device)
+            mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
+            multi_scale_features = [
+                torch.repeat_interleave(feat, repeats=mask_num, dim=0)
+                for feat in multi_scale_features
+            ]
 
         mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
 
@@ -783,8 +827,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
-            mask_num = None):
+            mask_num=None,
+            use_tcpd: Optional[bool] = None):
         
+        use_tcpd = self._resolve_use_tcpd(use_tcpd)
+        self._log_tcpd_config_once()
         output_attentions = False
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -810,21 +857,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
 
-        mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
-            image_features)
-    
+        if use_tcpd:
+            pd_features = self._repeat_image_features(image_features, mask_num)
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                pd_features, tcpd_condition=SEG_embedding, **self._get_tcpd_forward_kwargs())
+        else:
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                image_features)
+            mask_num = torch.tensor(mask_num, device=mask_features.device)
+            mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
+            multi_scale_features = [
+                torch.repeat_interleave(feat, repeats=mask_num, dim=0)
+                for feat in multi_scale_features
+            ]
+
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
-        mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
-        multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
-            for feat in multi_scale_features
-        ]
-
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
-
-        
         mask_pred_results = mask_outputs["pred_masks"]
         images = ImageList.from_tensors(images, self.size_divisibility)
         mask_pred_results = F.interpolate(

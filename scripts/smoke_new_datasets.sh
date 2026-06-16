@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Legacy: points to segearth+base; for Test 4 use scripts/test4_*.sh
 # Smoke tests for RefSegRS / RISBench integration (GPU 0).
 set -euo pipefail
 
