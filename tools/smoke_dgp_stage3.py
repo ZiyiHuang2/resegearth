@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Module-level shape check + single-batch forward smoke for Stage 3 DGP-QDTI."""
+"""Module-level shape check + single-batch forward smoke for DGP v6.1."""
 import os
 import sys
 
@@ -23,12 +23,13 @@ from segearth_r2.model.mask_decoder.Mask2Former_Simplify.modeling.transformer_de
 
 def check_modules():
     llm_dim, fuse_dim, mem_dim, n_heads = 2560, 256, 256, 8
-    B, L, Q, Pg, Pl, S = 2, 32, 1, 1, 1, 64
-    adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim, pg_tokens=Pg)
-    refiner = PromptAwareQueryRefiner(fuse_dim, 512)
-    assert float(refiner.gate.detach().item()) == 0.0
+    B, L, Q, S = 2, 32, 1, 64
+    adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim, pg_tokens=1)
+    refiner = PromptAwareQueryRefiner(fuse_dim, 512, gate_g_init=0.01, gate_l_init=0.02)
+    assert abs(float(refiner.gate_g.detach().item()) - 0.01) < 1e-6
+    assert abs(float(refiner.gate_l.detach().item()) - 0.02) < 1e-6
     qdti0 = QuerySpecificTextMemoryBias(fuse_dim, mem_dim, mem_dim, 128, qdti_scale_init=0.0)
-    qdti1 = QuerySpecificTextMemoryBias(fuse_dim, mem_dim, mem_dim, 128, qdti_scale_init=1.0)
+    qdti1 = QuerySpecificTextMemoryBias(fuse_dim, mem_dim, mem_dim, 128, qdti_scale_init=1e-3)
 
     hidden = torch.randn(B, L, llm_dim)
     attn = torch.ones(B, L, dtype=torch.bool)
@@ -36,26 +37,30 @@ def check_modules():
     seg_mask[:, -1] = True
     image_mask = torch.zeros(B, L, dtype=torch.bool)
     image_mask[:, 5:10] = True
+    q_seg = torch.randn(B, Q, fuse_dim)
 
-    p_g, p_l, prompt_tokens, prompt_mask = adapter(
-        hidden, attn, seg_mask, image_mask=image_mask
+    p_g, p_l, prompt_tokens, prompt_mask, health = adapter(
+        hidden, attn, seg_mask, q_seg=q_seg, image_mask=image_mask
     )
-    assert p_g.shape == (B, Pg, fuse_dim), p_g.shape
-    assert p_l.shape == (B, Pl, fuse_dim), p_l.shape
-    assert prompt_tokens.shape == (B, Pg + Pl, fuse_dim), prompt_tokens.shape
-    assert prompt_mask.shape == (B, Pg + Pl), prompt_mask.shape
+    assert p_g.shape == (B, Q, fuse_dim), p_g.shape
+    assert p_l.shape == (B, Q, fuse_dim), p_l.shape
+    assert prompt_tokens.shape == (B, 2 * Q, fuse_dim), prompt_tokens.shape
+    assert prompt_mask.shape == (B, 2 * Q), prompt_mask.shape
+    assert health["detail_prompt_source_name"] == "decoupled_attn"
 
     seg_hidden, seg_valid = pack_seg_hidden_states_bq(hidden, seg_mask)
     assert seg_hidden.shape == (B, Q, llm_dim), seg_hidden.shape
-    seg_emb = torch.randn(B, Q, fuse_dim)
-    q_ref = refiner(seg_emb, prompt_tokens, seg_query_mask=seg_valid, prompt_mask=prompt_mask)
+    q_ref, ref_health = refiner(seg_emb := q_seg, p_g, p_l, seg_query_mask=seg_valid, prompt_mask=prompt_mask)
     assert q_ref.shape == (B, Q, fuse_dim), q_ref.shape
+    assert "refiner_delta_over_seg" in ref_health
+    assert "query_refiner_gate_g" in ref_health
+    assert "delta_g_norm" in ref_health
 
     mask_num = torch.tensor([1, 2])
     q_exp = expand_bq_for_mask_num(q_ref, mask_num)
     assert q_exp.shape == (3, Q, fuse_dim), q_exp.shape
     p_exp = expand_bp_for_mask_num(prompt_tokens, mask_num)
-    assert p_exp.shape == (3, Pg + Pl, fuse_dim), p_exp.shape
+    assert p_exp.shape == (3, 2 * Q, fuse_dim), p_exp.shape
 
     memory = torch.randn(S, q_exp.shape[0], mem_dim)
     query = q_exp.permute(1, 0, 2)
@@ -66,6 +71,64 @@ def check_modules():
     bias1, _ = qdti1(memory, query, p_exp, p_mask_exp, n_heads)
     assert bias1.shape == (q_exp.shape[0] * n_heads, Q, S), bias1.shape
     print("[OK] module shape checks passed")
+
+
+def check_sigmoid_gate_init():
+    refiner = PromptAwareQueryRefiner(256, 512, use_sigmoid_gate=True)
+    gate_g = float(torch.sigmoid(refiner.gate_g_logit).item())
+    gate_l = float(torch.sigmoid(refiner.gate_l_logit).item())
+    assert abs(gate_g - 0.01) < 0.002, gate_g
+    assert abs(gate_l - 0.02) < 0.002, gate_l
+    print("[OK] sigmoid gate init (not sigmoid(-2))")
+
+
+def check_instruction_mask():
+    llm_dim, fuse_dim, B, L, Q = 2560, 256, 1, 12, 1
+    adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim)
+    hidden = torch.randn(B, L, llm_dim)
+    attn = torch.ones(B, L, dtype=torch.bool)
+    attn[:, -2:] = False
+    seg_mask = torch.zeros(B, L, dtype=torch.bool)
+    seg_mask[:, -3] = True
+    instruction = torch.zeros(B, L, dtype=torch.bool)
+    instruction[:, :8] = True
+    q_seg = torch.randn(B, Q, fuse_dim)
+    _, _, _, _, health = adapter(
+        hidden, attn, seg_mask, q_seg=q_seg, instruction_mask=instruction
+    )
+    assert health["detail_prompt_source_name"] == "decoupled_attn"
+    print("[OK] instruction-only text mask path")
+
+
+def check_decoupled_pl():
+    llm_dim, fuse_dim, B, L, Q = 2560, 256, 1, 16, 2
+    adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim)
+    hidden = torch.randn(B, L, llm_dim)
+    attn = torch.ones(B, L, dtype=torch.bool)
+    seg_mask = torch.zeros(B, L, dtype=torch.bool)
+    seg_mask[:, -2:] = True
+    q_seg = torch.randn(B, Q, fuse_dim)
+    _, p_l, _, _, health = adapter(hidden, attn, seg_mask, q_seg=q_seg)
+    assert p_l.shape == (B, Q, fuse_dim)
+    assert health["detail_prompt_source_name"] == "decoupled_attn"
+    print("[OK] decoupled P_l path (Q_detail always, no SEG fallback)")
+
+
+def check_refer_span_path():
+    llm_dim, fuse_dim, B, L, Q = 2560, 256, 1, 16, 1
+    adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim)
+    hidden = torch.randn(B, L, llm_dim)
+    attn = torch.ones(B, L, dtype=torch.bool)
+    seg_mask = torch.zeros(B, L, dtype=torch.bool)
+    seg_mask[:, -1] = True
+    refer_span = torch.zeros(B, L, dtype=torch.bool)
+    refer_span[:, 4:7] = True
+    q_seg = torch.randn(B, Q, fuse_dim)
+    _, _, _, _, health = adapter(
+        hidden, attn, seg_mask, q_seg=q_seg, refer_span_mask=refer_span
+    )
+    assert health["detail_prompt_source_name"] == "refer_id"
+    print("[OK] refer span diagnostic source (P_l query still Q_detail)")
 
 
 def check_baseline_equivalence():
@@ -79,6 +142,20 @@ def check_baseline_equivalence():
     out_b = layer(tgt, mem)
     assert torch.allclose(out_a, out_b), "extra_attn_bias=None must match baseline"
     print("[OK] extra_attn_bias=None baseline equivalence")
+
+
+def check_last1_qdti_layer():
+    from segearth_r2.model.mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder import (
+        mask2former_transformer_decoder as m2f,
+    )
+    dec = m2f.MultiScaleMaskedTransformerDecoderForOPTPreTrain.__new__(
+        m2f.MultiScaleMaskedTransformerDecoderForOPTPreTrain
+    )
+    dec.num_layers = 6
+    dec.qdti_apply_layers = "last1"
+    assert dec._qdti_layer_active(5) is True
+    assert dec._qdti_layer_active(4) is False
+    print("[OK] last1 QDTI layer gating")
 
 
 def check_fail_fast():
@@ -102,30 +179,35 @@ def check_model_keys():
 
     class Args:
         use_dgp_qdti = True
-        use_qdti_bias = True
+        use_qdti_bias = False
         dgp_fuse_dim = 256
         dgp_refiner_hidden_dim = 512
         dgp_pg_tokens = 1
         qdti_bias_dim = 128
         qdti_init_std = 1e-3
         qdti_max_abs = 0.01
-        qdti_apply_layers = "last3"
-        qdti_scale_init = 0.0
+        qdti_apply_layers = "last1"
+        qdti_scale_init = 1e-3
         scale_hard_loss_weight = 0.0
         load_mask2former = False
         vision_tower_mask = ""
 
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, torch_dtype=torch.float16)
     model.initial_mask_module(pretrained_path=None, model_args=Args())
-    keys = [k for k in model.state_dict().keys() if any(m in k for m in SegEarthR2.DGP_QDTI_STATE_KEY_MARKERS)]
-    expected = {"prompt_adapter", "query_refiner", "query_specific_text_memory_bias"}
+    keys = [k for k in model.state_dict().keys() if any(m in k for m in SegEarthR2.DGP_PROMPT_KEY_MARKERS)]
+    expected = {"prompt_adapter", "query_refiner"}
     found = {m for k in keys for m in expected if m in k}
     assert found == expected, f"missing DGP modules in state_dict: {expected - found}"
-    print(f"[OK] training model DGP-QDTI keys present ({len(keys)} tensors)")
+    print(f"[OK] training model DGP keys present ({len(keys)} tensors)")
 
 
 if __name__ == "__main__":
     check_modules()
+    check_sigmoid_gate_init()
+    check_instruction_mask()
+    check_decoupled_pl()
+    check_refer_span_path()
     check_baseline_equivalence()
+    check_last1_qdti_layer()
     check_fail_fast()
     check_model_keys()

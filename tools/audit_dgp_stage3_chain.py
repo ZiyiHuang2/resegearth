@@ -250,21 +250,25 @@ def audit_shape(repo: str, report: AuditReport) -> None:
     image_mask[:, 5:10] = True
 
     adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim, pg_tokens=1)
-    p_g, p_l, prompt_tokens, prompt_mask = adapter(hidden, attn, seg_mask, image_mask=image_mask)
+    q_seg = torch.randn(B, 1, fuse_dim)
+    p_g, p_l, prompt_tokens, prompt_mask, _ = adapter(hidden, attn, seg_mask, q_seg=q_seg, image_mask=image_mask)
     if p_g.shape[-1] != 256 or p_l.shape[-1] != 256 or prompt_tokens.shape[-1] != 256:
         report.add("shape.adapter.prompt_dim", "FAIL", f"P_g={p_g.shape} P_l={p_l.shape} prompt={prompt_tokens.shape}")
     else:
         report.add("shape.adapter.prompt_dim", "PASS", f"P_g={tuple(p_g.shape)} P_l={tuple(p_l.shape)} prompt={tuple(prompt_tokens.shape)}")
 
-    refiner = PromptAwareQueryRefiner(fuse_dim, 512)
-    gate_init = float(refiner.gate.detach().item())
-    if gate_init == 0.0:
-        report.add("shape.refiner.gate_init", "PASS", f"gate={gate_init}")
+    refiner = PromptAwareQueryRefiner(fuse_dim, 512, gate_g_init=0.01, gate_l_init=0.02)
+    gate_g_init = float(refiner.gate_g.detach().item())
+    gate_l_init = float(refiner.gate_l.detach().item())
+    if abs(gate_g_init - 0.01) < 1e-6 and abs(gate_l_init - 0.02) < 1e-6:
+        report.add("shape.refiner.gate_init", "PASS", f"gate_g={gate_g_init} gate_l={gate_l_init}")
     else:
-        report.add("shape.refiner.gate_init", "FAIL", f"gate={gate_init}, expected 0.0")
+        report.add("shape.refiner.gate_init", "FAIL", f"gate_g={gate_g_init} gate_l={gate_l_init}, expected 0.01/0.02")
     for Q in (1, 3):
-        seg_emb = torch.randn(B, Q, fuse_dim)
-        q_ref = refiner(seg_emb, prompt_tokens)
+        q_seg_q = torch.randn(B, Q, fuse_dim)
+        p_g_q, p_l_q, _, _, _ = adapter(hidden, attn, seg_mask, q_seg=q_seg_q, image_mask=image_mask)
+        seg_emb = q_seg_q
+        q_ref, _ = refiner(seg_emb, p_g_q, p_l_q)
         if q_ref.shape != seg_emb.shape:
             report.add(f"shape.refiner.Q={Q}", "FAIL", f"got {q_ref.shape}")
         else:

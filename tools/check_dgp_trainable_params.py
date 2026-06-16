@@ -152,23 +152,26 @@ def backward_grad_report(model, run_backward: bool = True) -> dict:
 
     seg_hidden_bq, seg_valid = pack_seg_hidden_states_bq(hidden, seg_mask)
     seg_emb = m.SEG_token_projector(seg_hidden_bq)
-    _, _, prompt_tokens, prompt_mask = m.prompt_adapter(
+    q_seg = seg_emb
+    p_g, p_l, _, prompt_mask, _ = m.prompt_adapter(
         hidden_states=hidden,
         attention_mask=attn,
         seg_mask=seg_mask,
+        q_seg=q_seg,
     )
-    q_ref = m.query_refiner(seg_emb, prompt_tokens, seg_query_mask=seg_valid, prompt_mask=prompt_mask)
+    q_ref, _ = m.query_refiner(seg_emb, p_g, p_l, seg_query_mask=seg_valid, prompt_mask=prompt_mask)
     loss_dgp = q_ref.sum()
     loss_dgp.backward(retain_graph=True)
 
     gate_mod = m.query_refiner
-    gate = gate_mod.gate
-    refiner_linear = gate_mod.ffn[0].weight
+    gate_g = gate_mod.gate_g
+    refiner_ln = gate_mod.ln_q.weight
 
     report = {
-        "query_refiner.gate": _grad_norm(gate),
-        "query_refiner.ffn0.weight": _grad_norm(refiner_linear),
+        "query_refiner.gate_g": _grad_norm(gate_g),
+        "query_refiner.ln_q.weight": _grad_norm(refiner_ln),
         "prompt_adapter.proj.weight": _grad_norm(m.prompt_adapter.proj.weight),
+        "prompt_adapter.detail_proj.weight": _grad_norm(m.prompt_adapter.detail_proj.weight),
     }
 
     qdti_mod = getattr(m.predictor, "query_specific_text_memory_bias", None)
@@ -266,7 +269,15 @@ def build_model_like_train(model_args, training_args):
     return model
 
 
-def apply_lora_and_trainable_flags(model, model_args, training_args):
+def apply_lora_and_trainable_flags(model, model_args, training_args, stage_a: bool = False):
+    if stage_a:
+        train_module_list = ["prompt_adapter", "query_refiner"]
+        model.requires_grad_(False)
+        for n, p in model.named_parameters():
+            if any(x in n for x in train_module_list):
+                p.requires_grad = True
+        return model, train_module_list, None
+
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
     ]
@@ -323,12 +334,21 @@ def checkpoint_key_report(ckpt_dir: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--skip-backward", action="store_true")
+    parser.add_argument("--stage-a", action="store_true", help="Stage A freeze policy (no LoRA)")
     parser.add_argument("--checkpoint", default="", help="optional ZeRO checkpoint dir")
+    parser.add_argument("--model-path", default="", help="override model_name_or_path (e.g. baseline merged_model)")
     parser.add_argument("--lora-r", type=int, default=4)
     args = parser.parse_args()
 
     model_args = ModelArgs()
+    if args.model_path:
+        model_args.model_name_or_path = args.model_path
     training_args = TrainArgs()
+    model_args.use_qdti_bias = False if args.stage_a else True
+    if args.stage_a:
+        model_args.dgp_training_stage = "a"
+        model_args.qdti_apply_layers = "disabled"
+        training_args.lora_enable = False
     training_args.lora_r = args.lora_r
 
     if not os.path.isdir(model_args.model_name_or_path):
@@ -346,7 +366,11 @@ def main() -> int:
     print("=" * 60)
     print("[2] Apply LoRA + train_module_list requires_grad (train.py order)")
     print("=" * 60)
-    model, train_module_list, peft_before = apply_lora_and_trainable_flags(model, model_args, training_args)
+    model, train_module_list, peft_before = apply_lora_and_trainable_flags(
+        model, model_args, training_args, stage_a=args.stage_a
+    )
+    if args.stage_a:
+        SegEarthR2.validate_stage_a_trainable_params(model, rank0_log=True)
     print(f"[INFO] train_module_list={train_module_list}")
 
     print("=" * 60)
