@@ -601,7 +601,70 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
-           
+
+    @staticmethod
+    def _flatten_joint_decoder_outputs(per_image_outputs):
+        """Reflatten per-image joint decoder outputs to baseline [sumK, 1, H, W]."""
+        pred_masks = torch.cat(
+            [out["pred_masks"].squeeze(0).unsqueeze(1) for out in per_image_outputs],
+            dim=0,
+        )
+
+        pred_seg_logits = per_image_outputs[0].get("pred_SEG_logits")
+        if pred_seg_logits is not None:
+            pred_seg_logits = torch.cat(
+                [out["pred_SEG_logits"] for out in per_image_outputs],
+                dim=0,
+            )
+
+        num_aux = len(per_image_outputs[0]["aux_outputs"])
+        aux_outputs = []
+        for layer_idx in range(num_aux):
+            aux_pred_masks = torch.cat(
+                [
+                    out["aux_outputs"][layer_idx]["pred_masks"].squeeze(0).unsqueeze(1)
+                    for out in per_image_outputs
+                ],
+                dim=0,
+            )
+            aux_entry = {"pred_masks": aux_pred_masks, "pred_SEG_logits": None}
+            aux_seg_logits = per_image_outputs[0]["aux_outputs"][layer_idx].get("pred_SEG_logits")
+            if aux_seg_logits is not None:
+                aux_entry["pred_SEG_logits"] = torch.cat(
+                    [
+                        out["aux_outputs"][layer_idx]["pred_SEG_logits"]
+                        for out in per_image_outputs
+                    ],
+                    dim=0,
+                )
+            aux_outputs.append(aux_entry)
+
+        return {
+            "pred_masks": pred_masks,
+            "pred_SEG_logits": pred_seg_logits,
+            "aux_outputs": aux_outputs,
+        }
+
+    def _run_joint_predictor_by_image(
+        self, multi_scale_features, mask_features, seg_embedding, mask_num
+    ):
+        """Per-image joint decode: Q=K_i queries share self-attention within each image."""
+        if torch.is_tensor(mask_num):
+            mask_num_list = mask_num.tolist()
+        else:
+            mask_num_list = list(mask_num)
+
+        seg_groups = torch.split(seg_embedding.squeeze(1), mask_num_list, dim=0)
+        per_image_outputs = []
+        for i, seg_group in enumerate(seg_groups):
+            seg_i = seg_group.unsqueeze(0)
+            mask_features_i = mask_features[i : i + 1]
+            multi_scale_features_i = [feat[i : i + 1] for feat in multi_scale_features]
+            per_image_outputs.append(
+                self.predictor(multi_scale_features_i, mask_features_i, None, None, seg_i)
+            )
+        return SegEarthR2._flatten_joint_decoder_outputs(per_image_outputs)
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -656,19 +719,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        if outputs.attentions is not None:
+            attentions = [
+                attention_item.sum(dim=1)
+                for attention_item in outputs.attentions
+                if attention_item is not None
+            ]
+        else:
+            attentions = []
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
         mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
-        multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
-            for feat in multi_scale_features
-        ]
-
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        mask_outputs = self._run_joint_predictor_by_image(
+            multi_scale_features, mask_features, SEG_embedding, mask_num
+        )
 
         # 开始计算loss
         loss = None
@@ -741,17 +807,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
         masks_down = masks_down.view(masks_down.size(0), -1)
         masks_down[masks_down > 0] = 1
         
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
-        for full_attention_map in attentions:
-            batch_attentions_list = []
-            for batch_idx in range(bs):
-                attention_map = full_attention_map[batch_idx]
-                SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
-                image_features_mask = image_features_indices[batch_idx].bool()
-                attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
-                batch_attentions_list.append(attention)
-            batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
-            loss_attention += self.attention_loss(batch_attentions, masks_down)
+        loss_attention = torch.tensor(0.0, device=mask_loss.device)
+        if attentions:
+            for full_attention_map in attentions:
+                batch_attentions_list = []
+                for batch_idx in range(bs):
+                    attention_map = full_attention_map[batch_idx]
+                    SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
+                    image_features_mask = image_features_indices[batch_idx].bool()
+                    attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
+                    batch_attentions_list.append(attention)
+                batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
+                loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
         loss = llm_loss + mask_loss + 0.01 * loss_attention
 
@@ -816,13 +883,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
         images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
         images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
         mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
-        multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
-            for feat in multi_scale_features
-        ]
-
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        mask_outputs = self._run_joint_predictor_by_image(
+            multi_scale_features, mask_features, SEG_embedding, mask_num
+        ) 
 
         
         mask_pred_results = mask_outputs["pred_masks"]

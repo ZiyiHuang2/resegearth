@@ -504,20 +504,16 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # QxNxC
+        if seg_query is None:
+            output = SEG_embedding.permute(1, 0, 2)
+        else:
+            output = seg_query.permute(1, 0, 2)  # output: [Q, batch_size, mask_dim(256)]
+
+        # QxNxC — match output shape so joint decode (Q=K_i, N=1) works
         if self.use_seg_query:
             query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         else:
-            query_embed = torch.zeros(
-                self.new_query_embed.weight.shape[0], bs, self.new_query_embed.weight.shape[-1], 
-                device=SEG_embedding.device, dtype=SEG_embedding.dtype
-            )
-        
-        if seg_query is None:
-            # output = self.new_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
-            output = SEG_embedding.permute(1, 0, 2)
-        else:
-            output = seg_query.permute(1, 0, 2) # output: [100, batch_size, mask_dim(256)]
+            query_embed = torch.zeros_like(output)
             
         predictions_SEG_class = []        
         predictions_mask = []

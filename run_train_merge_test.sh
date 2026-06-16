@@ -1,4 +1,27 @@
 #!/usr/bin/env bash
+# =============================================================================
+# SegEarth-R2 Base 全流程：Train → Merge → Eval → Metrics
+# 数据集：LaSeRS（dataset_name=lasers）
+#
+# ⚠️ 官方 LaSeRS **没有 val 划分**，只有：
+#   ${BASE_DATA_PATH}/
+#     train/
+#       images/
+#       annotations/train_data.json          # 训练集（有 GT mask）
+#     test/
+#       images/
+#       annotations/
+#         test_short_query.json              # 9 个 benchmark 子集，均有 GT mask
+#         test_long_query.json
+#         test_explicit.json / test_implicit.json
+#         test_single_cate.json / test_multi_cate.json
+#         test_instance_level.json / test_part_level.json / test_sematic_level.json
+#
+# 数据逻辑（已对齐官方 release）：
+#   - 训练：train_data.json；训练期 validation 从 train 固定 seed holdout 5%
+#   - 最终评估：test/annotations/*.json（9 个 benchmark，eval.py 全部跑一遍）
+#   - 指标：eval_val_metrics.py LASERS_BENCHMARK=all → 每个 benchmark 单独 json + summary
+# =============================================================================
 set -euo pipefail
 
 ########################################
@@ -7,58 +30,63 @@ set -euo pipefail
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export WANDB_PROJECT=segearth-standard
-export WANDB_NAME=base-siglip1-28w-gd4    
+export WANDB_NAME=base-lasers-siglip1-5w-gd4
 export WANDB_INIT_TIMEOUT=300
 unset CUDA_VISIBLE_DEVICES
 
-GPU_SLOT="localhost:1"
-GPU_ID="1"
+GPU_SLOT="localhost:0"
+GPU_ID="0"
 MASTER_PORT="29500"
 
 ########################################
 # Project dir
 ########################################
-REPO_DIR="/home/wangchengjun/huangziyi/reseg/segearth+base"
+REPO_DIR="/root/rivermind-data/huangziyi/reseg/segearth+base"
 cd "${REPO_DIR}"
 
 ########################################
 # Common paths
 ########################################
-MODEL_NAME_OR_PATH="/home/wangchengjun/huangziyi/reseg/pretrained_model/mllm/Mipha-3B"
-VISION_TOWER="/home/wangchengjun/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384"
-VISION_TOWER_MASK="/home/wangchengjun/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl"
+MODEL_NAME_OR_PATH="/root/rivermind-data/huangziyi/reseg/pretrained_model/mllm/Mipha-3B"
+VISION_TOWER="/root/rivermind-data/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384"
+VISION_TOWER_MASK="/root/rivermind-data/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl"
 MASK_CONFIG="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml"
 
+
 ########################################
-# Dataset config
+# LaSeRS 数据集配置
+#   官方划分：train + test（无 val）
+#   EVAL_SPLIT=test；LASERS_BENCHMARK=all 表示 9 个 test benchmark 都算指标
 ########################################
-BASE_DATA_PATH="/home/wangchengjun/huangziyi/data/RRSISD"
-DATASET_NAME="rrsisd"
-TEST_SPLIT="test"
+BASE_DATA_PATH="/root/rivermind-data/huangziyi/data/LaSeRS"
+DATASET_NAME="lasers"
+EVAL_SPLIT="test"
+LASERS_BENCHMARK="${LASERS_BENCHMARK:-all}"
+LASERS_HOLDOUT_RATIO="${LASERS_HOLDOUT_RATIO:-0.05}"
 
 ########################################
 # Output
 ########################################
-OUTPUT_DIR="/home/wangchengjun/huangziyi/reseg/output/base/standard-base-siglip1-28w-gd4"
+OUTPUT_DIR="/root/rivermind-data/huangziyi/reseg/output/base/standard-base-lasers-siglip1-5w-gd4"
 MERGED_DIR="${OUTPUT_DIR}/merged_model"
-TEST_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
+EVAL_OUTPUT_DIR="${OUTPUT_DIR}/test_results"
 
 ########################################
-# Eval metrics config (auto upload to W&B)
+# Eval metrics
 ########################################
-EVAL_METRICS_SCRIPT="/home/wangchengjun/huangziyi/reseg/eval_val_metrics.py"
+EVAL_METRICS_SCRIPT="/root/rivermind-data/huangziyi/reseg/eval_val_metrics.py"
 EVAL_USE_WANDB="True"
 EVAL_WANDB_PROJECT="segearth-eval-standard-val"
-EVAL_WANDB_RUN_NAME="base-siglip1-28w-gd4"
+EVAL_WANDB_RUN_NAME="base-lasers-siglip1-5w-gd4"
 
 ########################################
 # Train config
 ########################################
-MAX_STEPS="70000"
-PER_DEVICE_TRAIN_BATCH_SIZE="1"
-GRADIENT_ACCUMULATION_STEPS="4"
+MAX_STEPS="50000"
+PER_DEVICE_TRAIN_BATCH_SIZE="4"
+GRADIENT_ACCUMULATION_STEPS="1"
 
-SAVE_STEPS="2000"
+SAVE_STEPS="5000"
 SAVE_TOTAL_LIMIT="2"
 
 LEARNING_RATE="1e-4"
@@ -71,7 +99,7 @@ BF16="True"
 TF32="False"
 MODEL_MAX_LENGTH="2048"
 GRADIENT_CHECKPOINTING="False"
-DATALOADER_NUM_WORKERS="4"
+DATALOADER_NUM_WORKERS="8"
 
 LORA_R="8"
 LORA_ALPHA="16"
@@ -165,7 +193,7 @@ eval_model () {
     --model_path "${model_dir}" \
     --output_dir "${out_dir}" \
     --dataset_name "${DATASET_NAME}" \
-    --split "${TEST_SPLIT}" \
+    --split "${EVAL_SPLIT}" \
     --eval_batch_size 1 \
     --zip_results False
 }
@@ -184,64 +212,49 @@ run_eval_metrics () {
   WANDB_RUN_NAME="${run_name}" \
   DATASET_TYPE="${DATASET_NAME}" \
   BASE_DATA_PATH="${BASE_DATA_PATH}" \
-  SPLIT="${TEST_SPLIT}" \
+  SPLIT="${EVAL_SPLIT}" \
+  LASERS_BENCHMARK="${LASERS_BENCHMARK}" \
   PRED_DIR="${pred_dir}" \
   python "${EVAL_METRICS_SCRIPT}"
 }
 
 ########################################
-# Preflight
+# Preflight（LaSeRS train + test，无 val）
 ########################################
 echo "========================================"
-echo "[0/6] Preflight checks"
+echo "[0/6] Preflight checks (LaSeRS train+test)"
 echo "========================================"
 
 echo "[INFO] REPO_DIR=${REPO_DIR}"
-echo "[INFO] MODEL_NAME_OR_PATH=${MODEL_NAME_OR_PATH}"
-echo "[INFO] VISION_TOWER=${VISION_TOWER}"
-echo "[INFO] VISION_TOWER_MASK=${VISION_TOWER_MASK}"
-echo "[INFO] MASK_CONFIG=${MASK_CONFIG}"
 echo "[INFO] BASE_DATA_PATH=${BASE_DATA_PATH}"
+echo "[INFO] DATASET_NAME=${DATASET_NAME}"
+echo "[INFO] EVAL_SPLIT=${EVAL_SPLIT} (LaSeRS 无 val，评估应对 test 子集)"
 echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
-echo "[INFO] GPU_SLOT=${GPU_SLOT}"
-echo "[INFO] LORA_R=${LORA_R}"
-echo "[INFO] LEARNING_RATE=${LEARNING_RATE}"
-echo "[INFO] EVAL_METRICS_SCRIPT=${EVAL_METRICS_SCRIPT}"
-echo "[INFO] EVAL_WANDB_PROJECT=${EVAL_WANDB_PROJECT}"
-echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
 
 if [[ ! -d "${MODEL_NAME_OR_PATH}" ]]; then
   echo "[ERROR] model path not found: ${MODEL_NAME_OR_PATH}"
   exit 1
 fi
 
-if [[ ! -d "${VISION_TOWER}" ]]; then
-  echo "[ERROR] vision tower not found: ${VISION_TOWER}"
+if [[ ! -f "${BASE_DATA_PATH}/train/annotations/train_data.json" ]]; then
+  echo "[ERROR] train annotation not found"
+  echo "[HINT] 解压: tar -xzf ${BASE_DATA_PATH}/train.tar.gz -C ${BASE_DATA_PATH}"
   exit 1
 fi
 
-if [[ ! -f "${VISION_TOWER_MASK}" ]]; then
-  echo "[ERROR] vision tower mask not found: ${VISION_TOWER_MASK}"
+if [[ ! -d "${BASE_DATA_PATH}/train/images" ]]; then
+  echo "[ERROR] train images not found: ${BASE_DATA_PATH}/train/images"
   exit 1
 fi
 
-if [[ ! -f "${MASK_CONFIG}" ]]; then
-  echo "[ERROR] mask config not found: ${MASK_CONFIG}"
+if [[ ! -d "${BASE_DATA_PATH}/test/annotations" ]]; then
+  echo "[ERROR] test annotations not found"
+  echo "[HINT] 解压: tar -xzf ${BASE_DATA_PATH}/test.tar.gz -C ${BASE_DATA_PATH}"
   exit 1
 fi
 
-if [[ ! -f "${BASE_DATA_PATH}/rrsisd/refs(unc).p" ]]; then
-  echo "[ERROR] refs file not found: ${BASE_DATA_PATH}/rrsisd/refs(unc).p"
-  exit 1
-fi
-
-if [[ ! -f "${BASE_DATA_PATH}/rrsisd/instances.json" ]]; then
-  echo "[ERROR] instances file not found: ${BASE_DATA_PATH}/rrsisd/instances.json"
-  exit 1
-fi
-
-if [[ ! -d "${BASE_DATA_PATH}/images" ]]; then
-  echo "[ERROR] images dir not found: ${BASE_DATA_PATH}/images"
+if [[ ! -d "${BASE_DATA_PATH}/test/images" ]]; then
+  echo "[ERROR] test images not found: ${BASE_DATA_PATH}/test/images"
   exit 1
 fi
 
@@ -250,20 +263,15 @@ if [[ ! -f "scripts/zero1.json" ]]; then
   exit 1
 fi
 
-if [[ ! -f "${EVAL_METRICS_SCRIPT}" ]]; then
-  echo "[ERROR] eval metrics script not found: ${EVAL_METRICS_SCRIPT}"
-  exit 1
-fi
-
 mkdir -p "${OUTPUT_DIR}"
-
-echo "[OK] preflight passed"
+echo "[OK] preflight passed (train + test present, no val required)"
 
 ########################################
 # 1) Train
+#    train_data.json；eval 用同文件 holdout 5%（非 test，避免泄漏）
 ########################################
 echo "========================================"
-echo "[1/6] Training (includes val + best ckpt)"
+echo "[1/6] Training on LaSeRS train (holdout eval)"
 echo "========================================"
 
 deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/train/train.py \
@@ -296,6 +304,8 @@ deepspeed --master_port="${MASTER_PORT}" --include="${GPU_SLOT}" segearth_r2/tra
   --switch_bs "${SWITCH_BS}" \
   --seed "${SEED}" \
   --data_seed "${DATA_SEED}" \
+  --lasers_holdout_ratio "${LASERS_HOLDOUT_RATIO}" \
+  --lasers_holdout_seed "${DATA_SEED}" \
   --report_to wandb
 
 ########################################
@@ -343,24 +353,23 @@ fi
 echo "[OK] merged config.json present"
 
 ########################################
-# 5) Eval merged model + upload eval metrics
+# 5) Eval on LaSeRS test benchmarks + metrics
 ########################################
 echo "========================================"
-echo "[5/6] Eval merged model + upload eval metrics"
+echo "[5/6] Eval on LaSeRS test benchmarks + metrics"
 echo "========================================"
 
-eval_model "${MERGED_DIR}" "${TEST_OUTPUT_DIR}"
-run_eval_metrics "${TEST_OUTPUT_DIR}" "${EVAL_WANDB_RUN_NAME}"
+eval_model "${MERGED_DIR}" "${EVAL_OUTPUT_DIR}"
+run_eval_metrics "${EVAL_OUTPUT_DIR}" "${EVAL_WANDB_RUN_NAME}"
 
 ########################################
 # 6) Done
 ########################################
 echo "========================================"
 echo "[6/6] DONE"
+echo "Dataset           : LaSeRS (train + test, no val)"
 echo "Output dir        : ${OUTPUT_DIR}"
 echo "Selected ckpt     : ${BEST_CHECKPOINT}"
 echo "Merged model      : ${MERGED_DIR}"
-echo "Test outputs      : ${TEST_OUTPUT_DIR}"
-echo "Eval W&B project  : ${EVAL_WANDB_PROJECT}"
-echo "Eval W&B run name : ${EVAL_WANDB_RUN_NAME}"
-echo "========================================"
+echo "Metrics summary   : ${OUTPUT_DIR}/lasers_${EVAL_SPLIT}_metrics_summary.json"
+echo "Metrics per bench : ${OUTPUT_DIR}/lasers_${EVAL_SPLIT}_test_*_metrics.json  (e.g. lasers_test_test_short_query_metrics.json)"
