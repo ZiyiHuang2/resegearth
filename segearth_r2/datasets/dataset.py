@@ -223,6 +223,7 @@ class RRSISDDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SET_token_id = self.tokenizer.convert_tokens_to_ids("[SET]")
 
         # 官方目录结构
         self.image_dir = os.path.join(base_data_path, "images", "rrsisd", "JPEGImages")
@@ -264,7 +265,7 @@ class RRSISDDataset(RS_Base_Dataset):
             cat_name = self.category_dict.get(cat_id, "target")
             instruction = f"segment the {cat_name} in this remote sensing image"
 
-        answer = "[SEG]"
+        answer = "[SET][SEG]"
 
         ann = self.ann_dict[ref["ann_id"]]
 
@@ -324,6 +325,9 @@ class RRSISDDataset(RS_Base_Dataset):
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
 
+        SET_token_embedding_indices = torch.zeros_like(input_ids)
+        SET_token_embedding_indices[input_ids == self.SET_token_id] = 1
+
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
 
@@ -334,10 +338,28 @@ class RRSISDDataset(RS_Base_Dataset):
         data_dict['token_refer_id'] = token_refer_id
         data_dict['refer_embedding_indices'] = refer_embedding_indices
         data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
+        data_dict['SET_token_embedding_indices'] = SET_token_embedding_indices
         data_dict['mask_num'] = mask_num
 
         return data_dict
     
+def split_lasers_train_holdout(records, holdout_mode: str, holdout_ratio: float = 0.05, holdout_seed: int = 42):
+    """Hold out a fixed subset of train_data.json for training-time validation."""
+    if holdout_mode not in ("train", "eval"):
+        raise ValueError(f"holdout_mode must be 'train' or 'eval', got {holdout_mode!r}")
+    n = len(records)
+    if n == 0:
+        return []
+    n_eval = max(1, int(n * holdout_ratio))
+    rng = random.Random(holdout_seed)
+    indices = list(range(n))
+    rng.shuffle(indices)
+    eval_indices = set(indices[:n_eval])
+    if holdout_mode == "eval":
+        return [records[i] for i in sorted(eval_indices)]
+    return [records[i] for i in range(n) if i not in eval_indices]
+
+
 class LaSeRSDataset(RS_Base_Dataset):
     
     def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
@@ -349,7 +371,16 @@ class LaSeRSDataset(RS_Base_Dataset):
 
         return token_refer_id
     
-    def __init__(self, base_data_path, tokenizer, data_args, split='train_data.json'):
+    def __init__(
+        self,
+        base_data_path,
+        tokenizer,
+        data_args,
+        split='train_data.json',
+        holdout_mode=None,
+        holdout_ratio=0.05,
+        holdout_seed=42,
+    ):
         self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
         self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
         
@@ -369,10 +400,19 @@ class LaSeRSDataset(RS_Base_Dataset):
             raise ValueError(f"Unsupported split: {split}")
 
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SET_token_id = self.tokenizer.convert_tokens_to_ids("[SET]")
         
-        with open(self.LaSeRS_json_path, "r") as f:
+        with open(self.LaSeRS_json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.reason_file = data
+
+        if holdout_mode is not None:
+            if os.path.basename(split) != "train_data.json":
+                raise ValueError("holdout_mode only applies to train_data.json")
+            ratio = float(getattr(data_args, "lasers_holdout_ratio", holdout_ratio))
+            seed = int(getattr(data_args, "lasers_holdout_seed", holdout_seed))
+            self.reason_file = split_lasers_train_holdout(data, holdout_mode, ratio, seed)
+        else:
+            self.reason_file = data
     
     def __len__(self):
         return len(self.reason_file)
@@ -430,13 +470,16 @@ class LaSeRSDataset(RS_Base_Dataset):
         token_refer_id = self.preprocess_referring_instruction(instruction)
         
         sources = [[{'from': 'human', 'value': prefix_inst + '\n<refer> <|assistant|>'},
-                    {'from': 'gpt', 'value': '\n' + answer}]]
+                    {'from': 'gpt', 'value': '\n[SET]' + answer}]]
 
         text_dict = self.preprocess_llama2(sources, self.tokenizer)
         input_ids = text_dict['input_ids'][0]
         
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+
+        SET_token_embedding_indices = torch.zeros_like(input_ids)
+        SET_token_embedding_indices[input_ids == self.SET_token_id] = 1
         
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
@@ -445,9 +488,10 @@ class LaSeRSDataset(RS_Base_Dataset):
         data_dict['labels'] = text_dict['labels'][0]
         data_dict['dataset_type'] = 'rs_reason_seg'
         
-        data_dict['token_refer_id'] = token_refer_id    
+        data_dict['token_refer_id'] = token_refer_id
         data_dict['refer_embedding_indices'] = refer_embedding_indices
         data_dict['SEG_token_embedding_indices'] = SEG_token_embedding_indices
+        data_dict['SET_token_embedding_indices'] = SET_token_embedding_indices
         
         data_dict['mask_num'] = mask_num
         
@@ -468,6 +512,7 @@ class RefSegRSDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SET_token_id = self.tokenizer.convert_tokens_to_ids("[SET]")
 
         split = split.lower()
         if split not in ("train", "val", "test"):
@@ -544,13 +589,17 @@ class RefSegRSDataset(RS_Base_Dataset):
         token_refer_id = self.preprocess_referring_instruction(instruction)
         sources = [[
             {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
-            {"from": "gpt", "value": "\n[SEG]"}
+            {"from": "gpt", "value": "\n[SET][SEG]"}
         ]]
         text_dict = self.preprocess_llama2(sources, self.tokenizer)
         input_ids = text_dict["input_ids"][0]
 
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+
+        SET_token_embedding_indices = torch.zeros_like(input_ids)
+        SET_token_embedding_indices[input_ids == self.SET_token_id] = 1
+
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
 
@@ -560,6 +609,7 @@ class RefSegRSDataset(RS_Base_Dataset):
         data_dict["token_refer_id"] = token_refer_id
         data_dict["refer_embedding_indices"] = refer_embedding_indices
         data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["SET_token_embedding_indices"] = SET_token_embedding_indices
         data_dict["mask_num"] = 1
 
         return data_dict
@@ -580,6 +630,7 @@ class RISBenchDataset(RS_Base_Dataset):
         self.base_data_path = base_data_path
         self.tokenizer = tokenizer
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SET_token_id = self.tokenizer.convert_tokens_to_ids("[SET]")
 
         split = split.lower()
         if split not in ("train", "val", "test"):
@@ -664,13 +715,17 @@ class RISBenchDataset(RS_Base_Dataset):
         token_refer_id = self.preprocess_referring_instruction(instruction)
         sources = [[
             {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
-            {"from": "gpt", "value": "\n[SEG]"}
+            {"from": "gpt", "value": "\n[SET][SEG]"}
         ]]
         text_dict = self.preprocess_llama2(sources, self.tokenizer)
         input_ids = text_dict["input_ids"][0]
 
         SEG_token_embedding_indices = torch.zeros_like(input_ids)
         SEG_token_embedding_indices[input_ids == self.SEG_token_id] = 1
+
+        SET_token_embedding_indices = torch.zeros_like(input_ids)
+        SET_token_embedding_indices[input_ids == self.SET_token_id] = 1
+
         refer_embedding_indices = torch.zeros_like(input_ids)
         refer_embedding_indices[input_ids == REFER_TOKEN_INDEX] = 1
 
@@ -680,6 +735,153 @@ class RISBenchDataset(RS_Base_Dataset):
         data_dict["token_refer_id"] = token_refer_id
         data_dict["refer_embedding_indices"] = refer_embedding_indices
         data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["SET_token_embedding_indices"] = SET_token_embedding_indices
+        data_dict["mask_num"] = 1
+
+        return data_dict
+
+
+def build_earthreason_samples(base_data_path, split="test"):
+    """Expand EarthReason QAs into per-question eval samples."""
+    split = split.lower()
+    split_root = os.path.join(base_data_path, split)
+    if not os.path.isdir(split_root):
+        if os.path.isdir(os.path.join(base_data_path, "QAs")):
+            split_root = base_data_path
+        else:
+            raise FileNotFoundError(f"EarthReason split dir not found: {split_root}")
+
+    image_dir = os.path.join(split_root, "images")
+    label_dir = os.path.join(split_root, "labels")
+    qa_dir = os.path.join(split_root, "QAs")
+    for path in (image_dir, label_dir, qa_dir):
+        if not os.path.isdir(path):
+            raise FileNotFoundError(f"EarthReason dir not found: {path}")
+
+    samples = []
+    sample_idx = 0
+    for qa_path in sorted(glob.glob(os.path.join(qa_dir, "*.json"))):
+        sid = os.path.splitext(os.path.basename(qa_path))[0]
+        image_path = os.path.join(image_dir, f"{sid}.jpg")
+        label_path = os.path.join(label_dir, f"{sid}.png")
+        if not os.path.isfile(image_path) or not os.path.isfile(label_path):
+            continue
+
+        with open(qa_path, "r", encoding="utf-8") as f:
+            qa = json.load(f)
+        questions = [str(q).strip() for q in qa.get("questions", []) if q is not None and str(q).strip()]
+        answers = [str(a).strip() for a in qa.get("answer", []) if a is not None and str(a).strip()]
+        if not questions:
+            continue
+
+        mask = cv2.imread(label_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read EarthReason label: {label_path}")
+        gt_mask = (mask > 0).astype(np.uint8)
+
+        for q_idx, question in enumerate(questions):
+            answer = answers[q_idx % len(answers)] if answers else ""
+            samples.append({
+                "id": sample_idx,
+                "image_id": sid,
+                "image_stem": sid,
+                "image_name": f"{sid}.jpg",
+                "image_path": image_path,
+                "label_path": label_path,
+                "question_idx": q_idx,
+                "description": question,
+                "answer": answer,
+                "split_name": split,
+                "gt_mask": gt_mask,
+            })
+            sample_idx += 1
+
+    return samples
+
+
+class EarthReasonDataset(RS_Base_Dataset):
+
+    def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
+        tokenized = self.tokenizer.encode(instruction, add_special_tokens=False)
+        refer_token_id = [self.tokenizer.encode(REFER_token, add_special_tokens=False)[0]]
+        tokenized = tokenized + refer_token_id
+        return torch.tensor(tokenized)
+
+    def __init__(self, base_data_path, tokenizer, data_args, split="test"):
+        self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
+        self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
+
+        self.base_data_path = base_data_path
+        self.tokenizer = tokenizer
+        self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
+        self.SET_token_id = self.tokenizer.convert_tokens_to_ids("[SET]")
+        self.split = split.lower()
+        self.reason_file = build_earthreason_samples(base_data_path, split=self.split)
+
+    def __len__(self):
+        return len(self.reason_file)
+
+    def __getitem__(self, idx):
+        rec = self.reason_file[idx]
+        instruction = rec["description"]
+        image_path = rec["image_path"]
+        sample_id = rec["id"]
+        image_stem = rec["image_stem"]
+
+        image_BGR = cv2.imread(image_path)
+        if image_BGR is None:
+            raise FileNotFoundError(f"EarthReason image missing: {image_path}")
+
+        gt_mask = rec["gt_mask"]
+        data_dict = {}
+        data_dict["file_name"] = image_path
+        image_height = image_BGR.shape[0]
+        image_width = image_BGR.shape[1]
+        data_dict["height"] = image_height
+        data_dict["width"] = image_width
+        data_dict["image_id"] = image_stem
+
+        image_RGB = preprocess_image(image_path)
+        image_tensor = torch.as_tensor(np.ascontiguousarray(image_RGB.transpose(2, 0, 1)))
+        data_dict["image"] = (image_tensor - self.pixel_mean) / self.pixel_std
+
+        data_dict["annotations"] = [{
+            "data_id": int(sample_id),
+            "mask_id": 0,
+            "mask": np.expand_dims(gt_mask, axis=0),
+            "image_path": image_path,
+            "height": image_height,
+            "width": image_width,
+            "image_id": image_stem,
+        }]
+
+        prefix_inst = (
+            "This is an image <|vision_bos|> <image> <|vision_eos|> <|sep|> <|user|>, "
+            "please doing Reasoning Segmentation according to the following instruction:"
+        )
+        token_refer_id = self.preprocess_referring_instruction(instruction)
+        sources = [[
+            {"from": "human", "value": prefix_inst + "\n<refer> <|assistant|>"},
+            {"from": "gpt", "value": "\n[SET][SEG]"},
+        ]]
+        text_dict = self.preprocess_llama2(sources, self.tokenizer)
+
+        SEG_token_embedding_indices = torch.zeros_like(text_dict["input_ids"][0])
+        SEG_token_embedding_indices[text_dict["input_ids"][0] == self.SEG_token_id] = 1
+
+        SET_token_embedding_indices = torch.zeros_like(text_dict["input_ids"][0])
+        SET_token_embedding_indices[text_dict["input_ids"][0] == self.SET_token_id] = 1
+
+        refer_embedding_indices = torch.zeros_like(text_dict["input_ids"][0])
+        refer_embedding_indices[text_dict["input_ids"][0] == REFER_TOKEN_INDEX] = 1
+
+        data_dict["input_ids"] = text_dict["input_ids"][0]
+        data_dict["labels"] = text_dict["labels"][0]
+        data_dict["dataset_type"] = "rs_reason_seg"
+        data_dict["token_refer_id"] = token_refer_id
+        data_dict["refer_embedding_indices"] = refer_embedding_indices
+        data_dict["SEG_token_embedding_indices"] = SEG_token_embedding_indices
+        data_dict["SET_token_embedding_indices"] = SET_token_embedding_indices
         data_dict["mask_num"] = 1
 
         return data_dict
@@ -785,6 +987,14 @@ class DataCollatorForCOCODatasetV2(object):
                 batch_first=True,
                 padding_value=0)
             batch['SEG_token_embedding_indices'] = SEG_token_embedding_indices
+
+        if 'SET_token_embedding_indices' in instances[0]:
+            SET_token_embedding_indices = [instance['SET_token_embedding_indices'] for instance in instances]
+            SET_token_embedding_indices = torch.nn.utils.rnn.pad_sequence(
+                SET_token_embedding_indices,
+                batch_first=True,
+                padding_value=0)
+            batch['SET_token_embedding_indices'] = SET_token_embedding_indices
         
         if 'mask_num' in instances[0]:
             batch['mask_num'] = [instance['mask_num'] for instance in instances]

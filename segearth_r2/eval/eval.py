@@ -16,6 +16,7 @@ from segearth_r2.utils import conversation as conversation_lib
 from segearth_r2.utils.builder import load_pretrained_model
 from segearth_r2.datasets.dataset import (
     DataCollatorForCOCODatasetV2,
+    EarthReasonDataset,
     LaSeRSDataset,
     RefSegRSDataset,
     RISBenchDataset,
@@ -48,12 +49,13 @@ class DataArguments:
     eval_batch_size: int = 1
     dataloader_num_workers: int = 8
     max_eval_samples: int = 0
+    skip_existing: bool = False
     load_8bit: bool = False
     load_4bit: bool = False
 
     # 新增：数据集类型与 split
-    dataset_name: str = "lasers"   # lasers / rrsisd / refsegrs / risbench
-    split: str = "val"             # train / val / test (rrsisd/refsegrs/risbench)
+    dataset_name: str = "lasers"   # lasers / rrsisd / refsegrs / risbench / earthreason
+    split: str = "val"             # train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
 
@@ -89,16 +91,24 @@ def build_eval_datasets(data_args, tokenizer):
     dataset_name = data_args.dataset_name.lower()
 
     if dataset_name == "lasers":
-        json_folders = os.path.join(data_args.base_data_path, "val", "annotations")
-        if not os.path.isdir(json_folders):
-            raise FileNotFoundError(f"LaSeRS val annotation dir not found: {json_folders}")
+        for subdir in ("test", "val"):
+            json_folders = os.path.join(data_args.base_data_path, subdir, "annotations")
+            if os.path.isdir(json_folders):
+                break
+        else:
+            raise FileNotFoundError(
+                f"LaSeRS annotation dir not found under {data_args.base_data_path}/test or .../val"
+            )
 
-        splits = sorted(os.listdir(json_folders))
+        splits = sorted(f for f in os.listdir(json_folders) if f.endswith(".json"))
+        if not splits:
+            raise FileNotFoundError(f"No LaSeRS annotation json in {json_folders}")
+
         eval_sets = []
 
         for split in splits:
             if data_args.local_rank == 0:
-                print(f"------ cur benchmark is LaSeRS {split} subset -------")
+                print(f"------ cur benchmark is LaSeRS {split} ({subdir}/) -------")
 
             eval_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
@@ -155,6 +165,23 @@ def build_eval_datasets(data_args, tokenizer):
             print(f"------ cur benchmark is RISBench {split} subset -------")
 
         eval_dataset = RISBenchDataset(
+            base_data_path=data_args.base_data_path,
+            tokenizer=tokenizer,
+            data_args=data_args,
+            split=split,
+        )
+        split_name = f"{split}.json"
+        return [(split_name, eval_dataset)]
+
+    elif dataset_name == "earthreason":
+        split = data_args.split.lower()
+        if split not in ["train", "val", "test"]:
+            raise ValueError(f"Unsupported EarthReason split: {split}. Must be train / val / test")
+
+        if data_args.local_rank == 0:
+            print(f"------ cur benchmark is EarthReason {split} subset -------")
+
+        eval_dataset = EarthReasonDataset(
             base_data_path=data_args.base_data_path,
             tokenizer=tokenizer,
             data_args=data_args,
@@ -257,7 +284,22 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
             inputs = {k: v.to(device) if torch.is_tensor(v) else v for k, v in inputs.items()}
             inputs["token_refer_id"] = [ids.to(device) for ids in inputs["token_refer_id"]]
 
-            outputs = model.eval_seg(
+            if data_args.skip_existing:
+                split_stem = split.split(".")[0]
+                seg_info = inputs["seg_info"]
+                if all(
+                    os.path.isfile(
+                        os.path.join(
+                            save_folder,
+                            f"{s['image_id']}_{s['data_id']}_{split_stem}_{s['mask_id']}.tif",
+                        )
+                    )
+                    for s in seg_info
+                ):
+                    processed_samples += len(seg_info)
+                    continue
+
+            outputs, _ = model.eval_seg(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 images=inputs["images"].to(device=device, dtype=infer_dtype),
@@ -265,6 +307,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 seg_info=inputs["seg_info"],
                 token_refer_id=inputs["token_refer_id"],
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
+                SET_token_embedding_indices=inputs["SET_token_embedding_indices"],
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
             )
@@ -277,14 +320,16 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
 
                 split_stem = split.split(".")[0]
                 mask_save_name = f"{image_name}_{sample_id}_{split_stem}_{mask_id}.tif"
+                save_path = os.path.join(save_folder, mask_save_name)
 
                 if pred_mask.ndim > 2:
                     pred_mask = np.squeeze(pred_mask)
 
-                imsave(
-                    os.path.join(save_folder, mask_save_name),
-                    pred_mask.astype(np.uint8),
-                )
+                if data_args.skip_existing and os.path.isfile(save_path):
+                    processed_samples += 1
+                    continue
+
+                imsave(save_path, pred_mask.astype(np.uint8))
                 processed_samples += 1
 
     if data_args.distributed:

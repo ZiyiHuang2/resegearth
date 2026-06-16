@@ -54,6 +54,8 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
+    lasers_holdout_ratio: float = field(default=0.05)
+    lasers_holdout_seed: int = field(default=42)
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -206,17 +208,22 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 split="val"
             )
         elif dataset_name == "lasers":
+            holdout_seed = int(getattr(data_args, "lasers_holdout_seed", training_args.data_seed))
             train_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                split="train_data.json"
+                split="train_data.json",
+                holdout_mode="train",
+                holdout_seed=holdout_seed,
             )
             eval_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                split="val_data.json"
+                split="train_data.json",
+                holdout_mode="eval",
+                holdout_seed=holdout_seed,
             )
         elif dataset_name == "refsegrs":
             train_dataset = RefSegRSDataset(
@@ -352,10 +359,35 @@ def train():
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
-    tokenizer.add_tokens("[SEG]")
+    tokenizer.add_tokens(["[SEG]", "[SET]"])
     model.resize_token_embeddings(len(tokenizer))
+
+    # --- Tokenizer / lm_head safety check ---
+    _lm_head_size = model.lm_head.out_features
+    _tokenizer_len = len(tokenizer)
+    _seg_id = tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    _set_id = tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+
+    if _tokenizer_len > _lm_head_size:
+        raise RuntimeError(
+            f"Tokenizer size ({_tokenizer_len}) exceeds lm_head.out_features ({_lm_head_size}). "
+            f"Either increase lm_head_size in config or reduce special tokens."
+        )
+    if _seg_id >= _lm_head_size:
+        raise RuntimeError(
+            f"[SEG] token id ({_seg_id}) >= lm_head.out_features ({_lm_head_size}). "
+            f"lm_head is too small for the tokenizer's [SEG] index."
+        )
+    if _set_id >= _lm_head_size:
+        raise RuntimeError(
+            f"[SET] token id ({_set_id}) >= lm_head.out_features ({_lm_head_size}). "
+            f"lm_head is too small for the tokenizer's [SET] index."
+        )
+    print(f"[safety] tokenizer_len={_tokenizer_len}, lm_head_size={_lm_head_size}, "
+          f"SEG_id={_seg_id}, SET_id={_set_id}  -- OK")
+
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "SET_token_projector",
     ]
 
     if model_args.train_swin_backbone:
@@ -386,7 +418,11 @@ def train():
 
                 p.requires_grad = True
 
-    model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    model.get_special_token(
+        SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'],
+        SET=tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'],
+        EOS=tokenizer.eos_token_id,
+    )
     
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
     

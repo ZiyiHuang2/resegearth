@@ -359,11 +359,21 @@ class LLaVATrainer(Trainer):
         valid_count = 0
         eps = 1e-7
 
+        # Diagnostic accumulators
+        union_iou_sum = 0.0
+        union_inter_sum = 0.0
+        union_union_sum = 0.0
+        union_valid = 0
+        instance_iou_k1_sum = 0.0
+        instance_iou_k1_count = 0
+        instance_iou_kgt1_sum = 0.0
+        instance_iou_kgt1_count = 0
+
         for inputs in eval_dataloader:
             with torch.no_grad():
                 inputs = self._prepare_inputs(inputs)
                 token_refer_id = [ids.to(self.args.device) for ids in inputs["token_refer_id"]]
-                outputs = model.eval_seg(
+                outputs, union_mask_info = model.eval_seg(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
                     images=inputs["images"].to(dtype=model_dtype),
@@ -371,6 +381,7 @@ class LLaVATrainer(Trainer):
                     seg_info=inputs["seg_info"],
                     token_refer_id=token_refer_id,
                     SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
+                    SET_token_embedding_indices=inputs.get("SET_token_embedding_indices", None),
                     labels=inputs["labels"],
                     mask_num=inputs["mask_num"],
                 )
@@ -383,6 +394,56 @@ class LLaVATrainer(Trainer):
                     str(gt_item.get("mask_id")),
                 )
                 gt_by_key[gt_key] = gt_item
+
+            # Build per-image K mapping from mask_num for instance stratification
+            mask_num_list = inputs["mask_num"]
+            k_by_image = {}
+            offset = 0
+            for b_idx, k_val in enumerate(mask_num_list):
+                if k_val > 0:
+                    first_item = inputs["seg_info"][offset]
+                    img_key = (str(first_item.get("image_id")), str(first_item.get("data_id")))
+                    k_by_image[img_key] = k_val
+                offset += k_val
+
+            # --- Diagnostic: union mask IoU ---
+            union_preds = union_mask_info.get('union_preds', [])
+            union_image_ids = union_mask_info.get('image_ids', [])
+            union_data_ids = union_mask_info.get('data_ids', [])
+            # Build per-image GT union (OR of all GT masks for that image)
+            for b_idx in range(len(union_preds)):
+                img_id = union_image_ids[b_idx]
+                data_id = union_data_ids[b_idx]
+                # Collect all GT masks for this (image_id, data_id) pair
+                gt_masks_for_image = []
+                for key, gt_item in gt_by_key.items():
+                    if str(gt_item.get('image_id')) == str(img_id) and str(gt_item.get('data_id')) == str(data_id):
+                        gt_mask = gt_item.get('mask')
+                        if gt_mask is not None:
+                            if torch.is_tensor(gt_mask):
+                                gt_mask_np = gt_mask.detach().cpu().numpy()
+                            else:
+                                gt_mask_np = np.asarray(gt_mask)
+                            if gt_mask_np.ndim > 2:
+                                gt_mask_np = np.squeeze(gt_mask_np)
+                            gt_mask_np = (gt_mask_np > 0).astype(np.uint8)
+                            gt_masks_for_image.append(gt_mask_np)
+                if len(gt_masks_for_image) > 0:
+                    # OR all instance masks to get union GT
+                    union_gt = np.zeros_like(gt_masks_for_image[0], dtype=np.uint8)
+                    for m in gt_masks_for_image:
+                        union_gt = np.logical_or(union_gt, m > 0).astype(np.uint8)
+                    union_pred = union_preds[b_idx]
+                    if union_pred.shape != union_gt.shape:
+                        union_pred = cv2.resize(union_pred, (union_gt.shape[1], union_gt.shape[0]),
+                                                interpolation=cv2.INTER_NEAREST)
+                        union_pred = (union_pred > 0).astype(np.uint8)
+                    inter = float(np.logical_and(union_pred > 0, union_gt > 0).sum())
+                    uni = float(np.logical_or(union_pred > 0, union_gt > 0).sum())
+                    union_iou_sum += inter / (uni + eps)
+                    union_inter_sum += inter
+                    union_union_sum += uni
+                    union_valid += 1
 
             for pred_item in outputs:
                 pred_key = (
@@ -427,13 +488,35 @@ class LLaVATrainer(Trainer):
                 total_union += union
                 valid_count += 1
 
+                # Stratify by K
+                img_key = (str(gt_item.get('image_id')), str(gt_item.get('data_id')))
+                k = k_by_image.get(img_key, 1)
+                if k == 1:
+                    instance_iou_k1_sum += iou
+                    instance_iou_k1_count += 1
+                else:
+                    instance_iou_kgt1_sum += iou
+                    instance_iou_kgt1_count += 1
+
         if dist.is_available() and dist.is_initialized():
-            stats = torch.tensor([iou_sum, total_inter, total_union, float(valid_count)], device=self.args.device)
+            stats = torch.tensor([iou_sum, total_inter, total_union, float(valid_count),
+                                   union_iou_sum, union_inter_sum, union_union_sum, float(union_valid),
+                                   instance_iou_k1_sum, float(instance_iou_k1_count),
+                                   instance_iou_kgt1_sum, float(instance_iou_kgt1_count)],
+                                  device=self.args.device)
             dist.all_reduce(stats, op=dist.ReduceOp.SUM)
             iou_sum = float(stats[0].item())
             total_inter = float(stats[1].item())
             total_union = float(stats[2].item())
             valid_count = int(stats[3].item())
+            union_iou_sum = float(stats[4].item())
+            union_inter_sum = float(stats[5].item())
+            union_union_sum = float(stats[6].item())
+            union_valid = int(stats[7].item())
+            instance_iou_k1_sum = float(stats[8].item())
+            instance_iou_k1_count = int(stats[9].item())
+            instance_iou_kgt1_sum = float(stats[10].item())
+            instance_iou_kgt1_count = int(stats[11].item())
 
         if valid_count > 0:
             eval_giou = iou_sum / valid_count
@@ -448,6 +531,17 @@ class LLaVATrainer(Trainer):
             f"{metric_key_prefix}_ciou": float(eval_ciou),
             f"{metric_key_prefix}_score": float(eval_score),
         }
+        # Diagnostic metrics
+        if union_valid > 0:
+            metrics[f"{metric_key_prefix}_union_giou"] = float(union_iou_sum / union_valid)
+            metrics[f"{metric_key_prefix}_union_ciou"] = float(union_inter_sum / (union_union_sum + eps))
+        if instance_iou_k1_count > 0:
+            metrics[f"{metric_key_prefix}_instance_giou_K1"] = float(instance_iou_k1_sum / instance_iou_k1_count)
+        if instance_iou_kgt1_count > 0:
+            metrics[f"{metric_key_prefix}_instance_giou_Kgt1"] = float(instance_iou_kgt1_sum / instance_iou_kgt1_count)
+        metrics[f"{metric_key_prefix}_union_valid"] = float(union_valid)
+        metrics[f"{metric_key_prefix}_instance_K1_count"] = float(instance_iou_k1_count)
+        metrics[f"{metric_key_prefix}_instance_Kgt1_count"] = float(instance_iou_kgt1_count)
         self.log(metrics)
         self.control = self.callback_handler.on_evaluate(self.args, self.state, self.control, metrics)
         self._memory_tracker.stop_and_update_metrics(metrics)

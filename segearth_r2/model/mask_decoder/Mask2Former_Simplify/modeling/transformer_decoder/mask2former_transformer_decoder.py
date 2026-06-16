@@ -458,12 +458,18 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             self.SEG_norm = nn.LayerNorm(hidden_dim)
 
         self.num_queries = num_queries
+        self.hidden_dim = hidden_dim
         # learnable query features
         self.query_feat = nn.Embedding(num_queries, hidden_dim)
         # learnable query p.e.
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.SEG_query_embed = nn.Embedding(num_queries + 1, hidden_dim)
         self.new_query_embed = nn.Embedding(1, hidden_dim) # (1, 256)
+        # SET + SEG independent role embeddings (zero-init for safe training start)
+        self.SET_query_embed = nn.Embedding(1, hidden_dim)
+        nn.init.constant_(self.SET_query_embed.weight, 0)
+        self.SEG_role_embed = nn.Embedding(1, hidden_dim)
+        nn.init.constant_(self.SEG_role_embed.weight, 0)
         # level embedding (we always use 3 scales)
         self.num_feature_levels = 3
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
@@ -479,11 +485,11 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, SET_embedding=None, mask_num=None):
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
+        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding, SET_embedding, mask_num)
 
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, SET_embedding=None, mask_num=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -504,20 +510,40 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
 
         _, bs, _ = src[0].shape
 
-        # QxNxC
-        if self.use_seg_query:
-            query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
-        else:
-            query_embed = torch.zeros(
-                self.new_query_embed.weight.shape[0], bs, self.new_query_embed.weight.shape[-1], 
-                device=SEG_embedding.device, dtype=SEG_embedding.dtype
-            )
-        
-        if seg_query is None:
-            # output = self.new_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
-            output = SEG_embedding.permute(1, 0, 2)
-        else:
-            output = seg_query.permute(1, 0, 2) # output: [100, batch_size, mask_dim(256)]
+        # QxNxC -- SET + SEG independent dual-line query layout
+        # SEG_embedding: [sum(K_i), 1, C] -> pad to [B, Kmax, C]
+        # SET_embedding: [B, 1, C]
+        Kmax = max(mask_num) if mask_num is not None else 0
+
+        SEG_emb = SEG_embedding.squeeze(1)  # [sum(K_i), C]
+        SEG_padded = torch.zeros(bs, Kmax, self.hidden_dim, device=SEG_emb.device, dtype=SEG_emb.dtype)
+        split_sizes = mask_num if mask_num is not None else [SEG_emb.shape[0]]
+        SEG_split = list(torch.split(SEG_emb, split_sizes, dim=0))
+        for b_idx, seg in enumerate(SEG_split):
+            SEG_padded[b_idx, :seg.shape[0]] = seg
+
+        # Build SET query: P_SET(h_SET) + e_SET (role embedding)
+        SET_query = SET_embedding + self.SET_query_embed.weight.unsqueeze(0)  # [B, 1, C]
+
+        # Build SEG queries: P_SEG(h_SEG_i) + e_SEG (role embedding)
+        SEG_query = SEG_padded + self.SEG_role_embed.weight.unsqueeze(0)  # [B, Kmax, C]
+
+        # Concat: [SET, SEG_1, ..., SEG_Kmax] -> [B, 1+Kmax, C] -> [1+Kmax, B, C]
+        output = torch.cat([SET_query, SEG_query], dim=1)  # [B, 1+Kmax, C]
+        output = output.permute(1, 0, 2)  # [1+Kmax, B, C]
+
+        # Combined embedding for SEG_class dot-product
+        SET_emb_2d = SET_embedding.squeeze(1)  # [B, C]
+        combined_emb = torch.cat([SET_emb_2d.unsqueeze(1), SEG_padded], dim=1)  # [B, 1+Kmax, C]
+
+        # query_embed (positional): zeros for now
+        query_embed = torch.zeros(1 + Kmax, bs, self.hidden_dim, device=SEG_embedding.device, dtype=SEG_embedding.dtype)
+
+        # Build tgt_key_padding_mask for self-attention (True = mask out)
+        tgt_key_padding_mask = torch.ones(bs, 1 + Kmax, dtype=torch.bool, device=SEG_embedding.device)
+        tgt_key_padding_mask[:, 0] = False  # SET query always valid
+        for b_idx, k in enumerate(mask_num if mask_num is not None else [Kmax]):
+            tgt_key_padding_mask[b_idx, 1:1 + k] = False  # valid SEG queries
             
         predictions_SEG_class = []        
         predictions_mask = []
@@ -530,7 +556,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                                                                                 attn_mask_target_size=
                                                                                 size_list[
                                                                                             0],
-                                                                                SEG_embedding=SEG_embedding,
+                                                                                SEG_embedding=combined_emb,
                                                                                 )
         else:
             SEG_class, outputs_mask, attn_mask = self.forward_prediction_heads(output,
@@ -559,7 +585,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
 
             output = self.transformer_self_attention_layers[i](
                 output, tgt_mask=None,
-                tgt_key_padding_mask=None,
+                tgt_key_padding_mask=tgt_key_padding_mask,
                 query_pos=query_embed
             )
 
@@ -568,13 +594,19 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 output
             )
 
+            # Zero out padded SEG query positions after each decoder layer
+            # SET query (index 0) stays; padded SEG queries (beyond actual K_i) get zeroed
+            if mask_num is not None:
+                pad_mask = tgt_key_padding_mask.T.unsqueeze(-1)  # [1+Kmax, B, 1]
+                output = output.masked_fill(pad_mask, 0.0)
+
             if self.use_seg_query:
                 SEG_class, outputs_mask, attn_mask = self.forward_prediction_heads(
                     output, mask_features,
                     attn_mask_target_size=
                     size_list[(
                                       i + 1) % self.num_feature_levels],
-                    SEG_embedding=SEG_embedding,
+                    SEG_embedding=combined_emb,
                     )
             else:
                 SEG_class, outputs_mask, attn_mask = self.forward_prediction_heads(
@@ -602,9 +634,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, SEG_embedding=None,
                                 ):
         decoder_output = self.decoder_norm(output)
-        decoder_output = decoder_output.transpose(0, 1)
-        # SEG_embedding = self.SEG_norm(SEG_embedding).expand_as(decoder_output)
-        # SEG_embedding = SEG_embedding.expand_as(decoder_output)
+        decoder_output = decoder_output.transpose(0, 1)  # [B, Q, C] where Q = 1+Kmax
         if SEG_embedding is not None:
             if self.seg_proj:
                 decoder_seg_output = self.SEG_proj(decoder_output)
@@ -613,10 +643,10 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             if self.seg_norm:
                 SEG_embedding = self.SEG_norm(SEG_embedding)
                 SEG_embedding = self.seg_proj_after_norm(SEG_embedding)
-            SEG_class = torch.einsum('bld,bcd->blc', decoder_seg_output, SEG_embedding)
+            # [B, Q, C] x [B, Q, C] -> [B, Q] dot-product, then unsqueeze to [B, Q, 1]
+            SEG_class = torch.einsum('bqc,bqc->bq', decoder_seg_output, SEG_embedding).unsqueeze(-1)
         else:
             SEG_class = None
-        # SEG_class = F.cosine_similarity(decoder_seg_output, SEG_embedding, dim=-1, eps=1e-6).unsqueeze(-1)
 
         mask_embed = self.mask_embed(decoder_output)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
