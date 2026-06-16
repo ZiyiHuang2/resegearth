@@ -112,6 +112,18 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.config.decoder_attn_bias_rank_margin = 0.1
     if not hasattr(model.config, "decoder_attn_bias_rank_loss_weight"):
         model.config.decoder_attn_bias_rank_loss_weight = 0.001
+    if not hasattr(model.config, "use_seg_spatial_refiner"):
+        model.config.use_seg_spatial_refiner = False
+    if not hasattr(model.config, "train_seg_spatial_refiner_only"):
+        model.config.train_seg_spatial_refiner_only = False
+    if not hasattr(model.config, "seg_spatial_refiner_alpha"):
+        model.config.seg_spatial_refiner_alpha = 0.1
+    if not hasattr(model.config, "seg_spatial_refiner_loss_weight"):
+        model.config.seg_spatial_refiner_loss_weight = 0.1
+    if not hasattr(model.config, "seg_spatial_refiner_dice_weight"):
+        model.config.seg_spatial_refiner_dice_weight = 1.0
+    if not hasattr(model.config, "seg_spatial_refiner_bce_weight"):
+        model.config.seg_spatial_refiner_bce_weight = 1.0
 
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
@@ -132,6 +144,35 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.ensure_qdti_core_branch(allow_init=allow_random_qdti)
     if hasattr(model, "ensure_decoder_attn_bias_branch"):
         model.ensure_decoder_attn_bias_branch()
+    if hasattr(model, "ensure_seg_spatial_refiner_branch"):
+        use_refiner = bool(getattr(model.config, "use_seg_spatial_refiner", False))
+        ckpt_has_refiner = (
+            SegEarthR2.checkpoint_contains_seg_spatial_refiner_weights(model_path) if use_refiner else False
+        )
+        sidecar_path = None
+        if use_refiner:
+            from pathlib import Path
+            for candidate in (
+                Path(model_path) / "seg_spatial_refiner_trainable.pt",
+                Path(model_path).parent / "seg_spatial_refiner_trainable.pt",
+            ):
+                if candidate.is_file():
+                    sidecar_path = str(candidate)
+                    break
+        if use_refiner and ckpt_has_refiner and hasattr(model, "load_seg_spatial_refiner_weights_from_checkpoint"):
+            loaded = model.load_seg_spatial_refiner_weights_from_checkpoint(model_path)
+            if loaded:
+                print(f"[SegSpatialRefiner][load] bound {loaded} refiner keys from checkpoint.", flush=True)
+        elif use_refiner:
+            model.ensure_seg_spatial_refiner_branch(allow_init=True)
+        else:
+            model.ensure_seg_spatial_refiner_branch(allow_init=False)
+        if use_refiner and hasattr(model, "validate_seg_spatial_refiner_weights"):
+            model.validate_seg_spatial_refiner_weights(
+                checkpoint_path=model_path,
+                sidecar_path=sidecar_path,
+                context="load_pretrained",
+            )
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

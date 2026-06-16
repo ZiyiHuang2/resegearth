@@ -24,6 +24,9 @@ from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2forme
     DecoderTokenAttnBias,
 )
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.qdti_core import QDTICore
+from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.seg_spatial_refiner import (
+    SingleQuerySegSpatialRefiner,
+)
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
 
@@ -136,6 +139,14 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     qdti_alpha_l: Optional[torch.FloatTensor] = None
     qdti_gate_eff: Optional[torch.FloatTensor] = None
     qdti_warmup_factor: Optional[torch.FloatTensor] = None
+    loss_seg_spatial_refiner: Optional[torch.FloatTensor] = None
+    seg_refiner_enabled: Optional[torch.FloatTensor] = None
+    seg_refiner_alpha: Optional[torch.FloatTensor] = None
+    seg_refiner_abs_mean: Optional[torch.FloatTensor] = None
+    seg_refiner_delta_abs_mean: Optional[torch.FloatTensor] = None
+    seg_refiner_base_logit_abs_mean: Optional[torch.FloatTensor] = None
+    seg_refiner_final_logit_abs_mean: Optional[torch.FloatTensor] = None
+    seg_refiner_logit_abs_mean: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -373,6 +384,143 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 pass
         return False
 
+    @staticmethod
+    def checkpoint_contains_seg_spatial_refiner_weights(checkpoint_path: str) -> bool:
+        """Return True if checkpoint files contain predictor.seg_spatial_refiner.* tensors."""
+        if not checkpoint_path or not os.path.isdir(checkpoint_path):
+            return False
+        index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            weight_map = idx.get("weight_map", idx)
+            return any("seg_spatial_refiner" in str(k) for k in weight_map.keys())
+        single = os.path.join(checkpoint_path, "model.safetensors")
+        if os.path.isfile(single):
+            try:
+                from safetensors import safe_open
+                with safe_open(single, framework="pt") as f:
+                    return any("seg_spatial_refiner" in k for k in f.keys())
+            except Exception:
+                pass
+        pytorch_bin = os.path.join(checkpoint_path, "pytorch_model.bin")
+        if os.path.isfile(pytorch_bin):
+            try:
+                sd = torch.load(pytorch_bin, map_location="cpu")
+                return any("seg_spatial_refiner" in k for k in sd.keys())
+            except Exception:
+                pass
+        return False
+
+    @staticmethod
+    def _read_seg_spatial_refiner_state_dict(checkpoint_path: str) -> dict:
+        """Read refiner tensors from HF checkpoint directory."""
+        if not checkpoint_path or not os.path.isdir(checkpoint_path):
+            return {}
+        refiner_sd = {}
+        index_path = os.path.join(checkpoint_path, "model.safetensors.index.json")
+        if os.path.isfile(index_path):
+            with open(index_path, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            weight_map = idx.get("weight_map", idx)
+            shard_keys = {}
+            for key, shard in weight_map.items():
+                if "seg_spatial_refiner" not in key:
+                    continue
+                shard_keys.setdefault(shard, []).append(key)
+            try:
+                from safetensors.torch import load_file
+            except ImportError:
+                from safetensors import safe_open
+                load_file = None
+            for shard, keys in shard_keys.items():
+                shard_path = os.path.join(checkpoint_path, shard)
+                if load_file is not None:
+                    shard_sd = load_file(shard_path)
+                    for key in keys:
+                        refiner_sd[key] = shard_sd[key]
+                else:
+                    with safe_open(shard_path, framework="pt") as f:
+                        for key in keys:
+                            refiner_sd[key] = f.get_tensor(key)
+            return refiner_sd
+        single = os.path.join(checkpoint_path, "model.safetensors")
+        if os.path.isfile(single):
+            try:
+                from safetensors.torch import load_file
+                return {k: v for k, v in load_file(single).items() if "seg_spatial_refiner" in k}
+            except Exception:
+                pass
+        pytorch_bin = os.path.join(checkpoint_path, "pytorch_model.bin")
+        if os.path.isfile(pytorch_bin):
+            try:
+                sd = torch.load(pytorch_bin, map_location="cpu")
+                return {k: v for k, v in sd.items() if "seg_spatial_refiner" in k}
+            except Exception:
+                pass
+        return {}
+
+    def load_seg_spatial_refiner_weights_from_checkpoint(self, checkpoint_path: str) -> int:
+        """Explicitly bind refiner weights after from_pretrained (HF may skip FiLM proj keys)."""
+        if not bool(getattr(self.config, "use_seg_spatial_refiner", False)):
+            return 0
+        self.ensure_seg_spatial_refiner_branch(allow_init=True)
+        refiner_sd = self._read_seg_spatial_refiner_state_dict(checkpoint_path)
+        if not refiner_sd:
+            return 0
+        missing, unexpected = self.load_state_dict(refiner_sd, strict=False)
+        miss_refiner = [k for k in missing if "seg_spatial_refiner" in k]
+        if miss_refiner:
+            raise RuntimeError(
+                f"[SegSpatialRefiner][load] failed to bind checkpoint refiner keys: {miss_refiner[:4]}"
+            )
+        if unexpected:
+            print(
+                f"[WARNING][SegSpatialRefiner][load] unexpected refiner keys while binding: {unexpected[:4]}",
+                flush=True,
+            )
+        return len(refiner_sd)
+
+    def validate_seg_spatial_refiner_weights(
+        self,
+        *,
+        checkpoint_path: Optional[str] = None,
+        sidecar_path: Optional[str] = None,
+        context: str = "load",
+    ) -> None:
+        if not bool(getattr(self.config, "use_seg_spatial_refiner", False)):
+            return
+        if not hasattr(self, "predictor") or getattr(self.predictor, "seg_spatial_refiner", None) is None:
+            raise RuntimeError(
+                f"[SegSpatialRefiner][{context}] use_seg_spatial_refiner=True but predictor.seg_spatial_refiner is missing."
+            )
+        ckpt_has = (
+            self.checkpoint_contains_seg_spatial_refiner_weights(str(checkpoint_path))
+            if checkpoint_path
+            else False
+        )
+        sidecar_has = bool(sidecar_path and os.path.isfile(str(sidecar_path)))
+        if not ckpt_has and not sidecar_has:
+            return
+        ref = self.predictor.seg_spatial_refiner
+        ref_sd = self._read_seg_spatial_refiner_state_dict(str(checkpoint_path)) if ckpt_has else {}
+        if not ref_sd and sidecar_has:
+            sidecar_sd = torch.load(str(sidecar_path), map_location="cpu")
+            ref_sd = {k: v for k, v in sidecar_sd.items() if "seg_spatial_refiner" in k}
+        if not ref_sd:
+            raise RuntimeError(
+                f"[SegSpatialRefiner][{context}] refiner enabled but no checkpoint/sidecar tensors found."
+            )
+        for name, mod in ref.named_parameters():
+            key = f"predictor.seg_spatial_refiner.{name}"
+            if key not in ref_sd:
+                raise RuntimeError(f"[SegSpatialRefiner][{context}] missing expected weight key: {key}")
+            diff = (mod.detach().cpu().float() - ref_sd[key].float()).abs().max().item()
+            if diff > 1e-3:
+                raise RuntimeError(
+                    f"[SegSpatialRefiner][{context}] weight mismatch for {key}: max_diff={diff:.6f}"
+                )
+
     def validate_qdti_core_weights(
         self,
         *,
@@ -454,6 +602,30 @@ class SegEarthR2(MiphaPhiForCausalLM):
             ),
         )
         print("[WARNING][QDTI] Initialized new random predictor.qdti_core (allow_init/allow_random).", flush=True)
+
+    def ensure_seg_spatial_refiner_branch(self, allow_init: bool = True):
+        """Attach SingleQuerySegSpatialRefiner when enabled."""
+        if not bool(getattr(self.config, "use_seg_spatial_refiner", False)):
+            return
+        if not hasattr(self, "predictor") or self.predictor is None:
+            return
+        self.predictor.use_seg_spatial_refiner = True
+        self.predictor.seg_spatial_refiner_alpha = float(
+            getattr(self.config, "seg_spatial_refiner_alpha", 0.1)
+        )
+        if getattr(self.predictor, "seg_spatial_refiner", None) is not None:
+            return
+        if not allow_init:
+            raise RuntimeError(
+                "[SegSpatialRefiner] predictor.seg_spatial_refiner missing and init not allowed."
+            )
+        hidden_dim = int(self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        mask_dim = int(self.mask_decoder_cfg.MODEL.SEM_SEG_HEAD.MASK_DIM)
+        self.predictor.register_module(
+            "seg_spatial_refiner",
+            SingleQuerySegSpatialRefiner(seg_dim=hidden_dim, mask_feature_dim=mask_dim),
+        )
+        print("[SegSpatialRefiner] Initialized new predictor.seg_spatial_refiner.", flush=True)
 
     def _sync_qdti_runtime_to_predictor(self, global_step: Optional[int] = None) -> None:
         if not self._use_qdti_core() or not hasattr(self, "predictor") or self.predictor is None:
@@ -719,6 +891,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     max_abs=float(getattr(self.config, "decoder_attn_bias_max_abs", 0.01)),
                 ),
             )
+        if bool(getattr(self.config, "use_seg_spatial_refiner", False)):
+            predictor.use_seg_spatial_refiner = True
+            predictor.seg_spatial_refiner_alpha = float(
+                getattr(self.config, "seg_spatial_refiner_alpha", 0.1)
+            )
+            predictor.register_module(
+                "seg_spatial_refiner",
+                SingleQuerySegSpatialRefiner(seg_dim=int(hidden_dim), mask_feature_dim=int(mask_dim)),
+            )
+        else:
+            predictor.use_seg_spatial_refiner = False
         return predictor
 
 
@@ -1038,6 +1221,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             parsed = [0.5, 0.3, 0.2]
         return parsed
 
+    @staticmethod
+    def _stack_binary_masks(masks):
+        """Pad variable-size [1,H,W] masks to a common canvas before stacking."""
+        if not masks:
+            return None
+        max_h = max(int(m.shape[-2]) for m in masks)
+        max_w = max(int(m.shape[-1]) for m in masks)
+        aligned = []
+        for m in masks:
+            h, w = int(m.shape[-2]), int(m.shape[-1])
+            if h == max_h and w == max_w:
+                aligned.append(m)
+            else:
+                aligned.append(F.pad(m, (0, max_w - w, 0, max_h - h), value=0.0))
+        return torch.stack(aligned, dim=0)
+
     def _build_binary_gt_mask(self, seg_info, ref_tensor):
         if seg_info is None or len(seg_info) == 0:
             return None
@@ -1076,10 +1275,54 @@ class SegEarthR2(MiphaPhiForCausalLM):
         else:
             return None
 
-        gt = torch.stack(target_masks, dim=0)
+        gt = self._stack_binary_masks(target_masks)
+        if gt is None:
+            return None
         if gt.ndim == 3:
             gt = gt.unsqueeze(1)
         return gt
+
+    def _seg_spatial_refiner_loss(self, mask_outputs, seg_info, zero_base):
+        z0 = zero_base * 0.0
+        refiner_log = getattr(self.predictor, "_last_seg_refiner_log", None) or {}
+        enabled = refiner_log.get("seg_refiner_enabled", z0)
+        alpha = refiner_log.get("seg_refiner_alpha", z0)
+        abs_mean = refiner_log.get("seg_refiner_abs_mean", z0)
+        delta_abs_mean = refiner_log.get("seg_refiner_delta_abs_mean", z0)
+        base_logit_abs_mean = refiner_log.get("seg_refiner_base_logit_abs_mean", z0)
+        final_logit_abs_mean = refiner_log.get(
+            "seg_refiner_final_logit_abs_mean", refiner_log.get("seg_refiner_logit_abs_mean", z0)
+        )
+        if not bool(getattr(self.config, "use_seg_spatial_refiner", False)):
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        if not self.training:
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        p_refine = mask_outputs.get("P_refine")
+        if p_refine is None or seg_info is None:
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        gt = self._build_binary_gt_mask(seg_info=seg_info, ref_tensor=p_refine)
+        if gt is None or gt.max().item() <= 0:
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        if gt.shape[0] != p_refine.shape[0]:
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        gt_s = F.interpolate(gt.float(), size=p_refine.shape[-2:], mode="nearest")
+        if gt_s.sum().item() <= 0:
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        bce_w = float(getattr(self.config, "seg_spatial_refiner_bce_weight", 1.0))
+        dice_w = float(getattr(self.config, "seg_spatial_refiner_dice_weight", 1.0))
+        pred_logits = p_refine.float().reshape(p_refine.shape[0], -1)
+        tgt = gt_s.float().reshape(p_refine.shape[0], -1)
+        if pred_logits.shape != tgt.shape:
+            return z0, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
+        loss_bce = F.binary_cross_entropy_with_logits(pred_logits, tgt)
+        pred_prob = pred_logits.sigmoid()
+        inter = 2.0 * (pred_prob * tgt).sum(dim=-1)
+        denom = pred_prob.sum(dim=-1) + tgt.sum(dim=-1) + 1.0
+        loss_dice = (1.0 - (inter + 1.0) / denom).mean()
+        loss_raw = bce_w * loss_bce + dice_w * loss_dice
+        if not torch.isfinite(loss_raw).all():
+            raise ValueError("[SegSpatialRefiner] non-finite auxiliary loss.")
+        return loss_raw, enabled, alpha, abs_mean, delta_abs_mean, base_logit_abs_mean, final_logit_abs_mean
 
     def _decoder_attn_bias_ranking_loss(
         self,
@@ -1623,7 +1866,178 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
-           
+
+    def _is_seg_spatial_refiner_only_training(self) -> bool:
+        return (
+            self.training
+            and bool(getattr(self.config, "train_seg_spatial_refiner_only", False))
+            and bool(getattr(self.config, "use_seg_spatial_refiner", False))
+        )
+
+    def _forward_train_seg_spatial_refiner_only(
+            self,
+            input_ids: torch.LongTensor,
+            attention_mask: Optional[torch.Tensor],
+            past_key_values: Optional[List[torch.FloatTensor]],
+            inputs_embeds: Optional[torch.FloatTensor],
+            labels: Optional[torch.LongTensor],
+            use_cache: Optional[bool],
+            images: torch.FloatTensor,
+            images_clip: torch.FloatTensor,
+            return_dict: Optional[bool],
+            seg_info,
+            token_refer_id,
+            SEG_token_embedding_indices,
+            mask_num,
+    ) -> CausalOutputWithMask:
+        if not getattr(self, "_seg_refiner_only_fast_path_logged", False):
+            self._seg_refiner_only_fast_path_logged = True
+            print(
+                "[SegSpatialRefiner] refiner-only fast forward: skip predictor/mask/llm/attn losses.",
+                flush=True,
+            )
+
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        text_cond = self.build_text_condition(
+            token_refer_id=token_refer_id,
+            batch_size=input_ids.shape[0],
+            device=images.device,
+        )
+        image_features = self.get_vision_tower_feature(images, text_cond=text_cond)
+
+        (
+            input_ids,
+            attention_mask,
+            past_key_values,
+            inputs_embeds,
+            labels,
+            SEG_token_embedding_indices,
+            image_features_indices,
+        ) = self.prepare_inputs_labels_for_multimodal(
+            input_ids,
+            attention_mask,
+            past_key_values,
+            labels,
+            images_clip,
+            token_refer_id=token_refer_id,
+            SEG_token_embedding_indices=SEG_token_embedding_indices,
+        )
+
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=return_dict,
+        )
+
+        hidden_states = outputs.last_hidden_state
+        logits = self.lm_head(hidden_states)
+        seg_embedding = self.SEG_token_projector(
+            self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+        )
+
+        mask_features, _, _ = self.pixel_decoder.forward_features(image_features)
+        mask_num_t = torch.tensor(mask_num, device=mask_features.device)
+        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num_t, dim=0)
+
+        refiner_mod = getattr(self.predictor, "seg_spatial_refiner", None)
+        if refiner_mod is None:
+            raise RuntimeError("[SegSpatialRefiner] predictor.seg_spatial_refiner is missing.")
+        alpha = float(getattr(self.config, "seg_spatial_refiner_alpha", 0.1))
+        p_refine = refiner_mod(seg_embedding, mask_features)
+        delta = alpha * p_refine
+        self.predictor._last_seg_refiner_log = {
+            "seg_refiner_enabled": p_refine.new_tensor(1.0),
+            "seg_refiner_alpha": p_refine.new_tensor(alpha),
+            "seg_refiner_abs_mean": p_refine.detach().abs().mean(),
+            "seg_refiner_delta_abs_mean": delta.detach().abs().mean(),
+            "seg_refiner_base_logit_abs_mean": p_refine.new_zeros(()),
+            "seg_refiner_final_logit_abs_mean": delta.detach().abs().mean(),
+            "seg_refiner_logit_abs_mean": delta.detach().abs().mean(),
+        }
+        mask_outputs = {"P_refine": p_refine}
+
+        zero_base = p_refine.sum() * 0.0
+        seg_refiner_loss_w = float(getattr(self.config, "seg_spatial_refiner_loss_weight", 0.1))
+        (
+            loss_seg_spatial_refiner_raw,
+            seg_refiner_enabled_log,
+            seg_refiner_alpha_log,
+            seg_refiner_abs_mean_log,
+            seg_refiner_delta_abs_mean_log,
+            seg_refiner_base_logit_abs_mean_log,
+            seg_refiner_final_logit_abs_mean_log,
+        ) = self._seg_spatial_refiner_loss(mask_outputs, seg_info, zero_base)
+        loss_seg_spatial_refiner_weighted = seg_refiner_loss_w * loss_seg_spatial_refiner_raw
+        loss = loss_seg_spatial_refiner_weighted
+
+        z0 = zero_base * 0.0
+        seg_refiner_enabled_log = z0 + seg_refiner_enabled_log.detach().float().to(zero_base.device)
+        seg_refiner_alpha_log = z0 + seg_refiner_alpha_log.detach().float().to(zero_base.device)
+        seg_refiner_abs_mean_log = z0 + seg_refiner_abs_mean_log.detach().float().to(zero_base.device)
+        seg_refiner_delta_abs_mean_log = z0 + seg_refiner_delta_abs_mean_log.detach().float().to(zero_base.device)
+        seg_refiner_base_logit_abs_mean_log = z0 + seg_refiner_base_logit_abs_mean_log.detach().float().to(zero_base.device)
+        seg_refiner_final_logit_abs_mean_log = z0 + seg_refiner_final_logit_abs_mean_log.detach().float().to(zero_base.device)
+        seg_refiner_logit_abs_mean_log = seg_refiner_final_logit_abs_mean_log
+
+        return CausalOutputWithMask(
+            loss=loss,
+            logits=logits,
+            past_key_values=outputs.past_key_values,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+            loss_mask=z0,
+            loss_dice=z0,
+            loss_llm=z0,
+            loss_attention=z0,
+            loss_midstage_gate=z0,
+            midstage_gate_alpha=z0,
+            loss_mstva_align=z0,
+            mstva_alpha3=z0,
+            mstva_alpha4=z0,
+            mstva_alpha5=z0,
+            text_film_gamma_norm=z0,
+            text_film_beta_norm=z0,
+            text_film_branch_alpha=z0,
+            decoder_attn_bias_abs_mean=z0,
+            decoder_attn_bias_raw_std=z0,
+            decoder_attn_bias_max=z0,
+            decoder_attn_bias_min=z0,
+            decoder_attn_bias_enabled=z0,
+            loss_decoder_attn_bias_rank=z0,
+            decoder_attn_bias_rank_loss_raw=z0,
+            decoder_attn_bias_inside_mean=z0,
+            decoder_attn_bias_outside_mean=z0,
+            decoder_attn_bias_inside_outside_gap=z0,
+            decoder_attn_bias_rank_fg_access_ratio=z0,
+            decoder_attn_bias_rank_bg_access_ratio=z0,
+            decoder_attn_bias_rank_valid_count=z0,
+            decoder_attn_bias_rank_num_layers=z0,
+            decoder_attn_bias_rank_layer_indices="",
+            loss_qdti_rank=z0,
+            qdti_rank_loss_raw=z0,
+            loss_qdti_neg=z0,
+            loss_qdti_div=z0,
+            qdti_bias_abs_mean=z0,
+            qdti_enabled=z0,
+            qdti_rank_valid_count=z0,
+            qdti_alpha_l=z0,
+            qdti_gate_eff=z0,
+            qdti_warmup_factor=z0,
+            loss_seg_spatial_refiner=loss_seg_spatial_refiner_weighted.detach(),
+            seg_refiner_enabled=seg_refiner_enabled_log.detach(),
+            seg_refiner_alpha=seg_refiner_alpha_log.detach(),
+            seg_refiner_abs_mean=seg_refiner_abs_mean_log.detach(),
+            seg_refiner_delta_abs_mean=seg_refiner_delta_abs_mean_log.detach(),
+            seg_refiner_base_logit_abs_mean=seg_refiner_base_logit_abs_mean_log.detach(),
+            seg_refiner_final_logit_abs_mean=seg_refiner_final_logit_abs_mean_log.detach(),
+            seg_refiner_logit_abs_mean=seg_refiner_logit_abs_mean_log.detach(),
+        )
+
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -1649,7 +2063,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_dataset_type = dataset_type[0]
         else:
             batch_dataset_type = []
-        output_attentions = True
+        use_attention_loss = getattr(self.config, "use_attention_loss", True)
+        refiner_only_train = self._is_seg_spatial_refiner_only_training()
+        output_attentions = bool(use_attention_loss) and not refiner_only_train
 
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1658,6 +2074,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
+                if refiner_only_train:
+                    return self._forward_train_seg_spatial_refiner_only(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        past_key_values=past_key_values,
+                        inputs_embeds=inputs_embeds,
+                        labels=labels,
+                        use_cache=use_cache,
+                        images=images,
+                        images_clip=images_clip,
+                        return_dict=return_dict,
+                        seg_info=seg_info,
+                        token_refer_id=token_refer_id,
+                        SEG_token_embedding_indices=SEG_token_embedding_indices,
+                        mask_num=mask_num,
+                    )
                 use_midstage_gate_loss = getattr(self.config, "use_midstage_gate_loss", False)
                 use_mstva = getattr(self.config, "use_mstva", False)
                 use_mstva_loss = getattr(self.config, "use_mstva_loss", False)
@@ -1712,7 +2144,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        attentions = (
+            [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+            if outputs.attentions is not None
+            else []
+        )
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
@@ -1810,7 +2246,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
 
-        use_attention_loss = getattr(self.config, "use_attention_loss", True)
         use_midstage_gate_loss = getattr(self.config, "use_midstage_gate_loss", False)
         midstage_gate_loss_weight = getattr(self.config, "midstage_gate_loss_weight", 0.0)
         use_mstva_loss = getattr(self.config, "use_mstva_loss", False)
@@ -2029,6 +2464,28 @@ class SegEarthR2(MiphaPhiForCausalLM):
             if div_w > 0:
                 loss_qdti_div_weighted = div_w * self._qdti_diversity_loss(bias_maps, neg_queries, zero_base)
 
+        loss_seg_spatial_refiner_raw = torch.zeros_like(zero_base)
+        seg_refiner_enabled_log = torch.zeros_like(zero_base)
+        seg_refiner_alpha_log = torch.zeros_like(zero_base)
+        seg_refiner_abs_mean_log = torch.zeros_like(zero_base)
+        seg_refiner_delta_abs_mean_log = torch.zeros_like(zero_base)
+        seg_refiner_base_logit_abs_mean_log = torch.zeros_like(zero_base)
+        seg_refiner_final_logit_abs_mean_log = torch.zeros_like(zero_base)
+        seg_refiner_logit_abs_mean_log = torch.zeros_like(zero_base)
+        seg_refiner_loss_w = float(getattr(self.config, "seg_spatial_refiner_loss_weight", 0.1))
+        if bool(getattr(self.config, "use_seg_spatial_refiner", False)) and seg_info is not None:
+            (
+                loss_seg_spatial_refiner_raw,
+                seg_refiner_enabled_log,
+                seg_refiner_alpha_log,
+                seg_refiner_abs_mean_log,
+                seg_refiner_delta_abs_mean_log,
+                seg_refiner_base_logit_abs_mean_log,
+                seg_refiner_final_logit_abs_mean_log,
+            ) = self._seg_spatial_refiner_loss(mask_outputs, seg_info, zero_base)
+            seg_refiner_logit_abs_mean_log = seg_refiner_final_logit_abs_mean_log
+        loss_seg_spatial_refiner_weighted = seg_refiner_loss_w * loss_seg_spatial_refiner_raw
+
         loss = llm_loss + mask_loss
         if use_attention_loss:
             loss = loss + 0.01 * loss_attention
@@ -2036,7 +2493,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss = loss + midstage_gate_loss_weight * loss_midstage_gate
         if use_mstva_loss and mstva_loss_weight > 0:
             loss = loss + mstva_loss_weight * loss_mstva_align
-        loss = loss + loss_dac_rank_weighted + loss_qdti_rank_weighted + loss_qdti_neg_weighted + loss_qdti_div_weighted
+        loss = (
+            loss
+            + loss_dac_rank_weighted
+            + loss_qdti_rank_weighted
+            + loss_qdti_neg_weighted
+            + loss_qdti_div_weighted
+            + loss_seg_spatial_refiner_weighted
+        )
 
         text_film_gamma_norm = torch.zeros_like(zero_base)
         text_film_beta_norm = torch.zeros_like(zero_base)
@@ -2079,6 +2543,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 dac_max = z0 + dac_log["decoder_attn_bias_max"].detach().float().to(zero_base.device)
                 dac_min = z0 + dac_log["decoder_attn_bias_min"].detach().float().to(zero_base.device)
                 dac_enabled = z0 + dac_log["decoder_attn_bias_enabled"].detach().float().to(zero_base.device)
+
+        if seg_refiner_enabled_log is not None:
+            seg_refiner_enabled_log = z0 + seg_refiner_enabled_log.detach().float().to(zero_base.device)
+            seg_refiner_alpha_log = z0 + seg_refiner_alpha_log.detach().float().to(zero_base.device)
+            seg_refiner_abs_mean_log = z0 + seg_refiner_abs_mean_log.detach().float().to(zero_base.device)
+            seg_refiner_delta_abs_mean_log = z0 + seg_refiner_delta_abs_mean_log.detach().float().to(zero_base.device)
+            seg_refiner_base_logit_abs_mean_log = z0 + seg_refiner_base_logit_abs_mean_log.detach().float().to(zero_base.device)
+            seg_refiner_final_logit_abs_mean_log = z0 + seg_refiner_final_logit_abs_mean_log.detach().float().to(zero_base.device)
+            seg_refiner_logit_abs_mean_log = z0 + seg_refiner_logit_abs_mean_log.detach().float().to(zero_base.device)
 
         return CausalOutputWithMask(
             loss=loss,
@@ -2124,6 +2597,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             qdti_alpha_l=qdti_alpha_log.detach(),
             qdti_gate_eff=qdti_gate_eff_log.detach(),
             qdti_warmup_factor=qdti_warmup_log.detach(),
+            loss_seg_spatial_refiner=loss_seg_spatial_refiner_weighted.detach(),
+            seg_refiner_enabled=seg_refiner_enabled_log.detach(),
+            seg_refiner_alpha=seg_refiner_alpha_log.detach(),
+            seg_refiner_abs_mean=seg_refiner_abs_mean_log.detach(),
+            seg_refiner_delta_abs_mean=seg_refiner_delta_abs_mean_log.detach(),
+            seg_refiner_base_logit_abs_mean=seg_refiner_base_logit_abs_mean_log.detach(),
+            seg_refiner_final_logit_abs_mean=seg_refiner_final_logit_abs_mean_log.detach(),
+            seg_refiner_logit_abs_mean=seg_refiner_logit_abs_mean_log.detach(),
         )
     
     def eval_seg(

@@ -7,6 +7,8 @@ sys.path.insert(0, project_root)
 import argparse
 import glob
 import copy
+import json
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -82,6 +84,12 @@ def parse_args(args):
     parser.add_argument("--qdti_warmup_steps", default=500, type=int)
     parser.add_argument("--allow_random_qdti_init", default=False, type=_str2bool)
 
+    parser.add_argument("--use_seg_spatial_refiner", default=False, type=_str2bool)
+    parser.add_argument("--seg_spatial_refiner_alpha", default=0.1, type=float)
+    parser.add_argument("--seg_spatial_refiner_loss_weight", default=0.1, type=float)
+    parser.add_argument("--seg_spatial_refiner_dice_weight", default=1.0, type=float)
+    parser.add_argument("--seg_spatial_refiner_bce_weight", default=1.0, type=float)
+
     parser.add_argument("--lora_enable", default=True, type=_str2bool)
     parser.add_argument("--lora_r", default=8, type=int)
     parser.add_argument("--lora_alpha", default=16, type=int)
@@ -143,6 +151,71 @@ def _apply_qdti_config(model, model_args):
     return use_qdti
 
 
+def _apply_seg_spatial_refiner_config(model, model_args):
+    use_refiner = bool(getattr(model_args, "use_seg_spatial_refiner", False))
+    model.config.use_seg_spatial_refiner = use_refiner
+    model.config.seg_spatial_refiner_alpha = float(getattr(model_args, "seg_spatial_refiner_alpha", 0.1))
+    model.config.seg_spatial_refiner_loss_weight = float(
+        getattr(model_args, "seg_spatial_refiner_loss_weight", 0.1)
+    )
+    model.config.seg_spatial_refiner_dice_weight = float(
+        getattr(model_args, "seg_spatial_refiner_dice_weight", 1.0)
+    )
+    model.config.seg_spatial_refiner_bce_weight = float(
+        getattr(model_args, "seg_spatial_refiner_bce_weight", 1.0)
+    )
+    if hasattr(model, "predictor") and model.predictor is not None:
+        model.predictor.use_seg_spatial_refiner = use_refiner
+        model.predictor.seg_spatial_refiner_alpha = float(model.config.seg_spatial_refiner_alpha)
+    return use_refiner
+
+
+def _is_deepspeed_zero_checkpoint(model_path: str) -> bool:
+    p = Path(model_path)
+    if not p.is_dir():
+        return False
+    if (p / "latest").exists():
+        return True
+    return any(p.glob("global_step*"))
+
+
+def _find_seg_spatial_refiner_sidecar(model_path: str):
+    candidates = [
+        Path(model_path) / "seg_spatial_refiner_trainable.pt",
+        Path(model_path).parent / "seg_spatial_refiner_trainable.pt",
+    ]
+    for path in candidates:
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _load_seg_spatial_refiner_sidecar(model, sidecar_path: str):
+    sd = torch.load(sidecar_path, map_location="cpu")
+    if not isinstance(sd, dict) or not sd:
+        raise RuntimeError(f"[SegSpatialRefiner][merge] empty sidecar: {sidecar_path}")
+    refiner_keys = [k for k in sd if "seg_spatial_refiner" in k]
+    if not refiner_keys:
+        raise RuntimeError(f"[SegSpatialRefiner][merge] sidecar has no seg_spatial_refiner keys: {sidecar_path}")
+    mapped = {}
+    model_keys = dict(model.named_parameters())
+    for k, v in sd.items():
+        candidates = [k, k.replace("base_model.model.", ""), k.replace("model.", "")]
+        loaded = False
+        for ck in candidates:
+            if ck in model_keys:
+                mapped[ck] = v
+                loaded = True
+                break
+        if not loaded and k in model.state_dict():
+            mapped[k] = v
+    missing, unexpected = model.load_state_dict(mapped, strict=False)
+    miss_refiner = [m for m in missing if "seg_spatial_refiner" in m]
+    if miss_refiner:
+        raise RuntimeError(f"[SegSpatialRefiner][merge] failed to load sidecar keys: {miss_refiner[:4]}")
+    print(f"[SegSpatialRefiner][merge] loaded sidecar keys={len(refiner_keys)} from {sidecar_path}")
+
+
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
     kwargs = {"device_map": 'cpu'}
@@ -163,8 +236,17 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    sidecar_path = _find_seg_spatial_refiner_sidecar(model_path)
+    load_path = model_path
+    sidecar_only = sidecar_path is not None and not _is_deepspeed_zero_checkpoint(model_path)
+    if sidecar_only:
+        adapter_cfg = Path(model_path) / "adapter_config.json"
+        if adapter_cfg.is_file():
+            load_path = json.load(open(adapter_cfg, encoding="utf-8")).get("base_model_name_or_path", load_path)
+        print(f"[SegSpatialRefiner][merge] sidecar-only load base={load_path}")
+
+    tokenizer = AutoTokenizer.from_pretrained(load_path, use_fast=True)
+    model = SegEarthR2.from_pretrained(load_path, mask_decoder_cfg=mask_cfg, **kwargs)
     use_tf = bool(getattr(model_args, "use_text_film", False))
     use_mv = bool(getattr(model_args, "use_mstva", False))
     if use_tf and use_mv:
@@ -186,6 +268,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.config.mstva_pool_large_scale = bool(getattr(model_args, "mstva_pool_large_scale"))
 
     use_qdti = _apply_qdti_config(model, model_args)
+    use_refiner = _apply_seg_spatial_refiner_config(model, model_args)
 
     use_dac = bool(getattr(model_args, "use_decoder_attn_bias", False)) and not use_qdti
     model.config.use_decoder_attn_bias = use_dac
@@ -222,6 +305,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.ensure_qdti_core_branch(allow_init=bool(getattr(model_args, "allow_random_qdti_init", False)))
     elif hasattr(model, "ensure_decoder_attn_bias_branch"):
         model.ensure_decoder_attn_bias_branch()
+    if use_refiner and hasattr(model, "ensure_seg_spatial_refiner_branch"):
+        model.ensure_seg_spatial_refiner_branch(allow_init=True)
 
     vision_tower = model.get_model().get_vision_tower_mask()
 
@@ -232,7 +317,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         "text_film_branch",
     ]
 
-    if model_args.lora_enable:
+    if model_args.lora_enable and not sidecar_only:
         lora_r = model_args.lora_r
         lora_alpha = model_args.lora_alpha
         lora_dropout = model_args.lora_dropout
@@ -249,11 +334,32 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     model.resize_token_embeddings(len(tokenizer))
 
-    from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
-    model = load_state_dict_from_zero_checkpoint(model, model_path)
-    model = model.merge_and_unload()
+    sidecar_path = _find_seg_spatial_refiner_sidecar(model_path) if use_refiner else None
+    if _is_deepspeed_zero_checkpoint(model_path):
+        from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
+        model = load_state_dict_from_zero_checkpoint(model, model_path)
+    elif sidecar_only:
+        print(f"[SegSpatialRefiner][merge] sidecar-only path; skip zero checkpoint load")
+    elif model_args.lora_enable:
+        from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
+        try:
+            model = load_state_dict_from_zero_checkpoint(model, model_path)
+        except Exception as exc:
+            if sidecar_path is None:
+                raise
+            print(f"[SegSpatialRefiner][merge] zero load failed ({exc}); fallback to sidecar.")
+    model = model.merge_and_unload() if hasattr(model, "merge_and_unload") else model
+
+    if use_refiner:
+        if sidecar_path is None:
+            sidecar_path = _find_seg_spatial_refiner_sidecar(model_path)
+        if sidecar_path is not None:
+            _load_seg_spatial_refiner_sidecar(model, sidecar_path)
+        elif not any("seg_spatial_refiner" in n for n, _ in model.named_parameters()):
+            raise RuntimeError("[SegSpatialRefiner][merge] refiner enabled but no sidecar/zero weights found.")
 
     _apply_qdti_config(model, model_args)
+    _apply_seg_spatial_refiner_config(model, model_args)
     if use_qdti:
         has_qdti = any("qdti_core" in n for n, _ in model.named_parameters())
         if not has_qdti:
@@ -270,22 +376,33 @@ def main(args):
 
     state_dict = {}
     qdti_keys = []
+    refiner_keys = []
     for k, v in model.state_dict().items():
         state_dict[k] = v
         if "qdti_core" in k:
             qdti_keys.append(k)
+        if "seg_spatial_refiner" in k:
+            refiner_keys.append(k)
     if bool(getattr(args, "use_query_aware_decoder_bias", False)):
         print(f"[QDTI][merge] state_dict qdti_core keys={len(qdti_keys)}")
         if qdti_keys:
             print(f"[QDTI][merge] sample keys: {qdti_keys[:3]}")
         if len(qdti_keys) == 0:
             raise RuntimeError("[QDTI][merge] no predictor.qdti_core.* in merged state_dict.")
+    if bool(getattr(args, "use_seg_spatial_refiner", False)):
+        print(f"[SegSpatialRefiner][merge] state_dict seg_spatial_refiner keys={len(refiner_keys)}")
+        if refiner_keys:
+            print(f"[SegSpatialRefiner][merge] sample keys: {refiner_keys[:3]}")
+        if len(refiner_keys) == 0:
+            raise RuntimeError("[SegSpatialRefiner][merge] no predictor.seg_spatial_refiner.* in merged state_dict.")
     model._hf_peft_config_loaded = False
     model.save_pretrained(args.save_path, state_dict=state_dict)
 
     tokenizer.save_pretrained(args.save_path)
     print(f"[OK] saved merged model to {args.save_path}")
     print(f"[OK] config use_query_aware_decoder_bias={getattr(model.config, 'use_query_aware_decoder_bias', False)}")
+    print(f"[OK] config use_seg_spatial_refiner={getattr(model.config, 'use_seg_spatial_refiner', False)}")
+    print(f"[OK] config seg_spatial_refiner_alpha={getattr(model.config, 'seg_spatial_refiner_alpha', None)}")
     
 if __name__ == "__main__":
     main(sys.argv[1:])

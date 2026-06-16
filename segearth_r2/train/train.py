@@ -1,5 +1,7 @@
 import os
+import re
 import sys
+from pathlib import Path
 from typing import Optional
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -64,6 +66,12 @@ class ModelArguments:
     use_decoder_attn_bias_rank_loss: bool = field(default=False)
     decoder_attn_bias_rank_margin: float = field(default=0.1)
     decoder_attn_bias_rank_loss_weight: float = field(default=0.001)
+    use_seg_spatial_refiner: bool = field(default=False)
+    train_seg_spatial_refiner_only: bool = field(default=False)
+    seg_spatial_refiner_alpha: float = field(default=0.1)
+    seg_spatial_refiner_loss_weight: float = field(default=0.1)
+    seg_spatial_refiner_dice_weight: float = field(default=1.0)
+    seg_spatial_refiner_bce_weight: float = field(default=1.0)
     train_midstage_recalibration: bool = field(default=True)
     stage3_norm_only: bool = field(default=False)
 
@@ -199,6 +207,63 @@ def _enable_text_film_trainable(model):
         p.requires_grad = True
 
 
+def _get_raw_model(model):
+    if hasattr(model, "base_model") and hasattr(model.base_model, "model"):
+        return model.base_model.model
+    return model
+
+
+def _enable_seg_spatial_refiner_trainable(model):
+    raw_model = _get_raw_model(model)
+    predictor = getattr(raw_model, "predictor", None)
+    if predictor is None or getattr(predictor, "seg_spatial_refiner", None) is None:
+        raise RuntimeError("[SegSpatialRefiner] predictor.seg_spatial_refiner is missing.")
+    for n, p in model.named_parameters():
+        if "seg_spatial_refiner" in n:
+            p.requires_grad = True
+
+
+def _save_seg_spatial_refiner_sidecar(model, output_dir, local_rank_value=0):
+    if not _is_rank0(local_rank_value):
+        return None
+    raw_model = _get_raw_model(model)
+    sidecar = {}
+    for n, p in raw_model.named_parameters():
+        if "seg_spatial_refiner" in n:
+            sidecar[n] = p.detach().cpu()
+    if not sidecar:
+        raise RuntimeError("[SegSpatialRefiner] no seg_spatial_refiner params to save in sidecar.")
+    path = os.path.join(output_dir, "seg_spatial_refiner_trainable.pt")
+    torch.save(sidecar, path)
+    print(f"[SegSpatialRefiner] saved sidecar: {path} keys={len(sidecar)}")
+    return path
+
+
+def log_seg_spatial_refiner_trainable_params(model, local_rank_value=0, max_show=32):
+    if not _is_rank0(local_rank_value):
+        return
+    trainable = [n for n, p in model.named_parameters() if p.requires_grad]
+    refiner_trainable = [n for n in trainable if "seg_spatial_refiner" in n]
+    non_refiner = [n for n in trainable if "seg_spatial_refiner" not in n]
+    print(
+        f"[SegSpatialRefiner trainable] refiner={len(refiner_trainable)} "
+        f"non_refiner={len(non_refiner)} total_trainable={len(trainable)}"
+    )
+    for n in refiner_trainable[:max_show]:
+        print(f"  {n}")
+    if len(refiner_trainable) > max_show:
+        print(f"  ... ({len(refiner_trainable) - max_show} more)")
+    if non_refiner:
+        sample = non_refiner[:8]
+        raise RuntimeError(
+            "[SegSpatialRefiner][FAIL-FAST] Non-refiner parameters are trainable: "
+            + ", ".join(sample)
+            + (f" ... (+{len(non_refiner) - len(sample)} more)" if len(non_refiner) > len(sample) else "")
+        )
+    if not refiner_trainable:
+        raise RuntimeError("[SegSpatialRefiner][FAIL-FAST] No seg_spatial_refiner parameters are trainable.")
+
+
 def log_text_film_trainable_params(model, local_rank_value=0):
     if not _is_rank0(local_rank_value):
         return
@@ -290,6 +355,41 @@ def log_midstage_recalibration_trainable_params(model, local_rank_value=0, max_s
     sample_names = (mid_names + blk_names + norm_names)[:max_show]
     if sample_names:
         print(f"[MidStage trainable] sample trainable params: {sample_names}")
+
+
+def _list_training_checkpoints(output_dir: str):
+    checkpoints = []
+    for path in Path(output_dir).glob("checkpoint-*"):
+        match = re.match(r"checkpoint-(\d+)$", path.name)
+        if match:
+            checkpoints.append((int(match.group(1)), path))
+    checkpoints.sort()
+    return checkpoints
+
+
+def _checkpoint_uses_lora(checkpoint_dir: Path) -> bool:
+    return (checkpoint_dir / "adapter_config.json").is_file()
+
+
+def _resolve_resume_from_checkpoint(output_dir: str, lora_enable: bool, local_rank_value=0):
+    checkpoints = _list_training_checkpoints(output_dir)
+    if not checkpoints:
+        return None
+    latest_step, latest_dir = checkpoints[-1]
+    ckpt_lora = _checkpoint_uses_lora(latest_dir)
+    if ckpt_lora != bool(lora_enable):
+        if _is_rank0(local_rank_value):
+            print(
+                f"[WARN] Skip resume: checkpoint-{latest_step} is "
+                f"{'LoRA' if ckpt_lora else 'non-LoRA'} but lora_enable={lora_enable}. "
+                "Starting fresh from model_name_or_path. "
+                "Remove old checkpoint-* dirs or use a new output_dir to silence this.",
+                flush=True,
+            )
+        return None
+    if _is_rank0(local_rank_value):
+        print(f"[INFO] Resuming training from checkpoint-{latest_step}.", flush=True)
+    return True
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
@@ -510,6 +610,15 @@ def train():
     assert float(model.config.decoder_attn_bias_rank_margin) == float(model_args.decoder_attn_bias_rank_margin)
     assert bool(model.config.use_decoder_attn_bias_rank_loss) == bool(model_args.use_decoder_attn_bias_rank_loss)
 
+    model.config.use_seg_spatial_refiner = bool(getattr(model_args, "use_seg_spatial_refiner", False))
+    model.config.train_seg_spatial_refiner_only = bool(getattr(model_args, "train_seg_spatial_refiner_only", False))
+    model.config.seg_spatial_refiner_alpha = float(getattr(model_args, "seg_spatial_refiner_alpha", 0.1))
+    model.config.seg_spatial_refiner_loss_weight = float(getattr(model_args, "seg_spatial_refiner_loss_weight", 0.1))
+    model.config.seg_spatial_refiner_dice_weight = float(getattr(model_args, "seg_spatial_refiner_dice_weight", 1.0))
+    model.config.seg_spatial_refiner_bce_weight = float(getattr(model_args, "seg_spatial_refiner_bce_weight", 1.0))
+    if model.config.train_seg_spatial_refiner_only and not model.config.use_seg_spatial_refiner:
+        raise ValueError("train_seg_spatial_refiner_only=True requires use_seg_spatial_refiner=True")
+
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
@@ -543,6 +652,8 @@ def train():
         )
     if hasattr(model, "ensure_decoder_attn_bias_branch"):
         model.ensure_decoder_attn_bias_branch()
+    if hasattr(model, "ensure_seg_spatial_refiner_branch"):
+        model.ensure_seg_spatial_refiner_branch(allow_init=True)
 
     if model_args.freeze_backbone:
         model.model.requires_grad_(False)
@@ -623,6 +734,16 @@ def train():
 
     if model_args.train_swin_backbone:
         train_module_list.append('vision_tower_mask')
+
+    train_seg_spatial_refiner_only = bool(getattr(model_args, "train_seg_spatial_refiner_only", False))
+    if train_seg_spatial_refiner_only:
+        if training_args.lora_enable:
+            print("[train] train_seg_spatial_refiner_only=True: forcing lora_enable=False.")
+            training_args.lora_enable = False
+        if model_args.use_attention_loss:
+            print("[train] train_seg_spatial_refiner_only=True: forcing use_attention_loss=False.")
+            model_args.use_attention_loss = False
+            model.config.use_attention_loss = False
         
     if training_args.lora_enable:
         lora_r = training_args.lora_r
@@ -657,7 +778,14 @@ def train():
         if model_args.use_text_film:
             _enable_text_film_trainable(model)
 
-    if model_args.train_midstage_recalibration:
+    train_seg_spatial_refiner_only = bool(getattr(model_args, "train_seg_spatial_refiner_only", False))
+    if train_seg_spatial_refiner_only:
+        for p in model.parameters():
+            p.requires_grad = False
+        _enable_seg_spatial_refiner_trainable(model)
+        log_seg_spatial_refiner_trainable_params(model, local_rank_value=training_args.local_rank)
+
+    if model_args.train_midstage_recalibration and not train_seg_spatial_refiner_only:
         log_midstage_recalibration_trainable_params(model, local_rank_value=training_args.local_rank)
     if model_args.use_text_film:
         log_text_film_trainable_params(model, local_rank_value=training_args.local_rank)
@@ -668,17 +796,38 @@ def train():
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
-    if hasattr(training_args, "evaluation_strategy"):
-        training_args.evaluation_strategy = "steps"
-    if hasattr(training_args, "eval_strategy"):
-        training_args.eval_strategy = "steps"
+    train_seg_spatial_refiner_only = bool(getattr(model_args, "train_seg_spatial_refiner_only", False))
+    if not train_seg_spatial_refiner_only:
+        if getattr(training_args, "evaluation_strategy", None) in (None, "no", "NO"):
+            if hasattr(training_args, "eval_strategy") and getattr(training_args, "eval_strategy", None) not in (None, "no", "NO"):
+                pass
+            else:
+                if hasattr(training_args, "evaluation_strategy"):
+                    training_args.evaluation_strategy = "steps"
+                if hasattr(training_args, "eval_strategy"):
+                    training_args.eval_strategy = "steps"
+        else:
+            if hasattr(training_args, "eval_strategy"):
+                training_args.eval_strategy = training_args.evaluation_strategy
+    else:
+        eval_strat = getattr(training_args, "evaluation_strategy", None)
+        if eval_strat in (None, "no", "NO"):
+            if hasattr(training_args, "evaluation_strategy"):
+                training_args.evaluation_strategy = "no"
+            if hasattr(training_args, "eval_strategy"):
+                training_args.eval_strategy = "no"
+        elif hasattr(training_args, "eval_strategy"):
+            training_args.eval_strategy = training_args.evaluation_strategy
     training_args.save_strategy = "steps"
     if training_args.save_steps is None or training_args.save_steps <= 0:
         training_args.save_steps = 500
-    training_args.eval_steps = training_args.save_steps
-    training_args.load_best_model_at_end = True
-    training_args.metric_for_best_model = "eval_score"
-    training_args.greater_is_better = True
+    if getattr(training_args, "evaluation_strategy", "steps") != "no":
+        training_args.eval_steps = training_args.save_steps
+    if training_args.load_best_model_at_end and getattr(training_args, "evaluation_strategy", "steps") == "no":
+        training_args.load_best_model_at_end = False
+    if training_args.load_best_model_at_end:
+        training_args.metric_for_best_model = "eval_score"
+        training_args.greater_is_better = True
     if training_args.save_total_limit is None or training_args.save_total_limit > 2:
         training_args.save_total_limit = 2
     
@@ -686,11 +835,23 @@ def train():
                            tokenizer=tokenizer,
                            args=training_args,
                            **data_module)
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
-        trainer.train(resume_from_checkpoint=True)
+    resume_from_checkpoint = _resolve_resume_from_checkpoint(
+        training_args.output_dir,
+        lora_enable=bool(training_args.lora_enable),
+        local_rank_value=training_args.local_rank,
+    )
+    if resume_from_checkpoint is not None:
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     else:
         trainer.train()
     trainer.save_state()
+
+    if bool(getattr(model_args, "train_seg_spatial_refiner_only", False)):
+        _save_seg_spatial_refiner_sidecar(
+            model,
+            training_args.output_dir,
+            local_rank_value=training_args.local_rank,
+        )
 
     model.config.use_cache = True
 

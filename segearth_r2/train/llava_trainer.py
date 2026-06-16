@@ -223,7 +223,7 @@ class LLaVATrainer(Trainer):
         if not hasattr(self,'history_loss_dict'):
             self.history_loss_dict = {}
         for name, value in outputs.items():
-            if ('loss' in name and name != 'loss') or name.startswith('text_film_') or name.startswith('decoder_attn_bias') or name.startswith('qdti_'):
+            if ('loss' in name and name != 'loss') or name.startswith('text_film_') or name.startswith('decoder_attn_bias') or name.startswith('qdti_') or name.startswith('seg_refiner_'):
                 log_v = self._decoder_attn_bias_log_value(value)
                 if name not in self.history_loss_dict:
                     self.history_loss_dict[name] = log_v
@@ -269,7 +269,7 @@ class LLaVATrainer(Trainer):
             if isinstance(outputs, dict) and 'loss_dice' in outputs:
                 loss_dict = {}
                 for name,value in outputs.items():
-                    if ('loss' in name and name != 'loss') or name.startswith('text_film_') or name.startswith('decoder_attn_bias') or name.startswith('qdti_'):
+                    if ('loss' in name and name != 'loss') or name.startswith('text_film_') or name.startswith('decoder_attn_bias') or name.startswith('qdti_') or name.startswith('seg_refiner_'):
                         loss_value = self._decoder_attn_bias_log_value(value)
                         if (
                             not isinstance(loss_value, str)

@@ -944,13 +944,59 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 "decoder_attn_bias_enabled": zo,
             }
 
+        pred_masks_base = predictions_mask[-1]
+        pred_masks = pred_masks_base
+        refiner_mod = getattr(self, "seg_spatial_refiner", None)
+        refiner_enabled = (
+            refiner_mod is not None and bool(getattr(self, "use_seg_spatial_refiner", False))
+        )
+        self._last_seg_refiner_log = None
+        refiner_extra = {}
+        if refiner_enabled:
+            if SEG_embedding is None:
+                raise ValueError("[SegSpatialRefiner] SEG_embedding is required when refiner is enabled.")
+            alpha = float(getattr(self, "seg_spatial_refiner_alpha", 0.1))
+            p_refine = refiner_mod(SEG_embedding, mask_features)
+            if p_refine.shape[-2:] != pred_masks_base.shape[-2:]:
+                p_refine = F.interpolate(
+                    p_refine.float(),
+                    size=pred_masks_base.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(dtype=pred_masks_base.dtype)
+            if p_refine.shape[1] != pred_masks_base.shape[1]:
+                if p_refine.shape[1] == 1 and pred_masks_base.shape[1] == 1:
+                    pass
+                else:
+                    raise ValueError(
+                        f"[SegSpatialRefiner] P_refine Q={p_refine.shape[1]} != "
+                        f"base Q={pred_masks_base.shape[1]}"
+                    )
+            pred_masks = pred_masks_base + alpha * p_refine
+            delta = alpha * p_refine
+            self._last_seg_refiner_log = {
+                "seg_refiner_enabled": pred_masks_base.new_tensor(1.0),
+                "seg_refiner_alpha": pred_masks_base.new_tensor(alpha),
+                "seg_refiner_abs_mean": p_refine.detach().abs().mean(),
+                "seg_refiner_delta_abs_mean": delta.detach().abs().mean(),
+                "seg_refiner_base_logit_abs_mean": pred_masks_base.detach().abs().mean(),
+                "seg_refiner_final_logit_abs_mean": pred_masks.detach().abs().mean(),
+                "seg_refiner_logit_abs_mean": pred_masks.detach().abs().mean(),
+            }
+            refiner_extra = {
+                "pred_masks_base": pred_masks_base,
+                "P_refine": p_refine,
+            }
+
         out = {
             'pred_SEG_logits': predictions_SEG_class[-1],
-            'pred_masks': predictions_mask[-1],
+            'pred_masks': pred_masks,
             'aux_outputs': self._set_aux_loss(
                 predictions_SEG_class, predictions_mask,
             )
         }
+        if refiner_extra:
+            out.update(refiner_extra)
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, SEG_embedding=None,
