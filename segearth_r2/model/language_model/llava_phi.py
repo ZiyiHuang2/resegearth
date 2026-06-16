@@ -20,6 +20,7 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
+from ..tgmsa.tgmsa import DynamicQueryBinding, PixelTargetBackgroundCalibrator, SwinOutputTargetFilter
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
@@ -39,6 +40,10 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_tgmsa_query_diversity: Optional[torch.FloatTensor] = None
+    loss_tgmsa_segment_separation: Optional[torch.FloatTensor] = None
+    loss_tgmsa_binding_entropy: Optional[torch.FloatTensor] = None
+    loss_tgmsa_peer_contrast: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -150,6 +155,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.configure_tgmsa_modules(input_shape)
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -271,7 +277,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                                      enforce_input_project,
                                                                      seg_norm,
                                                                      seg_proj,
-                                                                     seg_fuse_score,)
+                                                                     seg_fuse_score,
+                                                                     use_tgmsa_decoder_binding=bool(getattr(self.config, 'use_tgmsa_decoder_binding', False)),
+                                                                     tgmsa_query_bank_size=int(getattr(self.config, 'tgmsa_query_bank_size', 4)),
+                                                                     tgmsa_decoder_alpha_init=float(getattr(self.config, 'tgmsa_decoder_alpha_init', 0.0)),
+                                                                     tgmsa_diversity_margin=float(getattr(self.config, 'tgmsa_diversity_margin', 0.2)),
+                                                                     tgmsa_query_num_heads=int(getattr(self.config, 'tgmsa_query_num_heads', 4)),)
         return predictor
 
 
@@ -601,6 +612,63 @@ class SegEarthR2(MiphaPhiForCausalLM):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
+
+    def _mask_num_as_list(self, mask_num):
+        if mask_num is None:
+            return None
+        if torch.is_tensor(mask_num):
+            return [int(x) for x in mask_num.detach().cpu().tolist()]
+        return [int(x) for x in mask_num]
+
+    def configure_tgmsa_modules(self, input_shape=None):
+        hidden_dim = self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+        if input_shape is None:
+            input_shape = self.output_shape()
+
+        if bool(getattr(self.config, 'use_tgmsa_swin_filter', False)) and not hasattr(self, 'tgmsa_swin_filter'):
+            feature_dims = {name: int(shape.channel) for name, shape in input_shape.items()}
+            self.tgmsa_swin_filter = SwinOutputTargetFilter(hidden_dim, feature_dims)
+
+        if bool(getattr(self.config, 'use_tgmsa_pixel_calibration', False)) and not hasattr(self, 'tgmsa_pixel_calibrator'):
+            self.tgmsa_pixel_calibrator = PixelTargetBackgroundCalibrator(hidden_dim)
+
+        predictor = getattr(self, 'predictor', None)
+        if bool(getattr(self.config, 'use_tgmsa_decoder_binding', False)) and predictor is not None:
+            if not hasattr(predictor, 'tgmsa_dynamic_query') or predictor.tgmsa_dynamic_query is None:
+                predictor.tgmsa_dynamic_query = DynamicQueryBinding(
+                    hidden_dim,
+                    query_bank_size=int(getattr(self.config, 'tgmsa_query_bank_size', 4)),
+                    alpha_init=float(getattr(self.config, 'tgmsa_decoder_alpha_init', 0.0)),
+                    diversity_margin=float(getattr(self.config, 'tgmsa_diversity_margin', 0.2)),
+                    num_heads=int(getattr(self.config, 'tgmsa_query_num_heads', 4)),
+                )
+
+    def _apply_tgmsa_swin_filter(self, image_features, seg_embedding, mask_num):
+        if bool(getattr(self.config, 'use_tgmsa_swin_filter', False)) and hasattr(self, 'tgmsa_swin_filter'):
+            return self.tgmsa_swin_filter(image_features, seg_embedding, self._mask_num_as_list(mask_num))
+        return image_features
+
+    def _apply_tgmsa_pixel_calibration(self, mask_features, multi_scale_features, seg_embedding):
+        if bool(getattr(self.config, 'use_tgmsa_pixel_calibration', False)) and hasattr(self, 'tgmsa_pixel_calibrator'):
+            return self.tgmsa_pixel_calibrator(mask_features, multi_scale_features, seg_embedding)
+        return mask_features, multi_scale_features
+
+    def _tgmsa_loss_weights(self):
+        return {
+            'loss_tgmsa_query_diversity': float(getattr(self.config, 'tgmsa_query_diversity_loss_weight', 0.0)),
+            'loss_tgmsa_segment_separation': float(getattr(self.config, 'tgmsa_segment_separation_loss_weight', 0.0)),
+            'loss_tgmsa_binding_entropy': float(getattr(self.config, 'tgmsa_binding_entropy_loss_weight', 0.0)),
+            'loss_tgmsa_peer_contrast': float(getattr(self.config, 'tgmsa_peer_contrast_loss_weight', 0.0)),
+        }
+
+    def _get_tgmsa_losses(self, mask_outputs):
+        if not bool(getattr(self.config, 'use_tgmsa_decoder_binding', False)):
+            return {}
+        losses = {}
+        for name, weight in self._tgmsa_loss_weights().items():
+            if weight > 0 and name in mask_outputs:
+                losses[name] = mask_outputs[name]
+        return losses
            
     def forward(
             self,
@@ -658,6 +726,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        image_features = self._apply_tgmsa_swin_filter(image_features, SEG_embedding, mask_num)
         
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -667,8 +736,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             torch.repeat_interleave(feat, repeats=mask_num, dim=0)
             for feat in multi_scale_features
         ]
+        mask_features, multi_scale_features = self._apply_tgmsa_pixel_calibration(
+            mask_features, multi_scale_features, SEG_embedding
+        )
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding, mask_num=mask_num)
+        tgmsa_losses = self._get_tgmsa_losses(mask_outputs)
 
         # 开始计算loss
         loss = None
@@ -754,6 +827,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
         loss = llm_loss + mask_loss + 0.01 * loss_attention
+        for name, tgmsa_loss in tgmsa_losses.items():
+            loss = loss + self._tgmsa_loss_weights()[name] * tgmsa_loss
 
         return CausalOutputWithMask(
             loss=loss,
@@ -765,6 +840,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            loss_tgmsa_query_diversity=(
+                tgmsa_losses['loss_tgmsa_query_diversity'].detach()
+                if 'loss_tgmsa_query_diversity' in tgmsa_losses else None
+            ),
+            loss_tgmsa_segment_separation=(
+                tgmsa_losses['loss_tgmsa_segment_separation'].detach()
+                if 'loss_tgmsa_segment_separation' in tgmsa_losses else None
+            ),
+            loss_tgmsa_binding_entropy=(
+                tgmsa_losses['loss_tgmsa_binding_entropy'].detach()
+                if 'loss_tgmsa_binding_entropy' in tgmsa_losses else None
+            ),
+            loss_tgmsa_peer_contrast=(
+                tgmsa_losses['loss_tgmsa_peer_contrast'].detach()
+                if 'loss_tgmsa_peer_contrast' in tgmsa_losses else None
+            ),
         )
     
     def eval_seg(
@@ -809,6 +900,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state   
 
         SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+        image_features = self._apply_tgmsa_swin_filter(image_features, SEG_embedding, mask_num)
 
         mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
             image_features)
@@ -821,8 +913,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             torch.repeat_interleave(feat, repeats=mask_num, dim=0)
             for feat in multi_scale_features
         ]
+        mask_features, multi_scale_features = self._apply_tgmsa_pixel_calibration(
+            mask_features, multi_scale_features, SEG_embedding
+        )
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding, mask_num=mask_num)
 
         
         mask_pred_results = mask_outputs["pred_masks"]

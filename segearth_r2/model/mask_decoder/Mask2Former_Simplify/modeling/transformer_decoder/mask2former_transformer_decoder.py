@@ -7,6 +7,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from .position_encoding import PositionEmbeddingSine
+from .....tgmsa.tgmsa import DynamicQueryBinding
 
 
 class SelfAttentionLayer(nn.Module):
@@ -407,6 +408,11 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             seg_proj=True,
             seg_fuse_score=False,
             use_seg_query=False,
+            use_tgmsa_decoder_binding=False,
+            tgmsa_query_bank_size=4,
+            tgmsa_decoder_alpha_init=0.0,
+            tgmsa_diversity_margin=0.2,
+            tgmsa_query_num_heads=4,
     ):
         nn.Module.__init__(self)
         # positional encoding
@@ -420,6 +426,13 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
         self.use_seg_query = use_seg_query
+        self.tgmsa_dynamic_query = DynamicQueryBinding(
+            hidden_dim,
+            query_bank_size=int(tgmsa_query_bank_size),
+            alpha_init=float(tgmsa_decoder_alpha_init),
+            diversity_margin=float(tgmsa_diversity_margin),
+            num_heads=int(tgmsa_query_num_heads),
+        ) if use_tgmsa_decoder_binding else None
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -479,11 +492,11 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, mask_num=None):
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
+        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding, mask_num=mask_num)
 
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, mask_num=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -503,15 +516,21 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             src[-1] = src[-1].permute(2, 0, 1)
 
         _, bs, _ = src[0].shape
+        tgmsa_info = {}
+        if self.tgmsa_dynamic_query is not None and SEG_embedding is not None:
+            SEG_embedding, tgmsa_info = self.tgmsa_dynamic_query(SEG_embedding, mask_num=mask_num)
 
         # QxNxC
         if self.use_seg_query:
             query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         else:
-            query_embed = torch.zeros(
-                self.new_query_embed.weight.shape[0], bs, self.new_query_embed.weight.shape[-1], 
-                device=SEG_embedding.device, dtype=SEG_embedding.dtype
-            )
+            if tgmsa_info.get('query_pos') is not None:
+                query_embed = tgmsa_info['query_pos'].permute(1, 0, 2)
+            else:
+                query_embed = torch.zeros(
+                    self.new_query_embed.weight.shape[0], bs, self.new_query_embed.weight.shape[-1],
+                    device=SEG_embedding.device, dtype=SEG_embedding.dtype
+                )
         
         if seg_query is None:
             # output = self.new_query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
@@ -597,6 +616,11 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 predictions_SEG_class, predictions_mask,
             )
         }
+        for key, value in tgmsa_info.items():
+            if key.startswith('loss_tgmsa_'):
+                out[key] = value
+        if 'tgmsa_binding_logits' in tgmsa_info:
+            out['tgmsa_binding_logits'] = tgmsa_info['tgmsa_binding_logits'].detach()
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, SEG_embedding=None,

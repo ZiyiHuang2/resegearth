@@ -41,6 +41,17 @@ class ModelArguments:
     mask_config: Optional[str] = field(default="segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml")
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
+    use_tgmsa_swin_filter: bool = field(default=False)
+    use_tgmsa_pixel_calibration: bool = field(default=False)
+    use_tgmsa_decoder_binding: bool = field(default=False)
+    tgmsa_query_bank_size: int = field(default=4)
+    tgmsa_query_num_heads: int = field(default=4)
+    tgmsa_decoder_alpha_init: float = field(default=0.0)
+    tgmsa_diversity_margin: float = field(default=0.2)
+    tgmsa_query_diversity_loss_weight: float = field(default=0.0)
+    tgmsa_segment_separation_loss_weight: float = field(default=0.0)
+    tgmsa_binding_entropy_loss_weight: float = field(default=0.0)
+    tgmsa_peer_contrast_loss_weight: float = field(default=0.0)
 
 @dataclass
 class DataArguments:
@@ -183,6 +194,26 @@ def smart_tokenizer_and_embedding_resize(
         input_embeddings[-num_new_tokens:] = input_embeddings_avg
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
+TGMSA_CONFIG_DEFAULTS = {
+    "use_tgmsa_swin_filter": False,
+    "use_tgmsa_pixel_calibration": False,
+    "use_tgmsa_decoder_binding": False,
+    "tgmsa_query_bank_size": 4,
+    "tgmsa_query_num_heads": 4,
+    "tgmsa_decoder_alpha_init": 0.0,
+    "tgmsa_diversity_margin": 0.2,
+    "tgmsa_query_diversity_loss_weight": 0.0,
+    "tgmsa_segment_separation_loss_weight": 0.0,
+    "tgmsa_binding_entropy_loss_weight": 0.0,
+    "tgmsa_peer_contrast_loss_weight": 0.0,
+}
+
+
+def apply_tgmsa_config(config, model_args):
+    for name, default in TGMSA_CONFIG_DEFAULTS.items():
+        setattr(config, name, getattr(model_args, name, default))
+
+
 def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_args):
     data_ratio = data_args.data_ratio
     data_ratio = data_ratio.split('||')
@@ -289,9 +320,12 @@ def train():
         **bnb_model_from_pretrained_args
                 )
 
+    apply_tgmsa_config(model.config, model_args)
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+    else:
+        model.configure_tgmsa_modules()
 
     model.config.use_cache = False
 
@@ -356,6 +390,7 @@ def train():
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "tgmsa_swin_filter", "tgmsa_pixel_calibrator", "tgmsa_dynamic_query",
     ]
 
     if model_args.train_swin_backbone:

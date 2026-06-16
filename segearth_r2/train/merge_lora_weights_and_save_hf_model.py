@@ -45,10 +45,41 @@ def parse_args(args):
     parser.add_argument("--lora_weight_path", default="", type=str)
     parser.add_argument("--lora_bias", default="none", type=str)
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
+    parser.add_argument("--use_tgmsa_swin_filter", action="store_true")
+    parser.add_argument("--use_tgmsa_pixel_calibration", action="store_true")
+    parser.add_argument("--use_tgmsa_decoder_binding", action="store_true")
+    parser.add_argument("--tgmsa_query_bank_size", default=4, type=int)
+    parser.add_argument("--tgmsa_query_num_heads", default=4, type=int)
+    parser.add_argument("--tgmsa_decoder_alpha_init", default=0.0, type=float)
+    parser.add_argument("--tgmsa_diversity_margin", default=0.2, type=float)
+    parser.add_argument("--tgmsa_query_diversity_loss_weight", default=0.0, type=float)
+    parser.add_argument("--tgmsa_segment_separation_loss_weight", default=0.0, type=float)
+    parser.add_argument("--tgmsa_binding_entropy_loss_weight", default=0.0, type=float)
+    parser.add_argument("--tgmsa_peer_contrast_loss_weight", default=0.0, type=float)
     
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
     
     return parser.parse_args(args)
+
+
+TGMSA_CONFIG_DEFAULTS = {
+    "use_tgmsa_swin_filter": False,
+    "use_tgmsa_pixel_calibration": False,
+    "use_tgmsa_decoder_binding": False,
+    "tgmsa_query_bank_size": 4,
+    "tgmsa_query_num_heads": 4,
+    "tgmsa_decoder_alpha_init": 0.0,
+    "tgmsa_diversity_margin": 0.2,
+    "tgmsa_query_diversity_loss_weight": 0.0,
+    "tgmsa_segment_separation_loss_weight": 0.0,
+    "tgmsa_binding_entropy_loss_weight": 0.0,
+    "tgmsa_peer_contrast_loss_weight": 0.0,
+}
+
+
+def apply_tgmsa_config(config, model_args):
+    for name, default in TGMSA_CONFIG_DEFAULTS.items():
+        setattr(config, name, getattr(model_args, name, default))
 
 
 def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_module_list=[]): 
@@ -95,6 +126,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
+    apply_tgmsa_config(model.config, model_args)
     
 
     mask2former_ckpt = model_args.vision_tower_mask
@@ -108,6 +140,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "tgmsa_swin_filter", "tgmsa_pixel_calibrator", "tgmsa_dynamic_query",
     ]
 
     if model_args.lora_enable:
