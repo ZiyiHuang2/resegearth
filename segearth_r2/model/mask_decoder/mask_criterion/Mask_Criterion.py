@@ -22,7 +22,7 @@ from segearth_r2.model.mask_decoder.Mask2Former_Simplify.utils.point_features im
     get_uncertain_point_coords_with_randomness
 from segearth_r2.model.mask_decoder.Mask2Former_Simplify.utils.matcher import HungarianMatcher, batch_dice_loss_jit, \
     batch_sigmoid_ce_loss_jit, batch_sigmoid_focal_loss
-from segearth_r2.model.mask_decoder.Mask2Former_Simplify.utils.criterion import SetCriterion
+from segearth_r2.model.mask_decoder.cs_deg.hcml_losses import compute_cs_deg_losses, lambda_hcml_schedule
 
 
 def dice_loss(
@@ -130,7 +130,7 @@ def calculate_uncertainty(logits):
 
 class Criterion(nn.Module):
 
-    def __init__(self, matcher, losses, num_points, oversample_ratio, importance_sample_ratio, device):
+    def __init__(self, matcher, losses, num_points, oversample_ratio, importance_sample_ratio, device, cs_deg_config=None):
         super().__init__()
         self.matcher = matcher
         self.losses = losses
@@ -139,6 +139,10 @@ class Criterion(nn.Module):
         self.importance_sample_ratio = importance_sample_ratio
         self.device = device
         self.pos_weight = torch.tensor([99.0])
+        self.cs_deg_config = cs_deg_config
+        self.cs_deg_enabled = bool(
+            cs_deg_config and getattr(cs_deg_config, "ENABLED", False) and getattr(cs_deg_config, "HCML_LOSS", True)
+        )
 
 
     def loss_labels(self, outputs, targets, indices):
@@ -238,7 +242,56 @@ class Criterion(nn.Module):
         target_onehot = target_onehot.scatter(dim=0, index=target.unsqueeze(0), value=1)
         return target_onehot
 
-    def get_loss(self, loss, outputs, targets, indices, num_masks):
+    def _loss_cs_all(self, outputs, targets, indices, num_masks, global_step=0):
+        if not self.cs_deg_enabled:
+            return {}
+        required = ("pred_context_logits", "pred_evidence_logits", "pred_masks")
+        if not all(k in outputs for k in required):
+            return {}
+        hcml = compute_cs_deg_losses(outputs, targets, self.cs_deg_config, global_step=global_step)
+        step = 0 if global_step is None else int(global_step)
+        lam = lambda_hcml_schedule(
+            step,
+            int(getattr(self.cs_deg_config, "HCML_WARMUP_STEPS", 1000)),
+            int(getattr(self.cs_deg_config, "HCML_RAMP_STEPS", 500)),
+            float(getattr(self.cs_deg_config, "LOSS_CONTEXT_WEIGHT", 2.0)),
+        )
+        if lam == 0.0:
+            zero = outputs["pred_context_logits"].sum() * 0.0
+            return {
+                "loss_cs_context": zero,
+                "loss_cs_evidence": zero,
+                "loss_cs_rank": zero,
+                "loss_cs_sibling_aux": zero,
+                "loss_cs_consistency": zero,
+                "loss_cs_boundary": zero,
+            }
+        w_evi = float(getattr(self.cs_deg_config, "LOSS_EVIDENCE_WEIGHT", 1.0))
+        w_rank = float(getattr(self.cs_deg_config, "LOSS_RANK_WEIGHT", 0.5))
+        w_sib = float(getattr(self.cs_deg_config, "LOSS_SIBLING_AUX_WEIGHT", 0.1))
+        w_cons = float(getattr(self.cs_deg_config, "LOSS_CONSISTENCY_WEIGHT", 0.5))
+        w_bnd = float(getattr(self.cs_deg_config, "LOSS_BOUNDARY_WEIGHT", 0.2))
+        out = {
+            "loss_cs_context": hcml["loss_cs_context"] * lam,
+            "loss_cs_evidence": hcml["loss_cs_evidence"] * lam * w_evi,
+            "loss_cs_rank": hcml["loss_cs_rank"] * lam * w_rank,
+            "loss_cs_sibling_aux": hcml["loss_cs_sibling_aux"] * lam * w_sib,
+        }
+        if getattr(self.cs_deg_config, "EVIDENCE_CONSISTENCY", True):
+            out["loss_cs_consistency"] = hcml["loss_cs_consistency"] * lam * w_cons
+        else:
+            out["loss_cs_consistency"] = outputs["pred_context_logits"].sum() * 0.0
+        if getattr(self.cs_deg_config, "BOUNDARY_LOSS", False):
+            out["loss_cs_boundary"] = hcml["loss_cs_boundary"] * lam * w_bnd
+        else:
+            out["loss_cs_boundary"] = outputs["pred_context_logits"].sum() * 0.0
+        return out
+
+    def get_loss(self, loss, outputs, targets, indices, num_masks, global_step=0):
+        if loss == "cs_context":
+            return self._loss_cs_all(outputs, targets, indices, num_masks, global_step)
+        if loss in ("cs_evidence", "cs_rank", "cs_sibling_aux"):
+            return {}
         loss_map = {
             'SEG_labels': self.loss_SEG_labels,
             'masks': self.loss_masks,
@@ -254,8 +307,8 @@ class Criterion(nn.Module):
         indices = self.matcher(outputs_without_aux, targets)
         return indices
 
-    def forward(self, outputs, targets):
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+    def forward(self, outputs, targets, global_step=0):
+        outputs_without_aux = {k: v for k, v in outputs.items() if k not in ("aux_outputs", "cs_deg_stats")}
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
@@ -276,14 +329,21 @@ class Criterion(nn.Module):
         losses = {}
         # losses['indices'] = indices
         for loss in self.losses:
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_masks))
+            if loss == "cs_context":
+                losses.update(self.get_loss(loss, outputs, targets, indices, num_masks, global_step=global_step))
+            elif loss in ("cs_evidence", "cs_rank", "cs_sibling_aux"):
+                continue
+            else:
+                losses.update(self.get_loss(loss, outputs, targets, indices, num_masks, global_step=global_step))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
                 indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks)
+                    if loss.startswith("cs_"):
+                        continue
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_masks, global_step=global_step)
                     l_dict = {k + f"_{i}": v for k, v in l_dict.items()}
                     losses.update(l_dict)
 

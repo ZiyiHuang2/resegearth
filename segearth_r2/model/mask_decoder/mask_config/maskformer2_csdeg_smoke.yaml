@@ -1,0 +1,16 @@
+_BASE_: ./maskformer2_swin_base_384_bs16_50ep.yaml
+
+CS_DEG:
+  ENABLED: true
+  RET: true
+  DEPG: true
+  BHEF: true
+  SOFT_BIAS: true
+  MASK_HEAD: true
+  HCML_LOSS: true
+  EVIDENCE_CONSISTENCY: true
+  BOUNDARY_LOSS: false
+  PROMPT_TOKEN_NUM: 4
+  BIAS_WARMUP_STEPS: 0
+  HCML_WARMUP_STEPS: 0
+  LOG_GRAD_NORM: true

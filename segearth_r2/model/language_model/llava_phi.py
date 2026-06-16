@@ -143,6 +143,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.config.mask_decode_train = True
 
         self.attention_loss = AttentionLoss()
+        self.register_buffer("csdeg_step", torch.zeros((), dtype=torch.long), persistent=False)
         
         self.test_topk_per_image = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         input_shape = self.output_shape()
@@ -216,21 +217,36 @@ class SegEarthR2(MiphaPhiForCausalLM):
         weight_dict = {"loss_SEG_class": class_weight,  "loss_mask": mask_weight,
                        "loss_dice": dice_weight, }
 
+        cs_deg = getattr(cfg, "CS_DEG", None)
+        cs_deg_enabled = bool(cs_deg and getattr(cs_deg, "ENABLED", False))
+        if cs_deg_enabled and getattr(cs_deg, "HCML_LOSS", True):
+            weight_dict.update({
+                "loss_cs_context": 1.0,
+                "loss_cs_evidence": 1.0,
+                "loss_cs_rank": 1.0,
+                "loss_cs_sibling_aux": 1.0,
+                "loss_cs_consistency": 1.0,
+                "loss_cs_boundary": 1.0,
+            })
+
         self.weight_dict = weight_dict
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
             aux_weight_dict = {}
             for i in range(dec_layers - 1):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if not k.startswith("loss_cs_")})
             weight_dict.update(aux_weight_dict)
         losses = ["SEG_labels", "masks",]
+        if cs_deg_enabled and getattr(cs_deg, "HCML_LOSS", True):
+            losses.extend(["cs_context", "cs_evidence", "cs_rank", "cs_sibling_aux"])
         self.criterion = Criterion(
             matcher=matcher,
             losses=losses,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-            device=self.device
+            device=self.device,
+            cs_deg_config=cs_deg,
         )
         self.size_divisibility = 32
         self.sem_seg_postprocess_before_inference = True
@@ -259,6 +275,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_norm = cfg.MODEL.MASK_FORMER.SEG_NORM
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
+        cs_deg_cfg = getattr(cfg, "CS_DEG", None)
 
         predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(in_channels,
                                                                      hidden_dim,
@@ -271,7 +288,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                                      enforce_input_project,
                                                                      seg_norm,
                                                                      seg_proj,
-                                                                     seg_fuse_score,)
+                                                                     seg_fuse_score,
+                                                                     cs_deg_cfg=cs_deg_cfg,)
         return predictor
 
 
@@ -323,6 +341,38 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                  transformer_in_features,
                                                  common_stride)
         return pixel_decoder
+
+    def _compute_sibling_unions(self, seg_info, device):
+        from collections import defaultdict
+
+        groups = defaultdict(list)
+        for idx, seg in enumerate(seg_info):
+            gid = seg.get("group_id")
+            if gid is None:
+                image_key = str(seg.get("image_key") or seg.get("image_id") or "")
+                gid = f"{image_key}:{seg.get('data_id')}"
+            groups[gid].append((idx, seg))
+
+        sibling_unions = [None] * len(seg_info)
+        for items in groups.values():
+            masks = []
+            for _, seg in items:
+                if seg.get("mask") is not None:
+                    masks.append(torch.as_tensor(seg["mask"], device=device).float())
+            if not masks:
+                continue
+            group_union = (torch.stack(masks, dim=0).sum(dim=0) > 0).float()
+            for idx, seg in items:
+                current = torch.as_tensor(seg["mask"], device=device).float()
+                sibling = group_union.clone()
+                sibling[current > 0.5] = 0.0
+                sibling_unions[idx] = sibling
+
+        for i, seg in enumerate(seg_info):
+            if sibling_unions[i] is None:
+                m = seg.get("mask")
+                sibling_unions[i] = torch.zeros_like(torch.as_tensor(m, device=device).float()) if m is not None else torch.zeros(1, 1, 1, device=device)
+        return sibling_unions
     
     def prepare_targets(self, targets, images):
         
@@ -668,7 +718,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        step = global_step
+        if step is None:
+            step = int(self.csdeg_step.item())
+            if self.training:
+                self.csdeg_step += 1
+
+        mask_outputs = self.predictor(
+            multi_scale_features, mask_features, None, None, SEG_embedding, global_step=step
+        )
 
         # 开始计算loss
         loss = None
@@ -698,37 +756,51 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
                 targets = self.prepare_targets(gt_instances, images)
             elif 'mask' in seg_info[0]:
+                assert len(seg_info) == SEG_embedding.shape[0], (
+                    f"seg_info len {len(seg_info)} != SEG_embedding batch {SEG_embedding.shape[0]}"
+                )
+                sibling_unions = self._compute_sibling_unions(seg_info, mask_outputs['pred_masks'].device)
                 targets = []
-                for gt_mask in seg_info:
+                for gt_mask, sibling_union in zip(seg_info, sibling_unions):
                     targets.append(
                         {
                             'labels': torch.tensor([0]).to(mask_outputs['pred_masks'].device),
                             'masks': gt_mask['mask'].to(mask_outputs['pred_masks'].device),
+                            'sibling_masks': sibling_union.to(mask_outputs['pred_masks'].device),
+                            'group_id': gt_mask.get('group_id'),
+                            'mask_id': gt_mask.get('mask_id'),
                             'valid': None,
                             'inst_id': None
                         }
                     )
+                for t, seg in zip(targets, seg_info):
+                    if t.get('mask_id') is not None and seg.get('mask_id') is not None:
+                        assert int(t['mask_id']) == int(seg['mask_id']), "mask_id order mismatch in seg_info/targets"
+                assert len(targets) == SEG_embedding.shape[0]
             else:
                 targets = None
-            mask_losses = self.criterion(mask_outputs, targets)
+            mask_losses = self.criterion(mask_outputs, targets, global_step=step)
             weight_dict = self.weight_dict
 
             loss_mask = 0.0
             loss_dice = 0.0
+            loss_cs = 0.0
         
             for k in list(mask_losses.keys()):
                 if k in weight_dict:
                     if mask_losses[k] is not None:
                         mask_losses[k] *= weight_dict[k]
                     
-                    if '_mask' in k:
+                    if '_mask' in k and not k.startswith('loss_cs_'):
                         loss_mask += mask_losses[k]
                     
                     elif '_dice' in k:
                         loss_dice += mask_losses[k]
+                    elif k.startswith('loss_cs_'):
+                        loss_cs += mask_losses[k]
                 else:
                     mask_losses.pop(k)
-            mask_loss = loss_mask + loss_dice
+            mask_loss = loss_mask + loss_dice + loss_cs
 
         loss_attention = None
         masks = [_seg_info['mask'] for _seg_info in seg_info]

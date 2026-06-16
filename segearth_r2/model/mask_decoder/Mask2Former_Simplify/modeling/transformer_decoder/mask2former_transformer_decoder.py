@@ -7,6 +7,11 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 
 from .position_encoding import PositionEmbeddingSine
+from segearth_r2.model.mask_decoder.cs_deg.referential_evidence_tokenizer import ReferentialEvidenceTokenizer
+from segearth_r2.model.mask_decoder.cs_deg.dense_evidence_prompt_generator import DenseEvidencePromptGenerator
+from segearth_r2.model.mask_decoder.cs_deg.bidirectional_hierarchical_evidence_fusion import BidirectionalHierarchicalEvidenceFusion
+from segearth_r2.model.mask_decoder.cs_deg.evidence_guided_attention import fuse_evidence_attention_mask
+from segearth_r2.model.mask_decoder.cs_deg.evidence_mask_head import apply_evidence_mask_head
 
 
 class SelfAttentionLayer(nn.Module):
@@ -407,6 +412,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             seg_proj=True,
             seg_fuse_score=False,
             use_seg_query=False,
+            cs_deg_cfg=None,
     ):
         nn.Module.__init__(self)
         # positional encoding
@@ -478,12 +484,63 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+        self.cs_deg_cfg = cs_deg_cfg
+        self.cs_deg_enabled = bool(cs_deg_cfg and getattr(cs_deg_cfg, "ENABLED", False))
+        if self.cs_deg_enabled:
+            prompt_num = int(getattr(cs_deg_cfg, "PROMPT_TOKEN_NUM", 4))
+            use_detail = bool(getattr(cs_deg_cfg, "USE_MASK_FEATURE_DETAIL", True))
+            use_uncertainty = bool(getattr(cs_deg_cfg, "USE_UNCERTAINTY", True))
+            depg_heads = int(getattr(cs_deg_cfg, "NUM_HEADS", nheads))
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+            self.cs_ret = bool(getattr(cs_deg_cfg, "RET", True))
+            self.cs_depg = bool(getattr(cs_deg_cfg, "DEPG", True))
+            self.cs_bhef = bool(getattr(cs_deg_cfg, "BHEF", True))
+            self.cs_deg_soft_bias = bool(getattr(cs_deg_cfg, "SOFT_BIAS", True))
+            self.cs_deg_mask_head = bool(getattr(cs_deg_cfg, "MASK_HEAD", True))
+            self.evidence_start_layer = int(getattr(cs_deg_cfg, "EVIDENCE_START_LAYER", 1))
+            self.context_lambda = float(getattr(cs_deg_cfg, "CONTEXT_LAMBDA", 1.0))
+            self.bias_max = float(getattr(cs_deg_cfg, "BIAS_MAX", 5.0))
+            self.bias_warmup_steps = int(getattr(cs_deg_cfg, "BIAS_WARMUP_STEPS", 1000))
+            self.log_grad_norm = bool(getattr(cs_deg_cfg, "LOG_GRAD_NORM", True))
+            self.log_attention_stats = bool(getattr(cs_deg_cfg, "LOG_ATTENTION_STATS", False))
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
+            if self.cs_ret:
+                self.ret = ReferentialEvidenceTokenizer(
+                    hidden_dim=hidden_dim,
+                    prompt_token_num=prompt_num,
+                    num_layers=dec_layers,
+                    gate_init=float(getattr(cs_deg_cfg, "RET_GATE_INIT", 0.0)),
+                )
+            if self.cs_depg:
+                self.depg = DenseEvidencePromptGenerator(
+                    hidden_dim=hidden_dim,
+                    mask_dim=mask_dim,
+                    num_levels=self.num_feature_levels,
+                    num_heads=depg_heads,
+                    use_mask_feature_detail=use_detail,
+                    use_uncertainty=use_uncertainty,
+                )
+            if self.cs_bhef:
+                self.bhef = BidirectionalHierarchicalEvidenceFusion(
+                    hidden_dim=hidden_dim,
+                    num_heads=depg_heads,
+                    gate_init=float(getattr(cs_deg_cfg, "BHEF_GATE_INIT", 0.0)),
+                )
 
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+            self.cs_alpha = nn.Parameter(torch.zeros(1))
+            self.mask_gamma = nn.Parameter(
+                torch.tensor([float(getattr(cs_deg_cfg, "MASK_GAMMA_INIT", 0.0))])
+            )
+            self.mask_eta = nn.Parameter(
+                torch.tensor([float(getattr(cs_deg_cfg, "MASK_ETA_INIT", 0.0))])
+            )
+
+
+    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, global_step=None):
+
+        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding, global_step=global_step)
+
+    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, global_step=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -545,15 +602,74 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         
         predictions_mask.append(outputs_mask)
 
+        cs_step = 0 if global_step is None else int(global_step)
+        cs_deg_stats = {}
+        final_target_h = None
+        final_context_h = None
+        final_uncertainty_h = None
+        last_sparse_prompts = None
+
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
             attn_mask[torch.where(attn_mask.sum(-1) == attn_mask.shape[-1])] = False
 
+            cross_attn_mask = attn_mask
+            target_lr = context_lr = target_h = context_h = None
+            if self.cs_deg_enabled and i >= self.evidence_start_layer:
+                evidence_tokens = None
+                if self.cs_ret:
+                    evidence_tokens = self.ret(output, i, SEG_embedding)
+
+                if self.cs_depg:
+                    (
+                        sparse_prompts,
+                        target_lr,
+                        context_lr,
+                        _unc_lr,
+                        target_h,
+                        context_h,
+                    ) = self.depg(
+                        output,
+                        src[level_index],
+                        size_list[level_index],
+                        outputs_mask,
+                        mask_features,
+                        evidence_tokens,
+                        level_index,
+                        compute_high_res=(i == self.num_layers - 1),
+                    )
+                    last_sparse_prompts = sparse_prompts
+                    if target_h is not None:
+                        final_target_h = target_h
+                        final_context_h = context_h
+                        final_uncertainty_h = _unc_lr
+                    evidence_tokens = sparse_prompts
+
+                if self.cs_bhef and evidence_tokens is not None:
+                    output, evidence_tokens = self.bhef(
+                        output, src[level_index], evidence_tokens
+                    )
+
+                if self.cs_deg_soft_bias and target_lr is not None:
+                    cross_attn_mask, bias_scale = fuse_evidence_attention_mask(
+                        attn_mask,
+                        target_lr,
+                        context_lr,
+                        self.cs_alpha,
+                        cs_step,
+                        self.num_heads,
+                        context_lambda=self.context_lambda,
+                        bias_max=self.bias_max,
+                        bias_warmup_steps=self.bias_warmup_steps,
+                        mask_dtype=src[level_index].dtype,
+                    )
+                    cs_deg_stats["cs_bias_scale"] = bias_scale.detach()
+
             # attention: cross-attention first
             output = self.transformer_cross_attention_layers[i](
                 output, src[level_index],
-                memory_mask=attn_mask,
-                memory_key_padding_mask=None,  # here we do not apply masking on padded region
+                memory_mask=cross_attn_mask,
+                memory_key_padding_mask=None,
                 pos=pos[level_index], query_pos=query_embed
             )
 
@@ -563,29 +679,33 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 query_pos=query_embed
             )
 
-            # FFN
-            output = self.transformer_ffn_layers[i](
-                output
-            )
+            output = self.transformer_ffn_layers[i](output)
 
             if self.use_seg_query:
                 SEG_class, outputs_mask, attn_mask = self.forward_prediction_heads(
                     output, mask_features,
-                    attn_mask_target_size=
-                    size_list[(
-                                      i + 1) % self.num_feature_levels],
+                    attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                     SEG_embedding=SEG_embedding,
-                    )
+                )
             else:
                 SEG_class, outputs_mask, attn_mask = self.forward_prediction_heads(
                     output, mask_features,
-                    attn_mask_target_size=
-                    size_list[(
-                                      i + 1) % self.num_feature_levels],
+                    attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels],
                     SEG_embedding=None,
-                    )
+                )
+
+            if (
+                self.cs_deg_enabled
+                and self.cs_deg_mask_head
+                and target_lr is not None
+            ):
+                tgt_map = target_h if (i == self.num_layers - 1 and target_h is not None) else target_lr
+                ctx_map = context_h if (i == self.num_layers - 1 and context_h is not None) else context_lr
+                outputs_mask = apply_evidence_mask_head(
+                    outputs_mask, tgt_map, ctx_map, self.mask_gamma, self.mask_eta
+                )
+
             predictions_SEG_class.append(SEG_class)
-            
             predictions_mask.append(outputs_mask)
 
         assert len(predictions_SEG_class) == self.num_layers + 1
@@ -597,6 +717,34 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 predictions_SEG_class, predictions_mask,
             )
         }
+
+        if self.cs_deg_enabled and self.cs_depg:
+            if final_target_h is None:
+                final_target_h, final_context_h, final_uncertainty_h = self.depg.forward_high_res(
+                    output, predictions_mask[-1], mask_features, last_sparse_prompts
+                )
+            out['pred_evidence_logits'] = final_target_h
+            out['pred_context_logits'] = final_context_h
+            if final_uncertainty_h is not None:
+                out['pred_uncertainty_logits'] = final_uncertainty_h
+
+            cs_deg_stats.update({
+                'mask_gamma': self.mask_gamma.detach(),
+                'mask_eta': self.mask_eta.detach(),
+                'cs_alpha': self.cs_alpha.detach(),
+            })
+            if self.cs_ret:
+                cs_deg_stats['ret_gate'] = self.ret.ret_gate.detach()
+            if self.cs_bhef:
+                cs_deg_stats['bhef_gate'] = self.bhef.bhef_gate.detach()
+            if self.log_grad_norm and self.cs_depg:
+                grad_sq = 0.0
+                for p in self.depg.parameters():
+                    if p.grad is not None:
+                        grad_sq += p.grad.data.norm(2).item() ** 2
+                cs_deg_stats['depg_grad_norm'] = grad_sq ** 0.5
+            out['cs_deg_stats'] = cs_deg_stats
+
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size, SEG_embedding=None,

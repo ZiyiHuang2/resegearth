@@ -54,6 +54,8 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
+    lasers_holdout_ratio: float = field(default=0.05)
+    lasers_holdout_seed: int = field(default=42)
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -206,17 +208,22 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 split="val"
             )
         elif dataset_name == "lasers":
+            holdout_seed = int(getattr(data_args, "lasers_holdout_seed", training_args.data_seed))
             train_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                split="train_data.json"
+                split="train_data.json",
+                holdout_mode="train",
+                holdout_seed=holdout_seed,
             )
             eval_dataset = LaSeRSDataset(
                 base_data_path=data_args.base_data_path,
                 tokenizer=tokenizer,
                 data_args=data_args,
-                split="val_data.json"
+                split="train_data.json",
+                holdout_mode="eval",
+                holdout_seed=holdout_seed,
             )
         elif dataset_name == "refsegrs":
             train_dataset = RefSegRSDataset(
