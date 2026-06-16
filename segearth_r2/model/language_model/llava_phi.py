@@ -1,6 +1,8 @@
-from typing import List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 from addict import Dict
 from dataclasses import dataclass
+import os
+from pathlib import Path
 import torch.nn.functional as F
 import fvcore.nn.weight_init as weight_init
 import numpy as np
@@ -136,6 +138,306 @@ class SegEarthR2(MiphaPhiForCausalLM):
         "prompt_adapter",
         "query_refiner",
     )
+    DGP_STAGE_A_WEIGHTS_BIN = "dgp_stage_a_weights.bin"
+    DGP_STAGE_A_WEIGHTS_SAFE = "dgp_stage_a_weights.safetensors"
+    DGP_CONFIG_FIELDS = (
+        "dgp_version",
+        "dgp_training_stage",
+        "use_dgp_qdti",
+        "use_qdti_bias",
+        "gate_init",
+        "gate_g_init",
+        "gate_l_init",
+        "use_sigmoid_gate",
+        "dgp_fuse_dim",
+        "dgp_refiner_hidden_dim",
+        "dgp_pg_tokens",
+        "qdti_bias_dim",
+        "qdti_init_std",
+        "qdti_max_abs",
+        "qdti_apply_layers",
+        "qdti_scale_init",
+        "scale_hard_loss_weight",
+    )
+
+    STAGE_A_TRAINABLE_MARKERS = ("prompt_adapter", "query_refiner")
+    STAGE_A_FORBIDDEN_TRAINABLE_MARKERS = (
+        "SEG_token_projector",
+        "pixel_decoder",
+        "predictor",
+        "vision_tower",
+        "vision_tower_mask",
+        "lm_head",
+        "lora_",
+        "query_specific_text_memory_bias",
+        "qdti",
+    )
+
+    @classmethod
+    def _normalize_dgp_param_key(cls, name: str) -> str:
+        key = name
+        for prefix in ("base_model.model.", "model.", "module."):
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+        return key
+
+    @classmethod
+    def apply_v61_stage_defaults(cls, model_args, stage: Optional[str]) -> None:
+        stage = (stage or "").strip().lower()
+        if stage not in ("a", "b"):
+            return
+        if not getattr(model_args, "dgp_version", None):
+            model_args.dgp_version = "v6.1"
+        model_args.use_dgp_qdti = True
+        if getattr(model_args, "gate_g_init", None) is None:
+            model_args.gate_g_init = 0.01
+        if getattr(model_args, "gate_l_init", None) is None:
+            model_args.gate_l_init = 0.02
+        if getattr(model_args, "gate_init", None) is None:
+            model_args.gate_init = float(model_args.gate_l_init)
+        if stage == "a":
+            model_args.dgp_training_stage = "a"
+            model_args.use_qdti_bias = False
+            model_args.qdti_apply_layers = "disabled"
+            if getattr(model_args, "qdti_scale_init", None) is None:
+                model_args.qdti_scale_init = 0.0
+        elif stage == "b":
+            model_args.dgp_training_stage = "b"
+            model_args.use_qdti_bias = True
+            model_args.qdti_apply_layers = "last1"
+            model_args.qdti_scale_init = 1e-3
+
+    @classmethod
+    def merge_dgp_config_from_hf(cls, hf_config, model_args) -> None:
+        """Fill unset CLI args from saved HF config (eval/merge load path)."""
+        inherit_if_none = (
+            "dgp_version",
+            "dgp_training_stage",
+            "gate_init",
+            "gate_g_init",
+            "gate_l_init",
+            "use_sigmoid_gate",
+            "qdti_apply_layers",
+            "qdti_scale_init",
+            "dgp_fuse_dim",
+            "dgp_refiner_hidden_dim",
+            "dgp_pg_tokens",
+            "qdti_bias_dim",
+            "qdti_init_std",
+            "qdti_max_abs",
+            "scale_hard_loss_weight",
+        )
+        for field in inherit_if_none:
+            cli_val = getattr(model_args, field, None)
+            hf_val = getattr(hf_config, field, None)
+            if cli_val is None and hf_val is not None:
+                setattr(model_args, field, hf_val)
+
+        if not bool(getattr(model_args, "use_dgp_qdti", False)):
+            if bool(getattr(hf_config, "use_dgp_qdti", False)):
+                model_args.use_dgp_qdti = True
+
+        if getattr(model_args, "use_qdti_bias", None) is None:
+            if hasattr(hf_config, "use_qdti_bias"):
+                model_args.use_qdti_bias = bool(hf_config.use_qdti_bias)
+
+    @classmethod
+    def extract_stage_a_state_dict(cls, model) -> Dict[str, torch.Tensor]:
+        state = {}
+        for name, param in model.named_parameters():
+            if any(marker in name for marker in cls.DGP_PROMPT_KEY_MARKERS):
+                key = cls._normalize_dgp_param_key(name)
+                state[key] = param.detach().cpu().clone()
+        return state
+
+    @classmethod
+    def export_stage_a_weights(cls, model, directory: str, rank0_log: bool = True) -> str:
+        out_dir = Path(directory)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        state = cls.extract_stage_a_state_dict(model)
+        if not state:
+            raise RuntimeError(f"No Stage A DGP keys found to export under {directory}")
+
+        bin_path = out_dir / cls.DGP_STAGE_A_WEIGHTS_BIN
+        torch.save(state, bin_path)
+        try:
+            from safetensors.torch import save_file
+            save_file(state, str(out_dir / cls.DGP_STAGE_A_WEIGHTS_SAFE))
+        except Exception:
+            pass
+
+        if rank0_log:
+            keys = sorted(state.keys())
+            print(f"[DGP] Exported Stage A weights: {len(keys)} tensors -> {bin_path}")
+            print(f"[DGP] Stage A keys: {keys}")
+        return str(bin_path)
+
+    @classmethod
+    def _load_stage_a_file(cls, path: Path) -> Dict[str, torch.Tensor]:
+        if path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+            return dict(load_file(str(path)))
+        return torch.load(str(path), map_location="cpu")
+
+    @classmethod
+    def _filter_stage_a_state(cls, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        return {
+            cls._normalize_dgp_param_key(k): v
+            for k, v in state.items()
+            if any(marker in k for marker in cls.DGP_PROMPT_KEY_MARKERS)
+        }
+
+    @classmethod
+    def _remap_stage_a_state_for_model(cls, model, state: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        model_sd = model.state_dict()
+        norm_to_full = {cls._normalize_dgp_param_key(k): k for k in model_sd.keys()}
+        remapped = {}
+        for k, v in state.items():
+            nk = cls._normalize_dgp_param_key(k)
+            if nk in norm_to_full:
+                remapped[norm_to_full[nk]] = v
+            elif k in model_sd:
+                remapped[k] = v
+        return remapped
+
+    @classmethod
+    def load_dgp_stage_checkpoint(
+        cls,
+        model,
+        checkpoint_root: str,
+        markers=None,
+        rank0_log: bool = True,
+    ) -> Dict[str, object]:
+        markers = markers or cls.DGP_PROMPT_KEY_MARKERS
+        checked_paths: List[str] = []
+        root = Path(checkpoint_root)
+        if not root.exists():
+            raise FileNotFoundError(f"DGP checkpoint root not found: {checkpoint_root}")
+
+        ckpt_dir = root
+        if root.is_dir():
+            ckpts = sorted(root.glob("checkpoint-*"), key=lambda p: int(p.name.split("-")[-1]))
+            if ckpts:
+                ckpt_dir = ckpts[-1]
+
+        search_dirs = []
+        for d in (ckpt_dir, root):
+            if d not in search_dirs:
+                search_dirs.append(d)
+
+        for base in search_dirs:
+            for fname in (cls.DGP_STAGE_A_WEIGHTS_BIN, cls.DGP_STAGE_A_WEIGHTS_SAFE):
+                path = base / fname
+                checked_paths.append(str(path))
+                if path.is_file():
+                    state = cls._filter_stage_a_state(cls._load_stage_a_file(path))
+                    return cls._apply_stage_a_state(model, state, str(path), markers, rank0_log)
+
+        for base in search_dirs:
+            bin_path = base / "pytorch_model.bin"
+            checked_paths.append(str(bin_path))
+            if bin_path.is_file():
+                state = cls._filter_stage_a_state(torch.load(bin_path, map_location="cpu"))
+                return cls._apply_stage_a_state(model, state, str(bin_path), markers, rank0_log)
+
+        for base in search_dirs:
+            for st_path in sorted(base.glob("*.safetensors")):
+                if "model" not in st_path.name:
+                    continue
+                checked_paths.append(str(st_path))
+                try:
+                    from safetensors.torch import load_file
+                    state = cls._filter_stage_a_state(load_file(str(st_path)))
+                    if state:
+                        return cls._apply_stage_a_state(model, state, str(st_path), markers, rank0_log)
+                except Exception:
+                    continue
+
+        zero_dirs = [d for d in search_dirs if (d / "global_step0").exists() or list(d.glob("global_step*"))]
+        for zdir in zero_dirs:
+            checked_paths.append(str(zdir))
+            try:
+                from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+                raw = get_fp32_state_dict_from_zero_checkpoint(str(zdir))
+                state = cls._filter_stage_a_state(raw)
+                if state:
+                    return cls._apply_stage_a_state(model, state, str(zdir), markers, rank0_log)
+            except Exception:
+                continue
+
+        raise FileNotFoundError(
+            "Failed to load Stage A DGP weights. Checked paths:\n  - "
+            + "\n  - ".join(checked_paths)
+        )
+
+    @classmethod
+    def _apply_stage_a_state(
+        cls,
+        model,
+        state: Dict[str, torch.Tensor],
+        source: str,
+        markers,
+        rank0_log: bool,
+    ) -> Dict[str, object]:
+        if not state:
+            raise RuntimeError(f"No DGP keys {markers} found in {source}")
+
+        remapped = cls._remap_stage_a_state_for_model(model, state)
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        missing_markers = [
+            k for k in missing if any(m in k for m in markers)
+        ]
+        if missing_markers:
+            raise RuntimeError(
+                f"Failed to load DGP stage checkpoint from {source}; missing keys: {missing_markers[:12]}"
+            )
+
+        gate_g_after = None
+        gate_l_after = None
+        for name, param in model.named_parameters():
+            if name.endswith("query_refiner.gate_g") or name.endswith("query_refiner.gate_g_logit"):
+                gate_g_after = float(param.detach().float().cpu().reshape(-1)[0].item())
+            if name.endswith("query_refiner.gate_l") or name.endswith("query_refiner.gate_l_logit"):
+                gate_l_after = float(param.detach().float().cpu().reshape(-1)[0].item())
+        if gate_l_after is None and hasattr(model, "query_refiner"):
+            refiner = model.query_refiner
+            if getattr(refiner, "use_sigmoid_gate", False):
+                gate_l_after = float(torch.sigmoid(refiner.gate_l_logit).detach().cpu().reshape(-1)[0].item())
+            elif hasattr(refiner, "gate_l"):
+                gate_l_after = float(refiner.gate_l.detach().float().cpu().reshape(-1)[0].item())
+            elif hasattr(refiner, "gate"):
+                gate_l_after = float(refiner.gate.detach().float().cpu().reshape(-1)[0].item())
+
+        gate_g_src = None
+        gate_l_src = None
+        for k, v in state.items():
+            nk = cls._normalize_dgp_param_key(k)
+            if nk.endswith("query_refiner.gate_g") or nk.endswith("query_refiner.gate_g_logit"):
+                gate_g_src = float(v.detach().float().cpu().reshape(-1)[0].item())
+            if nk.endswith("query_refiner.gate_l") or nk.endswith("query_refiner.gate_l_logit") or nk == "query_refiner.gate":
+                gate_l_src = float(v.detach().float().cpu().reshape(-1)[0].item())
+
+        report = {
+            "source": source,
+            "loaded_keys": sorted(state.keys()),
+            "loaded_count": len(state),
+            "missing": list(missing),
+            "unexpected": list(unexpected),
+            "gate_g_src": gate_g_src,
+            "gate_l_src": gate_l_src,
+            "gate_g_after": gate_g_after,
+            "gate_l_after": gate_l_after,
+        }
+        if rank0_log:
+            print(
+                f"[DGP] Loaded {report['loaded_count']} Stage A tensors from {source}; "
+                f"gate_g_src={gate_g_src} gate_l_src={gate_l_src} "
+                f"gate_g_after={gate_g_after} gate_l_after={gate_l_after}"
+            )
+            print(f"[DGP] Loaded keys: {report['loaded_keys']}")
+            if unexpected:
+                print(f"[DGP] Unexpected keys (ignored): {report['unexpected'][:8]}")
+        return report
 
     @staticmethod
     def resolve_use_qdti_bias(model_args) -> bool:
@@ -156,9 +458,29 @@ class SegEarthR2(MiphaPhiForCausalLM):
         config.qdti_bias_dim = int(getattr(model_args, "qdti_bias_dim", 128))
         config.qdti_init_std = float(getattr(model_args, "qdti_init_std", 1e-3))
         config.qdti_max_abs = float(getattr(model_args, "qdti_max_abs", 0.01))
-        config.qdti_apply_layers = str(getattr(model_args, "qdti_apply_layers", "last3"))
-        config.qdti_scale_init = float(getattr(model_args, "qdti_scale_init", 0.0))
+        qdti_layers = getattr(model_args, "qdti_apply_layers", None)
+        stage = (getattr(model_args, "dgp_training_stage", None) or "").strip().lower()
+        version = (getattr(model_args, "dgp_version", None) or "").strip().lower()
+        if qdti_layers is None and version != "v6.1" and stage not in ("a", "b"):
+            qdti_layers = "last3"
+        if qdti_layers is not None:
+            config.qdti_apply_layers = str(qdti_layers)
+        qdti_scale = getattr(model_args, "qdti_scale_init", None)
+        if qdti_scale is not None or version == "v6.1" or stage in ("a", "b"):
+            config.qdti_scale_init = float(0.0 if qdti_scale is None else qdti_scale)
         config.scale_hard_loss_weight = float(getattr(model_args, "scale_hard_loss_weight", 0.0))
+        if getattr(model_args, "dgp_version", None) is not None:
+            config.dgp_version = str(model_args.dgp_version)
+        if getattr(model_args, "dgp_training_stage", None) is not None:
+            config.dgp_training_stage = str(model_args.dgp_training_stage)
+        if getattr(model_args, "gate_init", None) is not None:
+            config.gate_init = float(model_args.gate_init)
+        if getattr(model_args, "gate_g_init", None) is not None:
+            config.gate_g_init = float(model_args.gate_g_init)
+        if getattr(model_args, "gate_l_init", None) is not None:
+            config.gate_l_init = float(model_args.gate_l_init)
+        if getattr(model_args, "use_sigmoid_gate", None) is not None:
+            config.use_sigmoid_gate = bool(model_args.use_sigmoid_gate)
         return config
 
     def __init__(self, config, model_args=None, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None):
@@ -203,12 +525,23 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if getattr(self, "prompt_adapter", None) is None:
             self.prompt_adapter = DualGranularityPromptAdapter(llm_dim, fuse_dim, pg_tokens=pg_tokens)
         if getattr(self, "query_refiner", None) is None:
-            self.query_refiner = PromptAwareQueryRefiner(fuse_dim, refiner_hidden)
+            gate_g_init = float(getattr(self.config, "gate_g_init", 0.01))
+            gate_l_init = float(getattr(self.config, "gate_l_init", 0.02))
+            use_sigmoid_gate = bool(getattr(self.config, "use_sigmoid_gate", False))
+            self.query_refiner = PromptAwareQueryRefiner(
+                fuse_dim,
+                refiner_hidden,
+                gate_g_init=gate_g_init,
+                gate_l_init=gate_l_init,
+                use_sigmoid_gate=use_sigmoid_gate,
+            )
         if not hasattr(self, "predictor") or self.predictor is None:
             return
         spec = str(getattr(self.config, "qdti_apply_layers", "last3"))
-        if getattr(self.predictor, "qdti_apply_layers", None) is None:
-            self.predictor.qdti_apply_layers = spec if self._qdti_bias_enabled() else None
+        if spec.lower() in ("disabled", "none") or not self._qdti_bias_enabled():
+            self.predictor.qdti_apply_layers = None
+        elif getattr(self.predictor, "qdti_apply_layers", None) is None:
+            self.predictor.qdti_apply_layers = spec
         if not self._qdti_bias_enabled():
             return
         if getattr(self.predictor, "query_specific_text_memory_bias", None) is not None:
@@ -257,38 +590,196 @@ class SegEarthR2(MiphaPhiForCausalLM):
         tmm = torch.repeat_interleave(text_memory_mask, mn, dim=0)
         return tm, tmm
 
+    def _store_dgp_health(self, adapter_health: dict, refiner_health: dict) -> None:
+        payload = {}
+        for key, value in adapter_health.items():
+            if key in ("detail_prompt_source_name", "_q_detail"):
+                if key == "detail_prompt_source_name":
+                    payload[key] = value
+                continue
+            if torch.is_tensor(value):
+                payload[key] = float(value.detach().float().cpu().item())
+            else:
+                payload[key] = value
+        for key, value in refiner_health.items():
+            if torch.is_tensor(value):
+                payload[key] = float(value.detach().float().cpu().item())
+            else:
+                payload[key] = value
+        self._dgp_last_health = payload
+
+    def _build_instruction_text_mask(
+        self,
+        attention_mask: torch.Tensor,
+        seg_mask: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        *,
+        is_eval: bool = False,
+    ) -> Tuple[torch.Tensor, str]:
+        """
+        Full instruction-only KV mask for P_g / P_l text_tokens.
+        refer_span_mask is never used here (diagnostic / detail_source only).
+        """
+        base = attention_mask.bool() & ~seg_mask.bool()
+        if image_mask is not None:
+            base = base & ~image_mask.bool()
+
+        if labels is not None and labels.shape == attention_mask.shape:
+            mask = base & (labels == IGNORE_INDEX)
+            return mask, "labels_ignore_index"
+
+        if is_eval:
+            print(
+                "[DGP] Eval has no labels; using conservative mask excluding pad/image/[SEG]/special tokens."
+            )
+        return base, "conservative_no_labels"
+
+    def _maybe_audit_instruction_mask(
+        self,
+        text_mask: torch.Tensor,
+        attention_mask: torch.Tensor,
+        seg_mask: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
+        refer_span_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        mode: str,
+    ) -> None:
+        if getattr(self, "_dgp_instruction_mask_audited", False):
+            return
+        self._dgp_instruction_mask_audited = True
+
+        b = 0
+        seq_len = text_mask.shape[1]
+        included = text_mask[b].nonzero(as_tuple=False).flatten().tolist()
+        attn_row = attention_mask[b].bool() if attention_mask is not None else text_mask[b]
+        excluded = (~text_mask[b] & attn_row).nonzero(as_tuple=False).flatten().tolist()
+
+        seg_excluded = not (text_mask[b] & seg_mask[b]).any().item()
+        img_excluded = True
+        if image_mask is not None:
+            img_excluded = not (text_mask[b] & image_mask[b]).any().item()
+
+        pad_excluded = True
+        if labels is not None and labels.shape == text_mask.shape:
+            pad_excluded = not (text_mask[b] & (labels == 0)).any().item()
+
+        assistant_excluded = True
+        if labels is not None and labels.shape == text_mask.shape:
+            assistant_excluded = not (text_mask[b] & (labels != IGNORE_INDEX)).any().item()
+
+        refer_span_present = False
+        refer_span_in_text = False
+        if refer_span_mask is not None:
+            refer_span_present = bool(refer_span_mask[b].any().item())
+            refer_span_in_text = bool((text_mask[b] & refer_span_mask[b].bool()).any().item())
+
+        text_mask_equals_refer_only = False
+        if refer_span_present:
+            refer_only = attention_mask[b].bool() & refer_span_mask[b].bool()
+            text_mask_equals_refer_only = bool((text_mask[b] == refer_only).all().item())
+
+        print("[DGP][instruction_mask_audit] text_mask_mode=", mode)
+        print(f"  seq_len={seq_len} included_count={len(included)} excluded_count={len(excluded)}")
+        print(f"  included_token_indices_head={included[:16]}{'...' if len(included) > 16 else ''}")
+        print(f"  excluded_token_indices_head={excluded[:16]}{'...' if len(excluded) > 16 else ''}")
+        print(f"  [SEG]_excluded={seg_excluded} image_excluded={img_excluded} pad_excluded={pad_excluded}")
+        print(f"  assistant_answer_excluded={assistant_excluded}")
+        print(
+            f"  refer_span_present={refer_span_present} refer_span_in_text={refer_span_in_text} "
+            f"text_mask_is_refer_only={text_mask_equals_refer_only}"
+        )
+        if text_mask_equals_refer_only and refer_span_present:
+            print("  [WARN] text_mask equals refer_span only — P_g would not be expression-level")
+
+    def _build_instruction_mask(
+        self,
+        attention_mask: torch.Tensor,
+        seg_mask: torch.Tensor,
+        image_mask: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        refer_span_mask: Optional[torch.Tensor] = None,
+        is_eval: bool = False,
+    ) -> torch.Tensor:
+        mask, mode = self._build_instruction_text_mask(
+            attention_mask, seg_mask, image_mask, labels, is_eval=is_eval
+        )
+        self._maybe_audit_instruction_mask(
+            mask, attention_mask, seg_mask, image_mask, refer_span_mask, labels, mode
+        )
+        return mask
+
+    @classmethod
+    def validate_stage_a_trainable_params(cls, model, rank0_log: bool = True) -> None:
+        """Fail fast if any trainable parameter falls outside Stage A whitelist."""
+        trainable_names = [n for n, p in model.named_parameters() if p.requires_grad]
+        if rank0_log:
+            print(f"[DGP v6.1 Stage A] trainable parameter count={len(trainable_names)}")
+            for name in sorted(trainable_names):
+                print(f"  [TRAINABLE] {name}")
+
+        invalid = []
+        for name in trainable_names:
+            if any(forbidden in name for forbidden in cls.STAGE_A_FORBIDDEN_TRAINABLE_MARKERS):
+                invalid.append(name)
+                continue
+            if not any(marker in name for marker in cls.STAGE_A_TRAINABLE_MARKERS):
+                invalid.append(name)
+
+        if invalid:
+            raise RuntimeError(
+                "[DGP v6.1 Stage A] Invalid trainable parameters outside whitelist:\n  - "
+                + "\n  - ".join(sorted(invalid))
+            )
+
     def _compute_seg_embedding_with_dgp(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         seg_embedding_indices: torch.Tensor,
         image_features_indices: Optional[torch.Tensor] = None,
-        token_refer_id=None,
         target_phrase_mask: Optional[torch.Tensor] = None,
+        refer_span_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        class_hints: Optional[list] = None,
+        is_eval: bool = False,
     ):
         seg_mask = seg_embedding_indices.bool()
         image_mask = image_features_indices.bool() if image_features_indices is not None else None
+        instruction_mask = self._build_instruction_mask(
+            attention_mask, seg_mask, image_mask, labels, refer_span_mask, is_eval=is_eval
+        )
 
         seg_hidden_bq, seg_valid_mask = pack_seg_hidden_states_bq(hidden_states, seg_mask)
         seg_embedding = self.SEG_token_projector(seg_hidden_bq)
 
-        _, _, prompt_tokens, prompt_mask = self.prompt_adapter(
+        p_g, p_l, prompt_tokens, prompt_mask, adapter_health = self.prompt_adapter(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             seg_mask=seg_mask,
+            q_seg=seg_embedding,
             target_phrase_mask=target_phrase_mask,
+            refer_span_mask=refer_span_mask,
             image_mask=image_mask,
-            token_refer_id=token_refer_id,
-            embed_fn=self.embed_refer_ids,
-            pad_token_id=self._resolve_pad_token_id(),
+            instruction_mask=instruction_mask,
+            seg_query_mask=seg_valid_mask,
         )
 
-        q_ref = self.query_refiner(
+        q_ref, refiner_health = self.query_refiner(
             seg_embedding,
-            prompt_tokens,
+            p_g,
+            p_l,
             seg_query_mask=seg_valid_mask,
             prompt_mask=prompt_mask,
         )
+        self._store_dgp_health(adapter_health, refiner_health)
+        if class_hints is not None:
+            self._dgp_last_health["class_hints"] = list(class_hints)
+            cos_pl = float(adapter_health.get("cos_pl_qseg", torch.tensor(0.0)).detach().float().cpu().item()
+                if torch.is_tensor(adapter_health.get("cos_pl_qseg")) else float(adapter_health.get("cos_pl_qseg", 0.0)))
+            for hints in class_hints:
+                for cls_name in hints:
+                    self._dgp_last_health[f"class_{cls_name}_cos_pl_qseg"] = cos_pl
 
         B, Q, D = q_ref.shape
         if seg_valid_mask.shape != (B, Q):
@@ -549,6 +1040,33 @@ class SegEarthR2(MiphaPhiForCausalLM):
         embedded_refer = self.get_model().embed_tokens(refer_ids)
         return embedded_refer
 
+    @staticmethod
+    def _class_hints_from_token_refer_id(token_refer_id, tokenizer=None) -> list:
+        problem_classes = ("bridge", "vehicle", "ship", "tennis")
+        if token_refer_id is None:
+            return []
+        if torch.is_tensor(token_refer_id):
+            refer_items = [token_refer_id]
+        elif isinstance(token_refer_id, (list, tuple)):
+            refer_items = list(token_refer_id)
+        else:
+            refer_items = [token_refer_id]
+
+        hints = []
+        for refer_ids in refer_items:
+            if refer_ids is None or (torch.is_tensor(refer_ids) and refer_ids.numel() == 0):
+                hints.append([])
+                continue
+            if tokenizer is not None:
+                text = tokenizer.decode(
+                    refer_ids.detach().cpu().tolist() if torch.is_tensor(refer_ids) else refer_ids,
+                    skip_special_tokens=True,
+                ).lower()
+            else:
+                text = ""
+            hints.append([cls for cls in problem_classes if cls in text])
+        return hints
+
     def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
         assert len(image_token_indices) == 1, 'not supporting multi image index'
@@ -562,6 +1080,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             cur_new_label = None
         
         cur_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        cur_refer_span_indices = []
+        track_refer_span = SEG_token_embedding_indices is not None
         
         chunks = []
         current_chunk = []
@@ -586,6 +1106,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(torch.full((img_feature.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if track_refer_span:
+                    cur_refer_span_indices.append(torch.zeros(img_feature.shape[0], device=input_id.device, dtype=torch.bool))
                 if label is not None:
                     cur_new_label.append(
                         torch.full((img_feature.shape[0],), IGNORE_INDEX, device=label.device,
@@ -603,6 +1125,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     cur_SEG_token_embedding_indices.append(
                         torch.full((refer_embed.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if track_refer_span:
+                    cur_refer_span_indices.append(torch.ones(refer_embed.shape[0], device=input_id.device, dtype=torch.bool))
                 if label is not None:
                     cur_new_label.append(
                         torch.full((refer_embed.shape[0],), IGNORE_INDEX, device=label.device,
@@ -615,6 +1139,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(SEG_token_embedding_indices[:chunk_len])
+                if track_refer_span:
+                    cur_refer_span_indices.append(torch.zeros(chunk_len, device=input_id.device, dtype=torch.bool))
                 if label is not None:
                     cur_new_label.append(label[:chunk_len])
 
@@ -634,12 +1160,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if SEG_token_embedding_indices is not None:
             cur_SEG_token_embedding_indices = [x.to(device=self.device) for x in cur_SEG_token_embedding_indices]
             cur_SEG_token_embedding_indices = torch.cat(cur_SEG_token_embedding_indices, dim=0)
+
+        cur_refer_span_mask = None
+        if track_refer_span:
+            cur_refer_span_indices = [x.to(device=self.device) for x in cur_refer_span_indices]
+            cur_refer_span_mask = torch.cat(cur_refer_span_indices, dim=0).bool()
         
         if image_features_indices:
             image_features_indices = [x.to(device=self.device) for x in image_features_indices]
             image_features_indices = torch.cat(image_features_indices, dim=0)
 
-        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, image_features_indices
+        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, image_features_indices, cur_refer_span_mask
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, attention_mask, past_key_values, labels, images, token_refer_id=None, SEG_token_embedding_indices=None):
 
@@ -650,7 +1181,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 1] == 1:
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                                             dtype=attention_mask.dtype, device=attention_mask.device)
-            return input_ids, attention_mask, past_key_values, None, labels, None, None
+            return input_ids, attention_mask, past_key_values, None, labels, None, None, None
 
         image_features = self.encode_images(images)
 
@@ -659,6 +1190,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         new_image_features_indices = []
         
         new_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        new_refer_span_mask = [] if SEG_token_embedding_indices is not None else None
         for batch_idx, cur_input_ids in enumerate(input_ids):
             cur_image_feature = image_features[batch_idx]
             
@@ -687,7 +1219,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             cur_refer_embedding = self.embed_refer_ids(cur_token_refer_id)
 
-            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_image_features_indices= self.concat_image_seg_cls_embeds(
+            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_image_features_indices, cur_refer_span_mask = self.concat_image_seg_cls_embeds(
                 input_id=cur_input_ids,
                 img_feature=cur_image_feature,
                 label=cur_label,
@@ -701,6 +1233,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices.append(cur_SEG_token_embedding_indices)
+                new_refer_span_mask.append(cur_refer_span_mask)
 
             if new_image_features_indices is not None:
                 new_image_features_indices.append(cur_image_features_indices)
@@ -729,13 +1262,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices_align = []
-                for new_SEG_token_embedding_indice in new_SEG_token_embedding_indices:
+                new_refer_span_mask_align = []
+                for new_SEG_token_embedding_indice, new_refer_span in zip(
+                    new_SEG_token_embedding_indices, new_refer_span_mask
+                ):
                     new_SEG_token_embedding_indice = torch.cat(
                         (new_SEG_token_embedding_indice,
                          torch.zeros((max_len - new_SEG_token_embedding_indice.shape[0]),dtype=new_SEG_token_embedding_indice.dtype, device=new_SEG_token_embedding_indice.device)),
                         dim=0)
+                    new_refer_span = torch.cat(
+                        (new_refer_span,
+                         torch.zeros((max_len - new_refer_span.shape[0]), dtype=torch.bool, device=new_refer_span.device)),
+                        dim=0)
                     new_SEG_token_embedding_indices_align.append(new_SEG_token_embedding_indice)
+                    new_refer_span_mask_align.append(new_refer_span)
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices_align, dim=0)
+                new_refer_span_mask = torch.stack(new_refer_span_mask_align, dim=0)
             
             if new_image_features_indices is not None:
                 new_image_features_indices_align = []
@@ -769,6 +1311,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices, dim=0)
+                new_refer_span_mask = torch.stack(new_refer_span_mask, dim=0)
 
             if new_image_features_indices is not None:
                 new_image_features_indices = torch.stack(new_image_features_indices, dim=0)
@@ -780,7 +1323,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
    
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices
+        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices, new_refer_span_mask
     
     def get_SEG_embedding(self, hidden_states, SEG_embedding_indices):
         SEG_embedding_list = []
@@ -826,9 +1369,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 image_features = self.get_vision_tower_feature(images)
                 bs = input_ids.shape[0]
             
-            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
                 token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
+        else:
+            refer_span_mask = None
 
         outputs = self.model(
             input_ids=input_ids,
@@ -848,12 +1393,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         text_memory = None
         text_memory_mask = None
         if self._dgp_qdti_enabled():
+            class_hints = self._class_hints_from_token_refer_id(
+                token_refer_id, tokenizer=getattr(self, "tokenizer", None)
+            )
             q_ref, text_memory, text_memory_mask = self._compute_seg_embedding_with_dgp(
                 hidden_states,
                 attention_mask,
                 SEG_token_embedding_indices,
                 image_features_indices=image_features_indices,
-                token_refer_id=token_refer_id,
+                refer_span_mask=refer_span_mask,
+                labels=labels,
+                class_hints=class_hints,
             )
             if not self._qdti_bias_enabled():
                 text_memory = None
@@ -1006,7 +1556,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
-            mask_num = None):
+            mask_num = None,
+            dgp_use_refined_query: bool = True):
         
         output_attentions = False
         output_hidden_states = False
@@ -1014,7 +1565,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         image_features = self.get_vision_tower_feature(images)
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
             token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
     
@@ -1033,14 +1584,25 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         text_memory = None
         text_memory_mask = None
+        q_seg_baseline = None
         if self._dgp_qdti_enabled():
+            class_hints = self._class_hints_from_token_refer_id(
+                token_refer_id, tokenizer=getattr(self, "tokenizer", None)
+            )
             q_ref, text_memory, text_memory_mask = self._compute_seg_embedding_with_dgp(
                 hidden_states,
                 attention_mask,
                 SEG_token_embedding_indices,
                 image_features_indices=image_features_indices,
-                token_refer_id=token_refer_id,
+                refer_span_mask=refer_span_mask,
+                labels=labels,
+                class_hints=class_hints,
+                is_eval=True,
             )
+            if not dgp_use_refined_query:
+                seg_mask = SEG_token_embedding_indices.bool()
+                seg_hidden_bq, _ = pack_seg_hidden_states_bq(hidden_states, seg_mask)
+                q_seg_baseline = self.SEG_token_projector(seg_hidden_bq)
             if not self._qdti_bias_enabled():
                 text_memory = None
                 text_memory_mask = None
@@ -1062,7 +1624,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         ]
 
         if self._dgp_qdti_enabled():
-            SEG_embedding = expand_bq_for_mask_num(q_ref, mask_num)
+            seg_query = q_seg_baseline if (not dgp_use_refined_query and q_seg_baseline is not None) else q_ref
+            SEG_embedding = expand_bq_for_mask_num(seg_query, mask_num)
             if SEG_embedding.dim() != 3:
                 raise ValueError(f"SEG_embedding must be [B,Q,256], got {tuple(SEG_embedding.shape)}")
 

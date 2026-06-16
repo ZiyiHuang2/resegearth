@@ -64,9 +64,15 @@ class DataArguments:
     qdti_bias_dim: int = 128
     qdti_init_std: float = 1e-3
     qdti_max_abs: float = 0.01
-    qdti_apply_layers: str = "last3"
-    qdti_scale_init: float = 0.0
+    qdti_apply_layers: Optional[str] = None
+    qdti_scale_init: Optional[float] = None
     scale_hard_loss_weight: float = 0.0
+    dgp_version: Optional[str] = None
+    dgp_training_stage: Optional[str] = None
+    gate_init: Optional[float] = None
+    gate_g_init: Optional[float] = None
+    gate_l_init: Optional[float] = None
+    dgp_use_refined_query: bool = field(default=True)
 
 
 def init_distributed_mode(args):
@@ -190,6 +196,11 @@ def evaluation():
 
     model_path = os.path.expanduser(data_args.model_path)
 
+    dgp_stage = (getattr(data_args, "dgp_training_stage", None) or "").strip().lower()
+    if dgp_stage in ("a", "b"):
+        from segearth_r2.model.language_model.llava_phi import SegEarthR2
+        SegEarthR2.apply_v61_stage_defaults(data_args, dgp_stage)
+
     tokenizer, model, image_processor, context_len = load_pretrained_model(
         model_path,
         model_args=data_args,
@@ -198,6 +209,15 @@ def evaluation():
         load_4bit=data_args.load_4bit,
         device="cuda",
     )
+
+    if data_args.local_rank == 0:
+        print(
+            f"[Eval][DGP config] version={getattr(model.config, 'dgp_version', None)} "
+            f"stage={getattr(model.config, 'dgp_training_stage', None)} "
+            f"qdti_apply_layers={getattr(model.config, 'qdti_apply_layers', None)} "
+            f"qdti_scale_init={getattr(model.config, 'qdti_scale_init', None)} "
+            f"use_qdti_bias={getattr(model.config, 'use_qdti_bias', None)}"
+        )
 
     device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
     if data_args.load_8bit or data_args.load_4bit:
@@ -279,6 +299,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
+                dgp_use_refined_query=data_args.dgp_use_refined_query,
             )
 
             for output in outputs:

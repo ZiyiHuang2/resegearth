@@ -1,11 +1,13 @@
 import os
 import sys
+import pathlib
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
+import torch
 import transformers
-from transformers import SiglipImageProcessor
+from transformers import SiglipImageProcessor, TrainerCallback
 from peft import LoraConfig, get_peft_model
 import warnings
 import copy
@@ -52,6 +54,13 @@ class ModelArguments:
     qdti_apply_layers: str = field(default="last3")
     qdti_scale_init: float = field(default=0.0)
     scale_hard_loss_weight: float = field(default=0.0)
+    dgp_version: Optional[str] = field(default=None)
+    gate_init: Optional[float] = field(default=None)
+    gate_g_init: Optional[float] = field(default=None)
+    gate_l_init: Optional[float] = field(default=None)
+    use_sigmoid_gate: bool = field(default=False)
+    dgp_training_stage: Optional[str] = field(default=None, metadata={"help": "DGP v6.1 stage: a or b"})
+    dgp_stage_a_checkpoint: Optional[str] = field(default=None, metadata={"help": "Stage A output dir for Stage B weight load"})
 
 @dataclass
 class DataArguments:
@@ -110,6 +119,7 @@ class TrainingArguments(transformers.TrainingArguments):
     dataloader_drop_last: bool = True
     dgp_monitor_wandb: bool = field(default=False)
     dgp_monitor_steps: int = field(default=10)
+    dgp_reset_optimizer: bool = field(default=False, metadata={"help": "Stage B: do not resume optimizer/scheduler state"})
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -275,12 +285,51 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     )
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
+
+class DGPCheckpointCallback(TrainerCallback):
+    """Sync v6.1 DGP config on checkpoint save; export Stage A lightweight weights when stage=a."""
+
+    def __init__(self, stage: str = "", model_args=None):
+        self.stage = (stage or "").strip().lower()
+        self.model_args = model_args
+
+    def _sync_and_save_config(self, model, directory: str) -> None:
+        if self.model_args is not None:
+            SegEarthR2.sync_dgp_config_from_args(model.config, self.model_args)
+        os.makedirs(directory, exist_ok=True)
+        model.config.save_pretrained(directory)
+
+    def on_save(self, args, state, control, model=None, **kwargs):
+        if model is None or getattr(args, "local_rank", 0) not in (-1, 0):
+            return
+        ckpt_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+        if os.path.isdir(ckpt_dir):
+            self._sync_and_save_config(model, ckpt_dir)
+            if self.stage == "a":
+                SegEarthR2.export_stage_a_weights(model, ckpt_dir, rank0_log=True)
+        self._sync_and_save_config(model, args.output_dir)
+        if self.stage == "a":
+            SegEarthR2.export_stage_a_weights(model, args.output_dir, rank0_log=True)
+
+
 def train():
     global local_rank
 
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    dgp_stage = (model_args.dgp_training_stage or "").strip().lower()
+    if dgp_stage in ("a", "b"):
+        SegEarthR2.apply_v61_stage_defaults(model_args, dgp_stage)
+    if dgp_stage == "a":
+        training_args.lora_enable = False
+        if training_args.local_rank in (-1, 0):
+            print("[DGP v6.1] Stage A: use_qdti_bias=False, train prompt_adapter+query_refiner only")
+            print("[DGP v6.1] gate_g_init=0.01 gate_l_init=0.02 (raw gates; no sigmoid(-2) default)")
+    elif dgp_stage == "b":
+        training_args.dgp_reset_optimizer = True
+        if training_args.local_rank in (-1, 0):
+            print("[DGP v6.1] Stage B: last1 QDTI, qdti_scale_init=1e-3, reset optimizer")
     if training_args.seed is None:
         training_args.seed = 42
     if training_args.data_seed is None:
@@ -308,6 +357,15 @@ def train():
     else:
         SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
         model.ensure_dgp_qdti_modules()
+
+    SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
+
+    if dgp_stage == "b" and model_args.dgp_stage_a_checkpoint:
+        SegEarthR2.load_dgp_stage_checkpoint(
+            model,
+            model_args.dgp_stage_a_checkpoint,
+            rank0_log=training_args.local_rank in (-1, 0),
+        )
 
     model.config.use_cache = False
 
@@ -370,11 +428,16 @@ def train():
 
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
-    train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
-    ]
-    if getattr(model_args, "use_dgp_qdti", False):
-        train_module_list.extend(["prompt_adapter", "query_refiner"])
+
+    if dgp_stage == "a":
+        train_module_list = ["prompt_adapter", "query_refiner"]
+        model.requires_grad_(False)
+    else:
+        train_module_list = [
+            "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        ]
+        if getattr(model_args, "use_dgp_qdti", False):
+            train_module_list.extend(["prompt_adapter", "query_refiner"])
 
     if model_args.train_swin_backbone:
         train_module_list.append('vision_tower_mask')
@@ -395,64 +458,88 @@ def train():
         model = get_peft_model(model, lora_config)
         model.print_trainable_parameters()
 
-        for n, p in model.named_parameters():
-            if any(
-                [
-                    x in n
-                    for x in train_module_list
-                ]):
+    for n, p in model.named_parameters():
+        if any(x in n for x in train_module_list):
+            p.requires_grad = True
 
-                p.requires_grad = True
+    if dgp_stage == "a":
+        SegEarthR2.validate_stage_a_trainable_params(
+            model, rank0_log=training_args.local_rank in (-1, 0)
+        )
 
-        if training_args.local_rank in (-1, 0):
-            total = sum(p.numel() for p in model.parameters())
-            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            dgp_keywords = (
-                "prompt_adapter", "query_refiner", "query_specific_text_memory_bias",
-                "qdti", "gate", "qdti_scale",
-            )
-            dgp_trainable = sum(
-                p.numel() for n, p in model.named_parameters()
-                if p.requires_grad and any(k in n for k in dgp_keywords)
-            )
-            pct = 100.0 * trainable / total if total else 0.0
-            print(
-                f"[REAL_TRAINABLE_AFTER_UNFREEZE] trainable={trainable:,} "
-                f"all={total:,} trainable%={pct:.6f}% dgp_trainable={dgp_trainable:,}"
-            )
+    if training_args.local_rank in (-1, 0):
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        dgp_keywords = (
+            "prompt_adapter", "query_refiner", "query_specific_text_memory_bias",
+            "qdti", "gate", "qdti_scale",
+        )
+        dgp_trainable = sum(
+            p.numel() for n, p in model.named_parameters()
+            if p.requires_grad and any(k in n for k in dgp_keywords)
+        )
+        pct = 100.0 * trainable / total if total else 0.0
+        print(
+            f"[REAL_TRAINABLE_AFTER_UNFREEZE] trainable={trainable:,} "
+            f"all={total:,} trainable%={pct:.6f}% dgp_trainable={dgp_trainable:,}"
+        )
 
     model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    model.tokenizer = tokenizer
     
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
-    if hasattr(training_args, "evaluation_strategy"):
-        training_args.evaluation_strategy = "steps"
-    if hasattr(training_args, "eval_strategy"):
-        training_args.eval_strategy = "steps"
+    skip_in_training_eval = (
+        str(getattr(training_args, "evaluation_strategy", "") or "").lower() == "no"
+        or str(getattr(training_args, "eval_strategy", "") or "").lower() == "no"
+    )
+    if not skip_in_training_eval:
+        if hasattr(training_args, "evaluation_strategy"):
+            training_args.evaluation_strategy = "steps"
+        if hasattr(training_args, "eval_strategy"):
+            training_args.eval_strategy = "steps"
+        training_args.eval_steps = training_args.save_steps
+        training_args.load_best_model_at_end = True
+        training_args.metric_for_best_model = "eval_score"
+        training_args.greater_is_better = True
     training_args.save_strategy = "steps"
     if training_args.save_steps is None or training_args.save_steps <= 0:
         training_args.save_steps = 500
-    training_args.eval_steps = training_args.save_steps
-    training_args.load_best_model_at_end = True
-    training_args.metric_for_best_model = "eval_score"
-    training_args.greater_is_better = True
-    if training_args.save_total_limit is None or training_args.save_total_limit > 2:
+    if training_args.save_total_limit is None:
         training_args.save_total_limit = 2
     
     trainer = LLaVATrainer(model=model,
                            tokenizer=tokenizer,
                            args=training_args,
+                           callbacks=[DGPCheckpointCallback(stage=dgp_stage, model_args=model_args)],
                            **data_module)
     if getattr(training_args, "dgp_monitor_wandb", False):
         from segearth_r2.train.dgp_wandb_monitor import attach_dgp_wandb_monitor
         attach_dgp_wandb_monitor(trainer, model)
-    if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+
+    resume = bool(list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")))
+    if getattr(training_args, "dgp_reset_optimizer", False) or dgp_stage == "b":
+        resume = False
+        if training_args.local_rank in (-1, 0):
+            print("[DGP] Optimizer/scheduler reset (no checkpoint resume)")
+
+    if resume:
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
     trainer.save_state()
+
+    SegEarthR2.sync_dgp_config_from_args(model.config, model_args)
+    if dgp_stage in ("a", "b"):
+        model.config.save_pretrained(training_args.output_dir)
+    if dgp_stage == "a":
+        SegEarthR2.export_stage_a_weights(
+            trainer.model,
+            training_args.output_dir,
+            rank0_log=training_args.local_rank in (-1, 0),
+        )
 
     model.config.use_cache = True
 

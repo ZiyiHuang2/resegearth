@@ -56,11 +56,23 @@ def parse_args(args):
     parser.add_argument("--qdti_bias_dim", default=128, type=int)
     parser.add_argument("--qdti_init_std", default=1e-3, type=float)
     parser.add_argument("--qdti_max_abs", default=0.01, type=float)
-    parser.add_argument("--qdti_apply_layers", default="last3", type=str)
-    parser.add_argument("--qdti_scale_init", default=0.0, type=float)
+    parser.add_argument("--qdti_apply_layers", default=None, type=str)
+    parser.add_argument("--qdti_scale_init", default=None, type=float)
     parser.add_argument("--scale_hard_loss_weight", default=0.0, type=float)
+    parser.add_argument("--dgp_version", default=None, type=str)
+    parser.add_argument("--dgp_training_stage", default=None, type=str)
+    parser.add_argument("--gate_init", default=None, type=float)
     
     return parser.parse_args(args)
+
+
+def _apply_merge_dgp_defaults(args):
+    stage = (getattr(args, "dgp_training_stage", None) or "").strip().lower()
+    version = (getattr(args, "dgp_version", None) or "").strip().lower()
+    if version == "v6.1" or stage in ("a", "b"):
+        SegEarthR2.apply_v61_stage_defaults(args, stage or "b")
+    if getattr(args, "use_dgp_qdti", False) and getattr(args, "use_qdti_bias", None) is None:
+        args.use_qdti_bias = True
 
 
 def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_module_list=[]): 
@@ -101,6 +113,12 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
+
+    hf_config = None
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_path):
+        hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+        SegEarthR2.merge_dgp_config_from_hf(hf_config, model_args)
 
     use_dgp_qdti = bool(getattr(model_args, "use_dgp_qdti", False))
     require_qdti_bias = SegEarthR2.resolve_use_qdti_bias(model_args)
@@ -163,6 +181,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
 def main(args):
     args = parse_args(args)
+    _apply_merge_dgp_defaults(args)
 
     tokenizer, model = load_pretrained_model(args.model_path, model_args=args, mask_config=args.mask_config, device='cuda')
 
@@ -170,7 +189,6 @@ def main(args):
 
     state_dict = {}
     for k, v in model.state_dict().items():
-        print(k)
         state_dict[k] = v
     model._hf_peft_config_loaded = False
     model.save_pretrained(args.save_path, state_dict=state_dict)

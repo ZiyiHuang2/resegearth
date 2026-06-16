@@ -525,6 +525,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             return False
         if spec == "last3":
             return layer_idx >= self.num_layers - 3
+        if spec == "last1":
+            return layer_idx >= self.num_layers - 1
         return False
 
     def forward(

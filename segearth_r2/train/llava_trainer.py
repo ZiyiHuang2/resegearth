@@ -387,13 +387,22 @@ class LLaVATrainer(Trainer):
         precision_sum = 0.0
         pr_counts = {thr: 0 for thr in self._PR_IOU_THRESHOLDS}
         valid_count = 0
+        flip_base_good_model_zero = 0
+        flip_base_zero_model_good = 0
+        flip_denom = 0
         eps = 1e-7
+
+        base_model = unwrap_model(model)
+        dgp_stage_a = (
+            bool(getattr(getattr(base_model, "config", None), "use_dgp_qdti", False))
+            and str(getattr(getattr(base_model, "config", None), "dgp_training_stage", "") or "").lower() == "a"
+        )
 
         for inputs in eval_dataloader:
             with torch.no_grad():
                 inputs = self._prepare_inputs(inputs)
                 token_refer_id = [ids.to(self.args.device) for ids in inputs["token_refer_id"]]
-                outputs = model.eval_seg(
+                eval_kwargs = dict(
                     input_ids=inputs["input_ids"],
                     attention_mask=inputs["attention_mask"],
                     images=inputs["images"].to(dtype=model_dtype),
@@ -404,6 +413,10 @@ class LLaVATrainer(Trainer):
                     labels=inputs["labels"],
                     mask_num=inputs["mask_num"],
                 )
+                outputs = model.eval_seg(**eval_kwargs, dgp_use_refined_query=True)
+                base_outputs = None
+                if dgp_stage_a:
+                    base_outputs = model.eval_seg(**eval_kwargs, dgp_use_refined_query=False)
 
             gt_by_key = {}
             for gt_item in inputs["seg_info"]:
@@ -413,6 +426,11 @@ class LLaVATrainer(Trainer):
                     str(gt_item.get("mask_id")),
                 )
                 gt_by_key[gt_key] = gt_item
+
+            base_by_key = {}
+            if base_outputs is not None:
+                for base_item in base_outputs:
+                    base_by_key[(str(base_item.get("image_name")), str(base_item.get("id")), str(base_item.get("mask_id")))] = base_item
 
             for pred_item in outputs:
                 pred_key = (
@@ -467,6 +485,25 @@ class LLaVATrainer(Trainer):
                     if iou >= thr:
                         pr_counts[thr] += 1
 
+                if dgp_stage_a and pred_key in base_by_key:
+                    base_pred_np = np.asarray(base_by_key[pred_key].get("pred"))
+                    if base_pred_np.ndim > 2:
+                        base_pred_np = np.squeeze(base_pred_np)
+                    base_pred_np = (base_pred_np > 0).astype(np.uint8)
+                    if base_pred_np.shape != gt_mask_np.shape:
+                        base_pred_np = cv2.resize(
+                            base_pred_np,
+                            (gt_mask_np.shape[1], gt_mask_np.shape[0]),
+                            interpolation=cv2.INTER_NEAREST,
+                        )
+                        base_pred_np = (base_pred_np > 0).astype(np.uint8)
+                    base_iou, _, _, _ = self._mask_sample_metrics(base_pred_np, gt_mask_np, eps=eps)
+                    flip_denom += 1
+                    if base_iou > 0.5 and iou == 0.0:
+                        flip_base_good_model_zero += 1
+                    if base_iou == 0.0 and iou > 0.5:
+                        flip_base_zero_model_good += 1
+
         stats_list = [
             iou_sum,
             total_inter,
@@ -475,6 +512,9 @@ class LLaVATrainer(Trainer):
             dice_sum,
             recall_sum,
             precision_sum,
+            float(flip_base_good_model_zero),
+            float(flip_base_zero_model_good),
+            float(flip_denom),
         ] + [float(pr_counts[thr]) for thr in self._PR_IOU_THRESHOLDS]
 
         if dist.is_available() and dist.is_initialized():
@@ -490,9 +530,15 @@ class LLaVATrainer(Trainer):
             dice_sum,
             recall_sum,
             precision_sum,
-        ) = stats_list[:7]
-        pr_count_values = stats_list[7:]
+            flip_base_good_model_zero,
+            flip_base_zero_model_good,
+            flip_denom,
+        ) = stats_list[:10]
+        pr_count_values = stats_list[10:]
         valid_count = int(valid_count)
+        flip_base_good_model_zero = int(flip_base_good_model_zero)
+        flip_base_zero_model_good = int(flip_base_zero_model_good)
+        flip_denom = int(flip_denom)
 
         if valid_count > 0:
             eval_giou = iou_sum / valid_count
@@ -508,6 +554,12 @@ class LLaVATrainer(Trainer):
             eval_mprecision = 0.0
         eval_pr_at_0_9 = float(pr_count_values[-1] / valid_count) if valid_count > 0 else 0.0
         eval_score = 0.45 * eval_giou + 0.35 * eval_ciou + 0.20 * eval_pr_at_0_9
+        flip_base_good_model_zero_rate = (
+            float(flip_base_good_model_zero / flip_denom) if flip_denom > 0 else 0.0
+        )
+        flip_base_zero_model_good_rate = (
+            float(flip_base_zero_model_good / flip_denom) if flip_denom > 0 else 0.0
+        )
 
         metrics = {
             f"{metric_key_prefix}_giou": float(eval_giou),
@@ -516,6 +568,14 @@ class LLaVATrainer(Trainer):
             f"{metric_key_prefix}_mdice": float(eval_mdice),
             f"{metric_key_prefix}_mrecall": float(eval_mrecall),
             f"{metric_key_prefix}_mprecision": float(eval_mprecision),
+            f"{metric_key_prefix}_base_good_to_model_zero_count": float(flip_base_good_model_zero),
+            f"{metric_key_prefix}_base_good_to_model_zero_rate": float(flip_base_good_model_zero_rate),
+            f"{metric_key_prefix}_base_zero_to_model_good_count": float(flip_base_zero_model_good),
+            f"{metric_key_prefix}_base_zero_to_model_good_rate": float(flip_base_zero_model_good_rate),
+            "base_good_to_model_zero_count": float(flip_base_good_model_zero),
+            "base_good_to_model_zero_rate": float(flip_base_good_model_zero_rate),
+            "base_zero_to_model_good_count": float(flip_base_zero_model_good),
+            "base_zero_to_model_good_rate": float(flip_base_zero_model_good_rate),
         }
         for thr, pr_count in zip(self._PR_IOU_THRESHOLDS, pr_count_values):
             thr_key = str(thr).replace(".", "_")
