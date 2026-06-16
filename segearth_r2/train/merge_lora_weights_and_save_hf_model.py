@@ -45,13 +45,24 @@ def parse_args(args):
     parser.add_argument("--lora_weight_path", default="", type=str)
     parser.add_argument("--lora_bias", default="none", type=str)
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
-    
+
+    # BQER
+    parser.add_argument("--bqer_enable", action="store_true")
+    parser.add_argument("--bqer_k_layers", default=2, type=int)
+    parser.add_argument("--bqer_boundary_weight", default=0.4, type=float)
+    parser.add_argument("--bqer_query_consistency_weight", default=0.2, type=float)
+    parser.add_argument("--bqer_small_object_weight", default=1.8, type=float)
+    parser.add_argument("--bqer_small_object_percentile", default=30.0, type=float)
+    parser.add_argument("--bqer_mod_alpha", default=0.1, type=float)
+    parser.add_argument("--bqer_token_drift_weight", default=0.02, type=float)
+    parser.add_argument("--bqer_q2b_detach_query", action="store_true")
+
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
-    
+
     return parser.parse_args(args)
 
 
-def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_module_list=[]): 
+def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_module_list=[]):
     cur_train_module_list = copy.deepcopy(train_module_list)
     cur_train_module_list.extend(["vision_tower", "vision_tower_mask"])
     cls = torch.nn.Linear
@@ -67,8 +78,9 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
                     and any([x in name for x in lora_target_modules])):
 
             lora_module_names.add(name)
-            
+
     return sorted(list(lora_module_names))
+
 
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
@@ -93,9 +105,18 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
 
+    model.config.bqer_enable = bool(getattr(model_args, 'bqer_enable', False))
+    model.config.bqer_k_layers = int(getattr(model_args, 'bqer_k_layers', 2))
+    model.config.boundary_weight = float(getattr(model_args, 'bqer_boundary_weight', 0.4))
+    model.config.query_consistency_weight = float(getattr(model_args, 'bqer_query_consistency_weight', 0.2))
+    model.config.small_object_weight = float(getattr(model_args, 'bqer_small_object_weight', 1.8))
+    model.config.small_object_percentile = float(getattr(model_args, 'bqer_small_object_percentile', 30.0))
+    model.config.bqer_mod_alpha = float(getattr(model_args, 'bqer_mod_alpha', 0.1))
+    model.config.bqer_token_drift_weight = float(getattr(model_args, 'bqer_token_drift_weight', 0.02))
+    model.config.bqer_q2b_detach_query = bool(getattr(model_args, 'bqer_q2b_detach_query', False))
+
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
-    
 
     mask2former_ckpt = model_args.vision_tower_mask
     model.initial_mask_module(mask2former_ckpt, model_args)
@@ -103,11 +124,11 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     model.get_model().initialize_vision_modules(model_args)
 
     vision_tower = model.get_model().get_vision_tower_mask()
-
     vision_tower.to(device=device)
 
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "bqer_head", "bqer_refiner", "bqer_q2b_modulator",
     ]
 
     if model_args.lora_enable:
@@ -133,19 +154,17 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     return tokenizer, model
 
+
 def main(args):
     args = parse_args(args)
 
     tokenizer, model = load_pretrained_model(args.model_path, model_args=args, mask_config=args.mask_config, device='cuda')
 
-    state_dict = {}
-    for k, v in model.state_dict().items():
-        print(k)
-        state_dict[k] = v
+    state_dict = dict(model.state_dict())
     model._hf_peft_config_loaded = False
     model.save_pretrained(args.save_path, state_dict=state_dict)
 
     tokenizer.save_pretrained(args.save_path)
-    
+
 if __name__ == "__main__":
     main(sys.argv[1:])

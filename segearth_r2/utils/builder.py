@@ -12,6 +12,9 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import json
+import os
+
 from peft import LoraConfig, get_peft_model
 
 from transformers import AutoTokenizer, BitsAndBytesConfig
@@ -20,6 +23,30 @@ from segearth_r2.model import *
 
 from segearth_r2.datasets.dataset import get_mask_config
 from segearth_r2.model.language_model.llava_phi import SegEarthR2
+
+
+def _checkpoint_contains_bqer_weights(model_path: str) -> bool:
+    candidates = [
+        os.path.join(model_path, "model.safetensors.index.json"),
+        os.path.join(model_path, "pytorch_model.bin.index.json"),
+    ]
+    for idx_path in candidates:
+        if os.path.exists(idx_path):
+            try:
+                data = json.load(open(idx_path, "r", encoding="utf-8"))
+                wm = data.get("weight_map", {}) if isinstance(data, dict) else {}
+                return any("bqer_" in k for k in wm.keys())
+            except Exception:
+                return False
+    single_candidates = [
+        os.path.join(model_path, "pytorch_model.bin"),
+        os.path.join(model_path, "model.safetensors"),
+    ]
+    for fp in single_candidates:
+        if os.path.exists(fp):
+            return True
+    return False
+
 
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
@@ -43,7 +70,23 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
-    
+
+    model.config.bqer_enable = bool(getattr(model_args, 'bqer_enable', False))
+    model.config.bqer_k_layers = int(getattr(model_args, 'bqer_k_layers', 2))
+    model.config.boundary_weight = float(getattr(model_args, 'bqer_boundary_weight', 0.4))
+    model.config.query_consistency_weight = float(getattr(model_args, 'bqer_query_consistency_weight', 0.2))
+    model.config.small_object_weight = float(getattr(model_args, 'bqer_small_object_weight', 1.8))
+    model.config.small_object_percentile = float(getattr(model_args, 'bqer_small_object_percentile', 30.0))
+    model.config.bqer_mod_alpha = float(getattr(model_args, 'bqer_mod_alpha', 0.1))
+    model.config.bqer_token_drift_weight = float(getattr(model_args, 'bqer_token_drift_weight', 0.02))
+    model.config.bqer_q2b_detach_query = bool(getattr(model_args, 'bqer_q2b_detach_query', False))
+
+    if model.config.bqer_enable and (not _checkpoint_contains_bqer_weights(model_path)):
+        raise RuntimeError(
+            f"BQER is enabled but checkpoint at {model_path} does not appear to contain BQER weights. "
+            "Disable --bqer_enable or use a checkpoint trained with BQER."
+        )
+
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor

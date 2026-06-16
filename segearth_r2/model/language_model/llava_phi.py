@@ -27,6 +27,15 @@ from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
+from ..bqer.bqer import (
+    BoundaryProposalHead,
+    QueryBoundaryRefiner,
+    QueryToBoundaryModulator,
+    masks_to_boundary_targets,
+    compute_small_object_weights,
+    mask_logits_to_boundary_prob,
+    boundary_token_drift_loss,
+)
 
 @dataclass
 class CausalOutputWithMask(CausalLMOutputWithPast):
@@ -39,6 +48,9 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_boundary: Optional[torch.FloatTensor] = None
+    loss_query_consistency: Optional[torch.FloatTensor] = None
+    loss_token_drift: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -150,6 +162,23 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+
+        # BQER config (default-off for backward compatibility)
+        self.bqer_enable = bool(getattr(self.config, 'bqer_enable', False))
+        self.bqer_k_layers = int(getattr(self.config, 'bqer_k_layers', 2))
+        self.bqer_boundary_weight = float(getattr(self.config, 'boundary_weight', 0.4))
+        self.bqer_query_consistency_weight = float(getattr(self.config, 'query_consistency_weight', 0.2))
+        self.bqer_small_object_weight = float(getattr(self.config, 'small_object_weight', 1.8))
+        self.bqer_small_object_percentile = float(getattr(self.config, 'small_object_percentile', 30.0))
+        self.bqer_mod_alpha = float(getattr(self.config, 'bqer_mod_alpha', 0.1))
+        self.bqer_token_drift_weight = float(getattr(self.config, 'bqer_token_drift_weight', 0.02))
+        self.bqer_q2b_detach_query = bool(getattr(self.config, 'bqer_q2b_detach_query', False))
+
+        hidden_dim = self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM
+        nheads = self.mask_decoder_cfg.MODEL.MASK_FORMER.NHEADS
+        self.bqer_head = BoundaryProposalHead(in_channels=hidden_dim, hidden_channels=hidden_dim)
+        self.bqer_refiner = QueryBoundaryRefiner(dim=hidden_dim, num_heads=nheads, depth=2)
+        self.bqer_q2b_modulator = QueryToBoundaryModulator(dim=hidden_dim, alpha=self.bqer_mod_alpha)
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -271,7 +300,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                                      enforce_input_project,
                                                                      seg_norm,
                                                                      seg_proj,
-                                                                     seg_fuse_score,)
+                                                                     seg_fuse_score,
+                                                                     False,
+                                                                     bool(getattr(self.config, 'bqer_enable', False)),
+                                                                     int(getattr(self.config, 'bqer_k_layers', 2)),)
         return predictor
 
 
@@ -668,7 +700,33 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        boundary_logits = None
+        boundary_logits_base = None
+        boundary_memory_tokens = None
+        boundary_memory_tokens_base = None
+        refined_queries = SEG_embedding
+        if self.bqer_enable:
+            boundary_logits_base, boundary_memory_tokens_base, fused_boundary_feature = self.bqer_head.forward_with_fused_feature(
+                multi_scale_features[-1],
+                multi_scale_features[-2],
+            )
+            refined_queries = self.bqer_refiner(SEG_embedding, boundary_memory_tokens_base)
+            query_for_mod = refined_queries.detach() if self.bqer_q2b_detach_query else refined_queries
+            fused_boundary_feature = self.bqer_q2b_modulator(
+                fused_boundary_feature,
+                query_for_mod,
+                alpha=self.bqer_mod_alpha,
+            )
+            boundary_logits, boundary_memory_tokens = self.bqer_head.features_to_boundary(fused_boundary_feature)
+
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            refined_queries,
+            SEG_embedding,
+            boundary_memory_tokens=boundary_memory_tokens,
+        )
 
         # 开始计算loss
         loss = None
@@ -730,6 +788,40 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     mask_losses.pop(k)
             mask_loss = loss_mask + loss_dice
 
+        loss_boundary = torch.tensor(0.0, device=mask_outputs['pred_masks'].device)
+        loss_query_consistency = torch.tensor(0.0, device=mask_outputs['pred_masks'].device)
+        loss_token_drift = torch.tensor(0.0, device=mask_outputs['pred_masks'].device)
+        if seg_info is not None and self.bqer_enable and boundary_logits is not None:
+            gt_masks = []
+            for item in seg_info:
+                m = item['mask'].to(boundary_logits.device).float()
+                if m.dim() == 2:
+                    m = m.unsqueeze(0)
+                if m.dim() == 3:
+                    m = m.sum(dim=0, keepdim=True)
+                m = (m > 0).float()
+                m = F.interpolate(m.unsqueeze(0), size=(800, 800), mode='nearest').squeeze(0)
+                gt_masks.append(m)
+            gt_masks = torch.stack(gt_masks, dim=0)  # [B,1,H,W]
+            boundary_t = masks_to_boundary_targets(gt_masks)
+            boundary_t = F.interpolate(boundary_t, size=boundary_logits.shape[-2:], mode='nearest')
+            sample_weights = compute_small_object_weights(
+                gt_masks,
+                percentile=self.bqer_small_object_percentile,
+                small_weight=self.bqer_small_object_weight,
+                normal_weight=1.0,
+            ).to(boundary_logits.device)
+            bce = F.binary_cross_entropy_with_logits(boundary_logits, boundary_t, reduction='none')
+            bce = bce.mean(dim=(1, 2, 3))
+            loss_boundary = (bce * sample_weights).mean()
+
+            pred_masks_for_consistency = mask_outputs['pred_masks'][:, :1]
+            pred_boundary = mask_logits_to_boundary_prob(pred_masks_for_consistency)
+            pred_boundary = F.interpolate(pred_boundary, size=boundary_logits.shape[-2:], mode='bilinear', align_corners=False)
+            loss_query_consistency = F.l1_loss(boundary_logits.sigmoid(), pred_boundary)
+            if boundary_memory_tokens_base is not None:
+                loss_token_drift = boundary_token_drift_loss(boundary_memory_tokens_base, boundary_memory_tokens)
+
         loss_attention = None
         masks = [_seg_info['mask'] for _seg_info in seg_info]
         masks_resized = [
@@ -754,6 +846,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_attention += self.attention_loss(batch_attentions, masks_down)
                              
         loss = llm_loss + mask_loss + 0.01 * loss_attention
+        if self.bqer_enable:
+            loss = (
+                loss
+                + self.bqer_boundary_weight * loss_boundary
+                + self.bqer_query_consistency_weight * loss_query_consistency
+                + self.bqer_token_drift_weight * loss_token_drift
+            )
 
         return CausalOutputWithMask(
             loss=loss,
@@ -765,6 +864,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            loss_boundary=loss_boundary.detach(),
+            loss_query_consistency=loss_query_consistency.detach(),
+            loss_token_drift=loss_token_drift.detach(),
         )
     
     def eval_seg(
@@ -822,7 +924,30 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for feat in multi_scale_features
         ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
+        boundary_memory_tokens = None
+        refined_queries = SEG_embedding
+        if self.bqer_enable:
+            _, boundary_memory_tokens_base, fused_boundary_feature = self.bqer_head.forward_with_fused_feature(
+                multi_scale_features[-1],
+                multi_scale_features[-2],
+            )
+            refined_queries = self.bqer_refiner(SEG_embedding, boundary_memory_tokens_base)
+            query_for_mod = refined_queries.detach() if self.bqer_q2b_detach_query else refined_queries
+            fused_boundary_feature = self.bqer_q2b_modulator(
+                fused_boundary_feature,
+                query_for_mod,
+                alpha=self.bqer_mod_alpha,
+            )
+            _, boundary_memory_tokens = self.bqer_head.features_to_boundary(fused_boundary_feature)
+
+        mask_outputs = self.predictor(
+            multi_scale_features,
+            mask_features,
+            None,
+            refined_queries,
+            SEG_embedding,
+            boundary_memory_tokens=boundary_memory_tokens,
+        ) 
 
         
         mask_pred_results = mask_outputs["pred_masks"]

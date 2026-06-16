@@ -51,6 +51,17 @@ class DataArguments:
     load_8bit: bool = False
     load_4bit: bool = False
 
+    # BQER
+    bqer_enable: bool = False
+    bqer_k_layers: int = 2
+    bqer_boundary_weight: float = 0.4
+    bqer_query_consistency_weight: float = 0.2
+    bqer_small_object_weight: float = 1.8
+    bqer_small_object_percentile: float = 30.0
+    bqer_mod_alpha: float = 0.1
+    bqer_token_drift_weight: float = 0.02
+    bqer_q2b_detach_query: bool = False
+
     # 新增：数据集类型与 split
     dataset_name: str = "lasers"   # lasers / rrsisd / refsegrs / risbench
     split: str = "val"             # train / val / test (rrsisd/refsegrs/risbench)

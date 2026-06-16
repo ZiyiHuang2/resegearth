@@ -42,6 +42,17 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
+    # BQER
+    bqer_enable: bool = field(default=False)
+    bqer_k_layers: int = field(default=2)
+    bqer_boundary_weight: float = field(default=0.4)
+    bqer_query_consistency_weight: float = field(default=0.2)
+    bqer_small_object_weight: float = field(default=1.8)
+    bqer_small_object_percentile: float = field(default=30.0)
+    bqer_mod_alpha: float = field(default=0.1)
+    bqer_token_drift_weight: float = field(default=0.02)
+    bqer_q2b_detach_query: bool = field(default=False)
+
 @dataclass
 class DataArguments:
     lazy_preprocess: bool = True
@@ -289,6 +300,17 @@ def train():
         **bnb_model_from_pretrained_args
                 )
 
+    # propagate BQER runtime config to model
+    model.config.bqer_enable = model_args.bqer_enable
+    model.config.bqer_k_layers = model_args.bqer_k_layers
+    model.config.boundary_weight = model_args.bqer_boundary_weight
+    model.config.query_consistency_weight = model_args.bqer_query_consistency_weight
+    model.config.small_object_weight = model_args.bqer_small_object_weight
+    model.config.small_object_percentile = model_args.bqer_small_object_percentile
+    model.config.bqer_mod_alpha = model_args.bqer_mod_alpha
+    model.config.bqer_token_drift_weight = model_args.bqer_token_drift_weight
+    model.config.bqer_q2b_detach_query = model_args.bqer_q2b_detach_query
+
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
@@ -355,7 +377,13 @@ def train():
     tokenizer.add_tokens("[SEG]")
     model.resize_token_embeddings(len(tokenizer))
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        'lm_head',
+        'pixel_decoder',
+        'predictor',
+        'SEG_token_projector',
+        'bqer_head',
+        'bqer_refiner',
+        'bqer_q2b_modulator',
     ]
 
     if model_args.train_swin_backbone:

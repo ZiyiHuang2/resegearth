@@ -407,6 +407,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             seg_proj=True,
             seg_fuse_score=False,
             use_seg_query=False,
+            bqer_enable=False,
+            bqer_k_layers=2,
     ):
         nn.Module.__init__(self)
         # positional encoding
@@ -420,6 +422,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
         self.use_seg_query = use_seg_query
+        self.bqer_enable = bool(bqer_enable)
+        self.bqer_k_layers = max(int(bqer_k_layers), 0)
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -478,12 +482,25 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+        if self.bqer_enable:
+            self.bqer_qbr_cross = CrossAttentionLayer(
+                d_model=hidden_dim,
+                nhead=nheads,
+                dropout=0.0,
+                normalize_before=pre_norm,
+            )
+            self.bqer_qbr_ffn = FFNLayer(
+                d_model=hidden_dim,
+                dim_feedforward=dim_feedforward,
+                dropout=0.0,
+                normalize_before=pre_norm,
+            )
 
-    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, boundary_memory_tokens=None):
 
-        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding)
+        return self.forward_woconcat(x, mask_features, mask, seg_query, SEG_embedding, boundary_memory_tokens)
 
-    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None):
+    def forward_woconcat(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, boundary_memory_tokens=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -568,6 +585,18 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
                 output
             )
 
+            if self.bqer_enable and boundary_memory_tokens is not None:
+                if i >= (self.num_layers - self.bqer_k_layers):
+                    output = self.bqer_qbr_cross(
+                        output,
+                        boundary_memory_tokens,
+                        memory_mask=None,
+                        memory_key_padding_mask=None,
+                        pos=None,
+                        query_pos=query_embed,
+                    )
+                    output = self.bqer_qbr_ffn(output)
+
             if self.use_seg_query:
                 SEG_class, outputs_mask, attn_mask = self.forward_prediction_heads(
                     output, mask_features,
@@ -595,7 +624,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             'pred_masks': predictions_mask[-1],
             'aux_outputs': self._set_aux_loss(
                 predictions_SEG_class, predictions_mask,
-            )
+            ),
+            'refined_queries': output.transpose(0, 1),
         }
         return out
 
