@@ -114,12 +114,13 @@ class WindowAttention(nn.Module):
         trunc_normal_(self.relative_position_bias_table, std=.02)
         self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, attn_text_bias=None):
         """ Forward function.
 
         Args:
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+            attn_text_bias: optional [num_windows*B, H, N, N] or [num_windows*B, 1, 1, N]
         """
         B_, N, C = x.shape
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -132,6 +133,9 @@ class WindowAttention(nn.Module):
             self.window_size[0] * self.window_size[1], self.window_size[0] * self.window_size[1], -1)  # Wh*Ww,Wh*Ww,nH
         relative_position_bias = relative_position_bias.permute(2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
         attn = attn + relative_position_bias.unsqueeze(0)
+
+        if attn_text_bias is not None:
+            attn = attn + attn_text_bias
 
         if mask is not None:
             nW = mask.shape[0]
@@ -191,7 +195,16 @@ class SwinTransformerBlock(nn.Module):
         self.H = None
         self.W = None
 
-    def forward(self, x, mask_matrix):
+    def forward(
+        self,
+        x,
+        mask_matrix,
+        text_cond=None,
+        reliability=None,
+        tg_swin_controller=None,
+        stage_idx=0,
+        layer_idx=0,
+    ):
         """ Forward function.
 
         Args:
@@ -226,10 +239,16 @@ class SwinTransformerBlock(nn.Module):
         x_windows = window_partition(shifted_x, self.window_size)  # nW*B, window_size, window_size, C
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
+        attn_text_bias = None
+        if tg_swin_controller is not None and text_cond is not None:
+            attn_text_bias = tg_swin_controller.compute_bias(
+                stage_idx, layer_idx, x_windows, text_cond, reliability
+            )
+
         # W-MSA/SW-MSA
         if attn_mask is not None:
             attn_mask = attn_mask.to(dtype=x_windows.dtype,device=x_windows.device)
-        attn_windows = self.attn(x_windows, mask=attn_mask)  # nW*B, window_size*window_size, C
+        attn_windows = self.attn(x_windows, mask=attn_mask, attn_text_bias=attn_text_bias)  # nW*B, window_size*window_size, C
 
         # merge windows
         attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
@@ -357,7 +376,16 @@ class BasicLayer(nn.Module):
         else:
             self.downsample = None
 
-    def forward(self, x, H, W):
+    def forward(
+        self,
+        x,
+        H,
+        W,
+        text_cond=None,
+        reliability=None,
+        tg_swin_controller=None,
+        stage_idx=0,
+    ):
         """ Forward function.
 
         Args:
@@ -386,12 +414,21 @@ class BasicLayer(nn.Module):
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
-        for blk in self.blocks:
+        tg_swin_active = tg_swin_controller is not None and text_cond is not None
+        for layer_idx, blk in enumerate(self.blocks):
             blk.H, blk.W = H, W
-            if self.use_checkpoint:
+            if self.use_checkpoint and not tg_swin_active:
                 x = checkpoint.checkpoint(blk, x, attn_mask)
             else:
-                x = blk(x, attn_mask)
+                x = blk(
+                    x,
+                    attn_mask,
+                    text_cond=text_cond,
+                    reliability=reliability,
+                    tg_swin_controller=tg_swin_controller,
+                    stage_idx=stage_idx,
+                    layer_idx=layer_idx,
+                )
         if self.downsample is not None:
             x_down = self.downsample(x, H, W)
             Wh, Ww = (H + 1) // 2, (W + 1) // 2
@@ -605,7 +642,13 @@ class SwinTransformer(nn.Module):
         else:
             raise TypeError('pretrained must be a str or None')
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        text_cond=None,
+        reliability=None,
+        tg_swin_controller=None,
+    ):
         """Forward function."""
         x = self.patch_embed(x)
 
@@ -621,7 +664,15 @@ class SwinTransformer(nn.Module):
         outs = []
         for i in range(self.num_layers):
             layer = self.layers[i]
-            x_out, H, W, x, Wh, Ww = layer(x, Wh, Ww)
+            x_out, H, W, x, Wh, Ww = layer(
+                x,
+                Wh,
+                Ww,
+                text_cond=text_cond,
+                reliability=reliability,
+                tg_swin_controller=tg_swin_controller,
+                stage_idx=i,
+            )
 
             if i in self.out_indices:
                 norm_layer = getattr(self, f'norm{i}')

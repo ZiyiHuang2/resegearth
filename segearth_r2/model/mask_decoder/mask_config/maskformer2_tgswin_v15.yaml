@@ -1,0 +1,19 @@
+_BASE_: ./maskformer2_swin_base_384_bs16_50ep.yaml
+
+TG_SWIN:
+  ENABLED: true
+  VERSION: "v1.5"
+  COND_DIM: 256
+  NUM_STAGES: 4
+  WTI_STAGES: [1, 2, 3]
+  STAGE_ROUTER: true
+  ROUTER_HIDDEN_DIM: 512
+  USE_RELATION_AWARE_POOL: true
+  HEAD_AWARE: true
+  LOW_RANK_QK: true
+  WTI_RANK: 16
+  BIAS_MAX: 4.0
+  ALPHA_INIT: 0.0
+  RELIABILITY_INIT: 0.0
+  PER_TARGET_SWING_REPEAT: true
+  LOG_STATS: false

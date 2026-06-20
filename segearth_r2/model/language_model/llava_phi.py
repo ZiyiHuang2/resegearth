@@ -20,6 +20,7 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
+from ..mask_encoder.tg_swin import TextConditionFactory, TGSwimController
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
@@ -150,6 +151,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+
+        self._init_tg_swin_modules()
             
         self.mask_decoder_training_init(self.mask_decoder_cfg)
         if pretrained_path is not None:
@@ -185,8 +188,151 @@ class SegEarthR2(MiphaPhiForCausalLM):
             print(diff_predictor_msg)
             print(diff_pixel_msg)
 
-    def get_vision_tower_feature(self, images):
-        features = self.get_model().get_vision_tower_mask()(images)
+    def _get_tg_swin_cfg(self):
+        return getattr(self.mask_decoder_cfg, "TG_SWIN", None)
+
+    def _tg_swin_enabled(self):
+        cfg = self._get_tg_swin_cfg()
+        return bool(cfg and getattr(cfg, "ENABLED", False))
+
+    def _init_tg_swin_modules(self):
+        cfg = self._get_tg_swin_cfg()
+        if not cfg or not getattr(cfg, "ENABLED", False):
+            self.tg_swin_tcf = None
+            self.tg_swin_controller = None
+            return
+
+        text_dim = getattr(cfg, "TEXT_DIM", None) or self.config.hidden_size
+        cond_dim = getattr(cfg, "COND_DIM", 256)
+        swin_type = getattr(self.config, "swin_type", "base")
+        window_size = getattr(self.mask_decoder_cfg.MODEL.SWIN, "WINDOW_SIZE", 12)
+        version = getattr(cfg, "VERSION", "v1")
+
+        self.tg_swin_tcf = TextConditionFactory(
+            text_dim=text_dim,
+            cond_dim=cond_dim,
+            reliability_init=getattr(cfg, "RELIABILITY_INIT", 0.0),
+            use_phrase_pool=getattr(cfg, "USE_PHRASE_POOL", True),
+            version=version,
+            num_stages=int(getattr(cfg, "NUM_STAGES", 4)),
+            stage_router=bool(getattr(cfg, "STAGE_ROUTER", version == "v1.5")),
+            router_hidden_dim=int(getattr(cfg, "ROUTER_HIDDEN_DIM", 512)),
+            use_relation_pool=bool(getattr(cfg, "USE_RELATION_AWARE_POOL", True)),
+        )
+        self.tg_swin_controller = TGSwimController(
+            cond_dim=cond_dim,
+            wti_rank=getattr(cfg, "WTI_RANK", 16),
+            wti_stages=list(getattr(cfg, "WTI_STAGES", [1, 2, 3])),
+            wti_start_layer=getattr(cfg, "WTI_START_LAYER", 0),
+            bias_max=getattr(cfg, "BIAS_MAX", 4.0),
+            alpha_init=getattr(cfg, "ALPHA_INIT", 0.0),
+            window_size=window_size,
+            swin_type=swin_type,
+            log_stats=getattr(cfg, "LOG_STATS", False),
+            head_aware=bool(getattr(cfg, "HEAD_AWARE", version == "v1.5")),
+            num_text_stages=int(getattr(cfg, "NUM_STAGES", 4)),
+        )
+        print(
+            f"[TG_SWIN] Initialized v={version} TCF + WTI "
+            f"(cond_dim={cond_dim}, head_aware={getattr(cfg, 'HEAD_AWARE', version == 'v1.5')}, "
+            f"stages={list(cfg.WTI_STAGES)})"
+        )
+
+    def _repeat_images_per_target(self, images, mask_num):
+        if isinstance(mask_num, torch.Tensor):
+            mask_num_list = mask_num.tolist()
+        else:
+            mask_num_list = list(mask_num)
+
+        if isinstance(images, torch.Tensor):
+            chunks = []
+            for i, n in enumerate(mask_num_list):
+                n = int(n)
+                if n > 0:
+                    chunks.append(images[i:i + 1].expand(n, -1, -1, -1))
+            if not chunks:
+                return images[:0]
+            return torch.cat(chunks, dim=0)
+
+        repeated = []
+        for img, n in zip(images, mask_num_list):
+            n = int(n)
+            repeated.extend([img] * n)
+        if not repeated:
+            return torch.stack([], dim=0) if isinstance(images[0], torch.Tensor) else []
+        return torch.stack(repeated, dim=0)
+
+    def _gather_refer_phrase_hidden(self, hidden_states, seg_indices, refer_span_mask):
+        """Gather refer-phrase hiddens per [SEG] target using region between previous SEG and current SEG."""
+        if refer_span_mask is None:
+            return None, None
+
+        phrase_pieces = []
+        for seq_hidden, seg_mask, ref_mask in zip(hidden_states, seg_indices, refer_span_mask):
+            seg_mask = seg_mask.bool()
+            ref_mask = ref_mask.bool()
+            seg_positions = seg_mask.nonzero(as_tuple=False).squeeze(-1)
+            if seg_positions.numel() == 0:
+                continue
+            if seg_positions.dim() == 0:
+                seg_positions = seg_positions.unsqueeze(0)
+
+            prev_boundary = 0
+            for seg_pos in seg_positions.tolist():
+                seg_pos = int(seg_pos)
+                region = ref_mask.clone()
+                region[:prev_boundary] = False
+                region[seg_pos:] = False
+                if region.any():
+                    phrase_pieces.append(seq_hidden[region])
+                else:
+                    phrase_pieces.append(
+                        torch.zeros(0, seq_hidden.shape[-1], device=seq_hidden.device, dtype=seq_hidden.dtype)
+                    )
+                prev_boundary = seg_pos + 1
+
+        if not phrase_pieces:
+            return None, None
+
+        max_len = max(p.shape[0] for p in phrase_pieces)
+        max_len = max(max_len, 1)
+        n_target = len(phrase_pieces)
+        hidden_dim = hidden_states.shape[-1]
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+        phrase_hidden = torch.zeros(n_target, max_len, hidden_dim, device=device, dtype=dtype)
+        phrase_mask = torch.zeros(n_target, max_len, device=device, dtype=torch.bool)
+        for i, piece in enumerate(phrase_pieces):
+            plen = piece.shape[0]
+            if plen > 0:
+                phrase_hidden[i, :plen] = piece
+                phrase_mask[i, :plen] = True
+        return phrase_hidden, phrase_mask
+
+    def build_text_cond(self, hidden_states, seg_indices, refer_span_mask=None):
+        seg_hidden = self.get_SEG_embedding(hidden_states, seg_indices).squeeze(1)
+        phrase_hidden, phrase_mask = self._gather_refer_phrase_hidden(
+            hidden_states, seg_indices, refer_span_mask
+        )
+        text_cond, reliability = self.tg_swin_tcf(
+            seg_hidden,
+            hidden_states=hidden_states,
+            seg_indices=seg_indices,
+            phrase_hidden=phrase_hidden,
+            phrase_mask=phrase_mask,
+        )
+        return seg_hidden, text_cond, reliability
+
+    def get_vision_tower_feature(self, images, text_cond=None, reliability=None):
+        swin = self.get_model().get_vision_tower_mask()
+        tg_kwargs = {}
+        if self._tg_swin_enabled() and text_cond is not None and self.tg_swin_controller is not None:
+            tg_kwargs = {
+                "text_cond": text_cond,
+                "reliability": reliability,
+                "tg_swin_controller": self.tg_swin_controller,
+            }
+        features = swin(images, **tg_kwargs)
         
         features_dict = {
             'res2': features[0], # bs, 128, 256, 256
@@ -375,6 +521,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             cur_new_label = None
         
         cur_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        cur_refer_span_indices = []
+        track_refer_span = SEG_token_embedding_indices is not None
         
         chunks = []
         current_chunk = []
@@ -399,6 +547,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(torch.full((img_feature.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if track_refer_span:
+                    cur_refer_span_indices.append(torch.zeros(img_feature.shape[0], device=input_id.device, dtype=torch.bool))
                 if label is not None:
                     cur_new_label.append(
                         torch.full((img_feature.shape[0],), IGNORE_INDEX, device=label.device,
@@ -416,6 +566,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     cur_SEG_token_embedding_indices.append(
                         torch.full((refer_embed.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if track_refer_span:
+                    cur_refer_span_indices.append(torch.ones(refer_embed.shape[0], device=input_id.device, dtype=torch.bool))
                 if label is not None:
                     cur_new_label.append(
                         torch.full((refer_embed.shape[0],), IGNORE_INDEX, device=label.device,
@@ -428,6 +580,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(SEG_token_embedding_indices[:chunk_len])
+                if track_refer_span:
+                    cur_refer_span_indices.append(torch.zeros(chunk_len, device=input_id.device, dtype=torch.bool))
                 if label is not None:
                     cur_new_label.append(label[:chunk_len])
 
@@ -447,12 +601,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if SEG_token_embedding_indices is not None:
             cur_SEG_token_embedding_indices = [x.to(device=self.device) for x in cur_SEG_token_embedding_indices]
             cur_SEG_token_embedding_indices = torch.cat(cur_SEG_token_embedding_indices, dim=0)
+
+        cur_refer_span_mask = None
+        if track_refer_span:
+            cur_refer_span_indices = [x.to(device=self.device) for x in cur_refer_span_indices]
+            cur_refer_span_mask = torch.cat(cur_refer_span_indices, dim=0).bool()
         
         if image_features_indices:
             image_features_indices = [x.to(device=self.device) for x in image_features_indices]
             image_features_indices = torch.cat(image_features_indices, dim=0)
 
-        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, image_features_indices
+        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, image_features_indices, cur_refer_span_mask
 
     def prepare_inputs_labels_for_multimodal(self, input_ids, attention_mask, past_key_values, labels, images, token_refer_id=None, SEG_token_embedding_indices=None):
 
@@ -463,7 +622,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 1] == 1:
                 attention_mask = torch.ones((attention_mask.shape[0], past_key_values[-1][-1].shape[-2] + 1),
                                             dtype=attention_mask.dtype, device=attention_mask.device)
-            return input_ids, attention_mask, past_key_values, None, labels, None, None
+            return input_ids, attention_mask, past_key_values, None, labels, None, None, None
 
         image_features = self.encode_images(images)
 
@@ -472,6 +631,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         new_image_features_indices = []
         
         new_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        new_refer_span_mask = [] if SEG_token_embedding_indices is not None else None
         for batch_idx, cur_input_ids in enumerate(input_ids):
             cur_image_feature = image_features[batch_idx]
             
@@ -500,7 +660,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             cur_refer_embedding = self.embed_refer_ids(cur_token_refer_id)
 
-            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_image_features_indices= self.concat_image_seg_cls_embeds(
+            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_image_features_indices, cur_refer_span_mask = self.concat_image_seg_cls_embeds(
                 input_id=cur_input_ids,
                 img_feature=cur_image_feature,
                 label=cur_label,
@@ -514,6 +674,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices.append(cur_SEG_token_embedding_indices)
+                new_refer_span_mask.append(cur_refer_span_mask)
 
             if new_image_features_indices is not None:
                 new_image_features_indices.append(cur_image_features_indices)
@@ -542,13 +703,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices_align = []
-                for new_SEG_token_embedding_indice in new_SEG_token_embedding_indices:
+                new_refer_span_mask_align = []
+                for new_SEG_token_embedding_indice, new_refer_span in zip(
+                    new_SEG_token_embedding_indices, new_refer_span_mask
+                ):
                     new_SEG_token_embedding_indice = torch.cat(
                         (new_SEG_token_embedding_indice,
                          torch.zeros((max_len - new_SEG_token_embedding_indice.shape[0]),dtype=new_SEG_token_embedding_indice.dtype, device=new_SEG_token_embedding_indice.device)),
                         dim=0)
+                    new_refer_span = torch.cat(
+                        (new_refer_span,
+                         torch.zeros((max_len - new_refer_span.shape[0]), dtype=torch.bool, device=new_refer_span.device)),
+                        dim=0)
                     new_SEG_token_embedding_indices_align.append(new_SEG_token_embedding_indice)
+                    new_refer_span_mask_align.append(new_refer_span)
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices_align, dim=0)
+                new_refer_span_mask = torch.stack(new_refer_span_mask_align, dim=0)
             
             if new_image_features_indices is not None:
                 new_image_features_indices_align = []
@@ -582,6 +752,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices, dim=0)
+                new_refer_span_mask = torch.stack(new_refer_span_mask, dim=0)
 
             if new_image_features_indices is not None:
                 new_image_features_indices = torch.stack(new_image_features_indices, dim=0)
@@ -593,7 +764,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
    
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices
+        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices, new_refer_span_mask
     
     def get_SEG_embedding(self, hidden_states, SEG_embedding_indices):
         SEG_embedding_list = []
@@ -632,14 +803,20 @@ class SegEarthR2(MiphaPhiForCausalLM):
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        tg_swin_enabled = self._tg_swin_enabled()
+        image_features = None
+        bs = input_ids.shape[0]
+        refer_span_mask = None
+
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
             # for generative mode only the 1th stage need
             if input_ids.shape[1] != 1:
-                image_features = self.get_vision_tower_feature(images)
-                bs = input_ids.shape[0]
+                if not tg_swin_enabled:
+                    image_features = self.get_vision_tower_feature(images)
+                    bs = input_ids.shape[0]
             
-            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
                 token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
 
@@ -657,16 +834,49 @@ class SegEarthR2(MiphaPhiForCausalLM):
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-        
-        mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
-            image_features)
-        mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
-        multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
-            for feat in multi_scale_features
-        ]
+
+        per_target_swin = (
+            tg_swin_enabled
+            and mask_num is not None
+            and seg_info is not None
+            and (input_ids is None or input_ids.shape[1] != 1)
+            and getattr(self._get_tg_swin_cfg(), "PER_TARGET_SWING_REPEAT", True)
+        )
+
+        if per_target_swin:
+            seg_hidden, text_cond, reliability = self.build_text_cond(
+                hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
+            )
+            SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
+            n_target = SEG_embedding.shape[0]
+            mask_num_tensor = torch.tensor(mask_num, device=hidden_states.device)
+            assert n_target == int(mask_num_tensor.sum().item()), (
+                f"TG_SWIN alignment: SEG targets={n_target} != sum(mask_num)={int(mask_num_tensor.sum().item())}"
+            )
+            images_expanded = self._repeat_images_per_target(images, mask_num)
+            assert images_expanded.shape[0] == n_target, (
+                f"TG_SWIN alignment: expanded images batch={images_expanded.shape[0]} != targets={n_target}"
+            )
+            image_features = self.get_vision_tower_feature(
+                images_expanded, text_cond=text_cond, reliability=reliability
+            )
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                image_features)
+            assert mask_features.shape[0] == n_target, (
+                f"TG_SWIN alignment: pixel_decoder batch={mask_features.shape[0]} != targets={n_target}"
+            )
+        else:
+            SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+            if image_features is None:
+                image_features = self.get_vision_tower_feature(images)
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                image_features)
+            mask_num_tensor = torch.tensor(mask_num, device=mask_features.device)
+            mask_features = torch.repeat_interleave(mask_features, repeats=mask_num_tensor, dim=0)
+            multi_scale_features = [
+                torch.repeat_interleave(feat, repeats=mask_num_tensor, dim=0)
+                for feat in multi_scale_features
+            ]
 
         mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
 
@@ -789,9 +999,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        image_features = self.get_vision_tower_feature(images)
+        tg_swin_enabled = self._tg_swin_enabled()
+        per_target_swin = (
+            tg_swin_enabled
+            and mask_num is not None
+            and getattr(self._get_tg_swin_cfg(), "PER_TARGET_SWING_REPEAT", True)
+        )
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices = self.prepare_inputs_labels_for_multimodal(
+        if not per_target_swin:
+            image_features = self.get_vision_tower_feature(images)
+
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
             token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
     
@@ -808,19 +1026,32 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         hidden_states = outputs.last_hidden_state   
 
-        SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
-
-        mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
-            image_features)
-    
-        images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
-        images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
-        mask_num = torch.tensor(mask_num, device=mask_features.device)
-        mask_features = torch.repeat_interleave(mask_features, repeats=mask_num, dim=0)
-        multi_scale_features = [
-            torch.repeat_interleave(feat, repeats=mask_num, dim=0)
-            for feat in multi_scale_features
-        ]
+        if per_target_swin:
+            seg_hidden, text_cond, reliability = self.build_text_cond(
+                hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
+            )
+            SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
+            n_target = SEG_embedding.shape[0]
+            images_expanded = self._repeat_images_per_target(images, mask_num)
+            assert images_expanded.shape[0] == n_target
+            image_features = self.get_vision_tower_feature(
+                images_expanded, text_cond=text_cond, reliability=reliability
+            )
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                image_features)
+            images = [s[0] for s in torch.split(images_expanded, 1, dim=0)]
+        else:
+            SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+            mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
+                image_features)
+            images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
+            images = [s[0] for image_repeat in images for s in torch.split(image_repeat, 1, dim=0)]
+            mask_num_tensor = torch.tensor(mask_num, device=mask_features.device)
+            mask_features = torch.repeat_interleave(mask_features, repeats=mask_num_tensor, dim=0)
+            multi_scale_features = [
+                torch.repeat_interleave(feat, repeats=mask_num_tensor, dim=0)
+                for feat in multi_scale_features
+            ]
 
         mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding) 
 

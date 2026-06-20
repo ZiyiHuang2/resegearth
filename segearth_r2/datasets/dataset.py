@@ -338,6 +338,23 @@ class RRSISDDataset(RS_Base_Dataset):
 
         return data_dict
     
+def split_lasers_train_holdout(records, holdout_mode: str, holdout_ratio: float = 0.05, holdout_seed: int = 42):
+    """Hold out a fixed subset of train_data.json for training-time validation."""
+    if holdout_mode not in ("train", "eval"):
+        raise ValueError(f"holdout_mode must be 'train' or 'eval', got {holdout_mode!r}")
+    n = len(records)
+    if n == 0:
+        return []
+    n_eval = max(1, int(n * holdout_ratio))
+    rng = random.Random(holdout_seed)
+    indices = list(range(n))
+    rng.shuffle(indices)
+    eval_indices = set(indices[:n_eval])
+    if holdout_mode == "eval":
+        return [records[i] for i in sorted(eval_indices)]
+    return [records[i] for i in range(n) if i not in eval_indices]
+
+
 class LaSeRSDataset(RS_Base_Dataset):
     
     def preprocess_referring_instruction(self, instruction, REFER_token='[SEG]'):
@@ -349,7 +366,16 @@ class LaSeRSDataset(RS_Base_Dataset):
 
         return token_refer_id
     
-    def __init__(self, base_data_path, tokenizer, data_args, split='train_data.json'):
+    def __init__(
+        self,
+        base_data_path,
+        tokenizer,
+        data_args,
+        split='train_data.json',
+        holdout_mode=None,
+        holdout_ratio=0.05,
+        holdout_seed=42,
+    ):
         self.pixel_mean = torch.Tensor([123.675, 116.28, 103.53]).view(-1, 1, 1)
         self.pixel_std = torch.Tensor([58.395, 57.12, 57.375]).view(-1, 1, 1)
         
@@ -370,9 +396,17 @@ class LaSeRSDataset(RS_Base_Dataset):
 
         self.SEG_token_id = self.tokenizer.convert_tokens_to_ids("[SEG]")
         
-        with open(self.LaSeRS_json_path, "r") as f:
+        with open(self.LaSeRS_json_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.reason_file = data
+
+        if holdout_mode is not None:
+            if os.path.basename(split) != "train_data.json":
+                raise ValueError("holdout_mode only applies to train_data.json")
+            ratio = float(getattr(data_args, "lasers_holdout_ratio", holdout_ratio))
+            seed = int(getattr(data_args, "lasers_holdout_seed", holdout_seed))
+            self.reason_file = split_lasers_train_holdout(data, holdout_mode, ratio, seed)
+        else:
+            self.reason_file = data
     
     def __len__(self):
         return len(self.reason_file)
