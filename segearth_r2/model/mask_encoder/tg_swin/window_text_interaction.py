@@ -98,19 +98,30 @@ class StageWTIHeadAware(nn.Module):
             nn.init.normal_(m.weight, std=1e-3)
 
         self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        self.state_proj: Optional[nn.Linear] = None
+
+    def set_state_proj(self, state_proj: nn.Linear):
+        self.state_proj = state_proj
+
+    def _apply_text_cond(self, text_cond: torch.Tensor, evidence_state: Optional[torch.Tensor]) -> torch.Tensor:
+        if evidence_state is None or self.state_proj is None:
+            return text_cond
+        return text_cond + self.state_proj(evidence_state)
 
     def compute_raw_bias(
         self,
         x_windows: torch.Tensor,
         text_cond: torch.Tensor,
         reliability: torch.Tensor,
+        evidence_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bw, n_tokens, _ = x_windows.shape
         batch_size = text_cond.shape[0]
         H, r = self.num_heads, self.rank
         num_windows = bw // batch_size
 
-        tc = text_cond.unsqueeze(1).expand(batch_size, num_windows, -1).reshape(bw, -1)
+        tc = self._apply_text_cond(text_cond, evidence_state)
+        tc = tc.unsqueeze(1).expand(batch_size, num_windows, -1).reshape(bw, -1)
 
         visual_q = self.visual_q(x_windows).view(bw, n_tokens, H, r).permute(0, 2, 1, 3)
         visual_k = self.visual_k(x_windows).view(bw, n_tokens, H, r).permute(0, 2, 1, 3)
@@ -128,6 +139,7 @@ class StageWTIHeadAware(nn.Module):
         x_windows: torch.Tensor,
         text_cond: torch.Tensor,
         reliability: torch.Tensor,
+        evidence_state: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         bw = x_windows.shape[0]
         batch_size = text_cond.shape[0]
@@ -135,7 +147,7 @@ class StageWTIHeadAware(nn.Module):
         rel = reliability.view(batch_size, -1)[:, :1]
         rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
 
-        raw_bias = self.compute_raw_bias(x_windows, text_cond, reliability)
+        raw_bias = self.compute_raw_bias(x_windows, text_cond, reliability, evidence_state=evidence_state)
         gate = torch.tanh(self.alpha) * self.stage_scale * rel
         attn_bias = raw_bias * gate
         return attn_bias, raw_bias, gate
@@ -176,6 +188,8 @@ class TGSwimController(nn.Module):
         log_stats: bool = False,
         head_aware: bool = True,
         num_text_stages: int = 4,
+        use_evidence_state: bool = False,
+        evidence_state_dim: int = 64,
     ):
         super().__init__()
         self.cond_dim = cond_dim
@@ -185,7 +199,11 @@ class TGSwimController(nn.Module):
         self.log_stats = log_stats
         self.head_aware = head_aware
         self.num_text_stages = num_text_stages
+        self.use_evidence_state = use_evidence_state
+        self.evidence_state_dim = evidence_state_dim
         self._last_stats: Dict[str, float] = {}
+        self._stage_bias_abs_mean: Dict[int, float] = {}
+        self._stage_dims_map: Dict[int, int] = {}
 
         if swin_type == "large":
             stage_dims = [192, 384, 768, 1536]
@@ -197,12 +215,37 @@ class TGSwimController(nn.Module):
         if stage_scales is None:
             stage_scales = [0.25, 0.5, 0.75, 1.0]
 
+        if use_evidence_state:
+            self.state_update = nn.Sequential(
+                nn.Linear(evidence_state_dim * 2, evidence_state_dim),
+                nn.LayerNorm(evidence_state_dim),
+                nn.GELU(),
+                nn.Linear(evidence_state_dim, evidence_state_dim),
+            )
+            nn.init.zeros_(self.state_update[-1].weight)
+            nn.init.zeros_(self.state_update[-1].bias)
+            self.state_proj = nn.Linear(evidence_state_dim, cond_dim)
+            nn.init.normal_(self.state_proj.weight, std=1e-3)
+            # Pre-register per-stage pool projs so .cuda() / state_dict cover them
+            self.visual_pool_projs = nn.ModuleDict()
+            for stage_idx, stage_dim in enumerate(stage_dims):
+                key = str(stage_idx)
+                proj = nn.Linear(stage_dim, evidence_state_dim)
+                nn.init.normal_(proj.weight, std=1e-3)
+                nn.init.zeros_(proj.bias)
+                self.visual_pool_projs[key] = proj
+        else:
+            self.state_update = None
+            self.state_proj = None
+            self.visual_pool_projs = None
+
         wti_cls = StageWTIHeadAware if head_aware else StageWTIKeyBias
         self.wti_blocks = nn.ModuleDict()
         for stage_idx in self.wti_stages:
             if stage_idx >= len(stage_dims):
                 continue
-            self.wti_blocks[str(stage_idx)] = wti_cls(
+            self._stage_dims_map[stage_idx] = stage_dims[stage_idx]
+            block = wti_cls(
                 dim=stage_dims[stage_idx],
                 cond_dim=cond_dim,
                 num_heads=stage_heads[stage_idx],
@@ -212,6 +255,9 @@ class TGSwimController(nn.Module):
                 alpha_init=alpha_init,
                 stage_scale=stage_scales[stage_idx] if stage_idx < len(stage_scales) else 1.0,
             )
+            if use_evidence_state and self.state_proj is not None:
+                block.set_state_proj(self.state_proj)
+            self.wti_blocks[str(stage_idx)] = block
 
     def _select_stage_cond(
         self,
@@ -241,6 +287,7 @@ class TGSwimController(nn.Module):
         x_windows: torch.Tensor,
         text_cond: Optional[torch.Tensor],
         reliability: Optional[torch.Tensor],
+        evidence_state: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if text_cond is None or reliability is None:
             return None
@@ -252,7 +299,17 @@ class TGSwimController(nn.Module):
 
         tc, rel = self._select_stage_cond(text_cond, reliability, stage_idx)
         module = self.wti_blocks[key]
-        attn_bias, raw_bias, gate = module(x_windows, tc, rel)
+        state_in = evidence_state
+        if self.use_evidence_state and state_in is None:
+            batch_size = tc.shape[0]
+            state_in = torch.zeros(
+                batch_size, self.evidence_state_dim,
+                device=tc.device, dtype=tc.dtype,
+            )
+        attn_bias, raw_bias, gate = module(x_windows, tc, rel, evidence_state=state_in)
+
+        if self.use_evidence_state:
+            self._stage_bias_abs_mean[stage_idx] = float(attn_bias.abs().mean().item())
 
         if self.log_stats:
             st = module.stats(attn_bias, raw_bias, gate, rel)
@@ -261,6 +318,38 @@ class TGSwimController(nn.Module):
             st["active"] = 1.0
             self._last_stats.update(st)
         return attn_bias
+
+    def update_evidence_state(
+        self,
+        stage_idx: int,
+        x_stage: torch.Tensor,
+        prev_state: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Update cross-stage evidence state at stage boundary."""
+        if not self.use_evidence_state or self.state_update is None:
+            return prev_state
+
+        batch_size = x_stage.shape[0]
+        if prev_state is None:
+            prev_state = torch.zeros(
+                batch_size, self.evidence_state_dim,
+                device=x_stage.device, dtype=x_stage.dtype,
+            )
+
+        key = str(stage_idx)
+        if key not in self.visual_pool_projs:
+            return prev_state
+
+        visual_pool = x_stage.mean(dim=1)
+        proj = self.visual_pool_projs[key]
+        if proj.weight.device != visual_pool.device:
+            proj.to(device=visual_pool.device, dtype=visual_pool.dtype)
+        pool_proj = proj(visual_pool)
+        state_in = torch.cat([prev_state, pool_proj], dim=-1)
+        if next(self.state_update.parameters()).device != visual_pool.device:
+            self.state_update.to(device=visual_pool.device, dtype=visual_pool.dtype)
+        delta = self.state_update(state_in)
+        return prev_state + delta
 
     def pop_stats(self) -> Dict[str, float]:
         stats = dict(self._last_stats)

@@ -204,6 +204,7 @@ class SwinTransformerBlock(nn.Module):
         tg_swin_controller=None,
         stage_idx=0,
         layer_idx=0,
+        evidence_state=None,
     ):
         """ Forward function.
 
@@ -242,7 +243,8 @@ class SwinTransformerBlock(nn.Module):
         attn_text_bias = None
         if tg_swin_controller is not None and text_cond is not None:
             attn_text_bias = tg_swin_controller.compute_bias(
-                stage_idx, layer_idx, x_windows, text_cond, reliability
+                stage_idx, layer_idx, x_windows, text_cond, reliability,
+                evidence_state=evidence_state,
             )
 
         # W-MSA/SW-MSA
@@ -385,6 +387,7 @@ class BasicLayer(nn.Module):
         reliability=None,
         tg_swin_controller=None,
         stage_idx=0,
+        evidence_state=None,
     ):
         """ Forward function.
 
@@ -428,13 +431,17 @@ class BasicLayer(nn.Module):
                     tg_swin_controller=tg_swin_controller,
                     stage_idx=stage_idx,
                     layer_idx=layer_idx,
+                    evidence_state=evidence_state,
                 )
+        new_evidence_state = evidence_state
+        if tg_swin_controller is not None and getattr(tg_swin_controller, "use_evidence_state", False):
+            new_evidence_state = tg_swin_controller.update_evidence_state(stage_idx, x, evidence_state)
         if self.downsample is not None:
             x_down = self.downsample(x, H, W)
             Wh, Ww = (H + 1) // 2, (W + 1) // 2
-            return x, H, W, x_down, Wh, Ww
+            return x, H, W, x_down, Wh, Ww, new_evidence_state
         else:
-            return x, H, W, x, H, W
+            return x, H, W, x, H, W, new_evidence_state
 
 
 class PatchEmbed(nn.Module):
@@ -662,9 +669,10 @@ class SwinTransformer(nn.Module):
         x = self.pos_drop(x)
 
         outs = []
+        evidence_state = None
         for i in range(self.num_layers):
             layer = self.layers[i]
-            x_out, H, W, x, Wh, Ww = layer(
+            x_out, H, W, x, Wh, Ww, evidence_state = layer(
                 x,
                 Wh,
                 Ww,
@@ -672,6 +680,7 @@ class SwinTransformer(nn.Module):
                 reliability=reliability,
                 tg_swin_controller=tg_swin_controller,
                 stage_idx=i,
+                evidence_state=evidence_state,
             )
 
             if i in self.out_indices:

@@ -1,0 +1,6 @@
+_BASE_: ./maskformer2_tgswin_v16.yaml
+
+TG_SWIN:
+  USE_STAGE_PHRASE: false
+  USE_HYBRID_RELIABILITY: false
+  USE_EVIDENCE_STATE: true

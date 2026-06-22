@@ -47,6 +47,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor
+    if not load_8bit and not load_4bit:
+        model.to(device=device)
 
     model.resize_token_embeddings(len(tokenizer))
 

@@ -1,0 +1,20 @@
+_BASE_: ./maskformer2_tgswin_v15.yaml
+
+TG_SWIN:
+  VERSION: "v1.6"
+  ENABLED: true
+  COND_DIM: 256
+  NUM_STAGES: 4
+  WTI_STAGES: [1, 2, 3]
+  HEAD_AWARE: true
+  WTI_RANK: 16
+  ALPHA_INIT: 0.0
+  RELIABILITY_INIT: 0.0
+  PER_TARGET_SWING_REPEAT: true
+  # v1.6 flags (must be independently ablatable)
+  USE_STAGE_PHRASE: true
+  USE_HYBRID_RELIABILITY: true
+  USE_EVIDENCE_STATE: true
+  EVIDENCE_STATE_DIM: 64
+  STAGE_PHRASE_TEMP: 1.0
+  HYBRID_RELIABILITY_TEMP: 1.0

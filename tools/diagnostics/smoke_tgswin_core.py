@@ -147,12 +147,20 @@ def check_7_v1_legacy_path():
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
+    parser.add_argument("--version", default="v1.5", choices=["v1.5", "v1.6"])
     args = parser.parse_args()
     os.chdir(REPO)
 
     if not os.path.isdir(args.model_path):
         print(f"[ERROR] model path not found: {args.model_path}")
         sys.exit(1)
+
+    if args.version == "v1.6":
+        import subprocess
+        v16_smoke = os.path.join(os.path.dirname(__file__), "smoke_tgswin_v16.py")
+        subprocess.run([sys.executable, v16_smoke], check=True, cwd=REPO)
+        print("[PASS] smoke_tgswin_core — delegated to smoke_tgswin_v16")
+        return
 
     check_1_tcf_v15_init()
     check_2_wti_identity()

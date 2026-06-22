@@ -129,6 +129,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     vision_tower = model.get_model().get_vision_tower_mask()
 
     vision_tower.to(device=device)
+    if not load_8bit and not load_4bit:
+        model.to(device=device)
 
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",

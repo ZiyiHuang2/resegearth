@@ -215,9 +215,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             use_phrase_pool=getattr(cfg, "USE_PHRASE_POOL", True),
             version=version,
             num_stages=int(getattr(cfg, "NUM_STAGES", 4)),
-            stage_router=bool(getattr(cfg, "STAGE_ROUTER", version == "v1.5")),
+            stage_router=bool(getattr(cfg, "STAGE_ROUTER", version in ("v1.5", "v1.6"))),
             router_hidden_dim=int(getattr(cfg, "ROUTER_HIDDEN_DIM", 512)),
             use_relation_pool=bool(getattr(cfg, "USE_RELATION_AWARE_POOL", True)),
+            use_stage_phrase=bool(getattr(cfg, "USE_STAGE_PHRASE", False)),
+            use_hybrid_reliability=bool(getattr(cfg, "USE_HYBRID_RELIABILITY", False)),
+            stage_phrase_temp=float(getattr(cfg, "STAGE_PHRASE_TEMP", 1.0)),
+            hybrid_reliability_temp=float(getattr(cfg, "HYBRID_RELIABILITY_TEMP", 1.0)),
         )
         self.tg_swin_controller = TGSwimController(
             cond_dim=cond_dim,
@@ -229,12 +233,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
             window_size=window_size,
             swin_type=swin_type,
             log_stats=getattr(cfg, "LOG_STATS", False),
-            head_aware=bool(getattr(cfg, "HEAD_AWARE", version == "v1.5")),
+            head_aware=bool(getattr(cfg, "HEAD_AWARE", version in ("v1.5", "v1.6"))),
             num_text_stages=int(getattr(cfg, "NUM_STAGES", 4)),
+            use_evidence_state=bool(getattr(cfg, "USE_EVIDENCE_STATE", False)),
+            evidence_state_dim=int(getattr(cfg, "EVIDENCE_STATE_DIM", 64)),
         )
         print(
             f"[TG_SWIN] Initialized v={version} TCF + WTI "
-            f"(cond_dim={cond_dim}, head_aware={getattr(cfg, 'HEAD_AWARE', version == 'v1.5')}, "
+            f"(cond_dim={cond_dim}, head_aware={getattr(cfg, 'HEAD_AWARE', version in ('v1.5', 'v1.6'))}, "
+            f"stage_phrase={getattr(cfg, 'USE_STAGE_PHRASE', False)}, "
+            f"hybrid_rho={getattr(cfg, 'USE_HYBRID_RELIABILITY', False)}, "
+            f"evidence_state={getattr(cfg, 'USE_EVIDENCE_STATE', False)}, "
             f"stages={list(cfg.WTI_STAGES)})"
         )
 
