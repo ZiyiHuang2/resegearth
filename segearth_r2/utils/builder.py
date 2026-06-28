@@ -36,7 +36,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
             bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs['torch_dtype'] = torch.float16
+        kwargs['torch_dtype'] = torch.float32 if device == "cpu" else torch.float16
 
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
@@ -47,8 +47,6 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor
-    if not load_8bit and not load_4bit:
-        model.to(device=device)
 
     model.resize_token_embeddings(len(tokenizer))
 

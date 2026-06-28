@@ -205,18 +205,21 @@ def evaluation():
 
     model_path = os.path.expanduser(data_args.model_path)
 
+    device = torch.device(
+        f"cuda:{data_args.local_rank}" if torch.cuda.is_available() else "cpu"
+    )
     tokenizer, model, image_processor, context_len = load_pretrained_model(
         model_path,
         model_args=data_args,
         mask_config=data_args.mask_config,
         load_8bit=data_args.load_8bit,
         load_4bit=data_args.load_4bit,
-        device="cuda",
+        device=str(device),
     )
-
-    device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
     if data_args.load_8bit or data_args.load_4bit:
         model.to(device=device)
+    elif device.type == "cpu":
+        model.to(dtype=torch.float32, device=device)
     else:
         # fp16 inference saves VRAM vs casting the whole model to fp32
         model.to(dtype=torch.float16, device=device)
