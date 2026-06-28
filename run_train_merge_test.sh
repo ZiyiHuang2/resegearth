@@ -41,7 +41,7 @@ MASTER_PORT="29500"
 ########################################
 # Project dir
 ########################################
-REPO_DIR="/root/rivermind-data/huangziyi/reseg/segearth+base"
+REPO_DIR="/root/rivermind-data/huangziyi/reseg/segearth+joint"
 cd "${REPO_DIR}"
 
 ########################################
