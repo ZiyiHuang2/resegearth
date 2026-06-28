@@ -12,7 +12,7 @@ mkdir -p "${TMPDIR}"
 
 RESEG_ROOT="${RESEG_ROOT:-/root/rivermind-data/huangziyi/reseg}"
 REPO="${REPO_DIR:-${RESEG_ROOT}/segearth+tgswin}"
-OUT="${OUT_DIR:-${RESEG_ROOT}/output/tgswin/tgswin-wti-v15-lasers-warmstart-10w-bs2-gd4}"
+OUT="${OUT_DIR:-${RESEG_ROOT}/output/tgswin/tgswin-wti-v15-lasers-warmstart-2w-bs2-gd4}"
 MODEL="${MODEL_PATH:-${OUT}/merged_model}"
 PY="${PYTHON:-/root/rivermind-data/miniconda3/envs/reseg/bin/python}"
 METRICS="${EVAL_METRICS_SCRIPT:-${RESEG_ROOT}/eval_val_metrics.py}"
@@ -22,7 +22,7 @@ MCFG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/maskformer2_tgsw
 SPLIT="${EVAL_SPLIT:-test}"
 EVAL_USE_WANDB="${EVAL_USE_WANDB:-false}"
 EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-tgswin}"
-EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-tgswin-wti-v15-lasers-warmstart-10w-bs2-gd4}"
+EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-tgswin-wti-v15-lasers-warmstart-2w-bs2-gd4}"
 
 DATA_RRSISD="${DATA_RRSISD:-/root/rivermind-data/huangziyi/data/RRSISD}"
 DATA_REFSEGRS="${DATA_REFSEGRS:-/root/rivermind-data/huangziyi/data/RefSegRS}"

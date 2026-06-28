@@ -4,7 +4,8 @@ TG_SWIN:
   ENABLED: true
   VERSION: "v1.5"
   COND_DIM: 256
-  NUM_STAGES: 4
+  # TCF outputs one cond per WTI injection stage (Swin stage 1/2/3 → res3/res4/res5)
+  NUM_STAGES: 3
   WTI_STAGES: [1, 2, 3]
   STAGE_ROUTER: true
   ROUTER_HIDDEN_DIM: 512

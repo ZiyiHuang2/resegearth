@@ -339,9 +339,12 @@ class RRSISDDataset(RS_Base_Dataset):
         return data_dict
     
 def split_lasers_train_holdout(records, holdout_mode: str, holdout_ratio: float = 0.05, holdout_seed: int = 42):
-    """Hold out a fixed subset of train_data.json for training-time validation."""
+    """Hold out a fixed subset of train_data.json for optional internal-val monitoring."""
     if holdout_mode not in ("train", "eval"):
         raise ValueError(f"holdout_mode must be 'train' or 'eval', got {holdout_mode!r}")
+    ratio = float(holdout_ratio or 0)
+    if ratio <= 0:
+        return [] if holdout_mode == "eval" else list(records)
     n = len(records)
     if n == 0:
         return []

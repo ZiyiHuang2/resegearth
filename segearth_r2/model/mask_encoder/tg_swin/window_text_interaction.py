@@ -193,7 +193,8 @@ class TGSwimController(nn.Module):
     ):
         super().__init__()
         self.cond_dim = cond_dim
-        self.wti_stages = set(wti_stages if wti_stages is not None else [1, 2, 3])
+        self.wti_stage_list = sorted(wti_stages if wti_stages is not None else [1, 2, 3])
+        self.wti_stages = set(self.wti_stage_list)
         self.wti_start_layer = wti_start_layer
         self.window_size = window_size
         self.log_stats = log_stats
@@ -259,6 +260,18 @@ class TGSwimController(nn.Module):
                 block.set_state_proj(self.state_proj)
             self.wti_blocks[str(stage_idx)] = block
 
+    def _cond_index_for_swin_stage(self, swin_stage_idx: int, num_cond_stages: int) -> int:
+        """Map Swin stage index to TCF cond slice.
+
+        Compact layout (v1.5 default): ``text_cond.shape[1] == len(wti_stage_list)`` and
+        cond[i] corresponds to ``wti_stage_list[i]`` (e.g. Swin stages 1/2/3 → cond 0/1/2).
+
+        Legacy layout (v1.6): ``num_cond_stages == 4`` with cond indexed by Swin stage id.
+        """
+        if num_cond_stages == len(self.wti_stage_list):
+            return self.wti_stage_list.index(swin_stage_idx)
+        return min(swin_stage_idx, num_cond_stages - 1)
+
     def _select_stage_cond(
         self,
         text_cond: torch.Tensor,
@@ -266,7 +279,7 @@ class TGSwimController(nn.Module):
         swin_stage_idx: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if text_cond.dim() == 3:
-            s = min(swin_stage_idx, text_cond.shape[1] - 1)
+            s = self._cond_index_for_swin_stage(swin_stage_idx, text_cond.shape[1])
             tc = text_cond[:, s, :]
             if reliability.dim() == 3:
                 rel = reliability[:, s, :]

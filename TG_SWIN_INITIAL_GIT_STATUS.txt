@@ -1,0 +1,21 @@
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/MultiScaleDeformableAttention.cpython-310-x86_64-linux-gnu.so
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/functions/__init__.py
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/functions/ms_deform_attn_func.py
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/modules/__init__.py
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/modules/ms_deform_attn.py
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/.ninja_deps
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/.ninja_log
+ D segearth_r2/model/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/build.ninja
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/MultiScaleDeformableAttention.cpython-310-x86_64-linux-gnu.so
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/functions/__init__.py
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/functions/ms_deform_attn_func.py
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/modules/__init__.py
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/lib.linux-x86_64-cpython-310/modules/ms_deform_attn.py
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/.ninja_deps
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/.ninja_log
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/build.ninja
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/home/wangchengjun/huangziyi/reseg/SegearthR2/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/cpu/ms_deform_attn_cpu.o
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/home/wangchengjun/huangziyi/reseg/SegearthR2/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/cuda/ms_deform_attn_cuda.o
+ D segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/build/temp.linux-x86_64-cpython-310/home/wangchengjun/huangziyi/reseg/SegearthR2/segearth_r2/model/mask_decoder/Mask2Former_Simplify/modeling/pixel_decoder/ops/src/vision.o
+?? TG_SWIN_BASE_GIT_SHA.txt
+?? TG_SWIN_INITIAL_GIT_STATUS.txt

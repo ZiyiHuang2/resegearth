@@ -11,7 +11,7 @@
 | `maskformer2_tgswin.yaml` | v1.5 enabled (alias) |
 | `maskformer2_tgswin_v15.yaml` | v1.5 enabled (run script default) |
 
-Key fields: `VERSION: "v1.5"`, `STAGE_ROUTER`, `HEAD_AWARE`, `LOW_RANK_QK`, `WTI_RANK`, `NUM_STAGES`, `WTI_STAGES`.
+Key fields: `VERSION: "v1.5"`, `STAGE_ROUTER`, `HEAD_AWARE`, `LOW_RANK_QK`, `WTI_RANK`, `NUM_STAGES: 3` (one cond per WTI stage), `WTI_STAGES: [1,2,3]`.
 
 ## TCF — `text_condition_factory.py`
 

@@ -54,7 +54,7 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
-    lasers_holdout_ratio: float = field(default=0.05)
+    lasers_holdout_ratio: float = field(default=0.0)
     lasers_holdout_seed: int = field(default=42)
 
 @dataclass
@@ -249,23 +249,34 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 split="val"
             )
         elif dataset_name == "lasers":
+            holdout_ratio = float(getattr(data_args, "lasers_holdout_ratio", 0.0) or 0)
             holdout_seed = int(getattr(data_args, "lasers_holdout_seed", training_args.data_seed))
-            train_dataset = LaSeRSDataset(
-                base_data_path=data_args.base_data_path,
-                tokenizer=tokenizer,
-                data_args=data_args,
-                split="train_data.json",
-                holdout_mode="train",
-                holdout_seed=holdout_seed,
-            )
-            eval_dataset = LaSeRSDataset(
-                base_data_path=data_args.base_data_path,
-                tokenizer=tokenizer,
-                data_args=data_args,
-                split="train_data.json",
-                holdout_mode="eval",
-                holdout_seed=holdout_seed,
-            )
+            if holdout_ratio > 0:
+                train_dataset = LaSeRSDataset(
+                    base_data_path=data_args.base_data_path,
+                    tokenizer=tokenizer,
+                    data_args=data_args,
+                    split="train_data.json",
+                    holdout_mode="train",
+                    holdout_seed=holdout_seed,
+                )
+                eval_dataset = LaSeRSDataset(
+                    base_data_path=data_args.base_data_path,
+                    tokenizer=tokenizer,
+                    data_args=data_args,
+                    split="train_data.json",
+                    holdout_mode="eval",
+                    holdout_seed=holdout_seed,
+                )
+            else:
+                train_dataset = LaSeRSDataset(
+                    base_data_path=data_args.base_data_path,
+                    tokenizer=tokenizer,
+                    data_args=data_args,
+                    split="train_data.json",
+                    holdout_mode=None,
+                )
+                eval_dataset = None
         elif dataset_name == "refsegrs":
             train_dataset = RefSegRSDataset(
                 base_data_path=data_args.base_data_path,
@@ -447,17 +458,25 @@ def train():
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
-    if hasattr(training_args, "evaluation_strategy"):
-        training_args.evaluation_strategy = "steps"
-    if hasattr(training_args, "eval_strategy"):
-        training_args.eval_strategy = "steps"
     training_args.save_strategy = "steps"
     if training_args.save_steps is None or training_args.save_steps <= 0:
-        training_args.save_steps = 500
-    training_args.eval_steps = training_args.save_steps
-    training_args.load_best_model_at_end = True
-    training_args.metric_for_best_model = "eval_score"
-    training_args.greater_is_better = True
+        training_args.save_steps = 5000
+    eval_ds = data_module.get("eval_dataset")
+    if eval_ds is not None and len(eval_ds) > 0:
+        if hasattr(training_args, "evaluation_strategy"):
+            training_args.evaluation_strategy = "steps"
+        if hasattr(training_args, "eval_strategy"):
+            training_args.eval_strategy = "steps"
+        training_args.eval_steps = training_args.save_steps
+        training_args.load_best_model_at_end = True
+        training_args.metric_for_best_model = "eval_score"
+        training_args.greater_is_better = True
+    else:
+        if hasattr(training_args, "evaluation_strategy"):
+            training_args.evaluation_strategy = "no"
+        if hasattr(training_args, "eval_strategy"):
+            training_args.eval_strategy = "no"
+        training_args.load_best_model_at_end = False
     if training_args.save_total_limit is None or training_args.save_total_limit > 2:
         training_args.save_total_limit = 2
     

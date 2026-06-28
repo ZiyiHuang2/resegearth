@@ -207,6 +207,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         swin_type = getattr(self.config, "swin_type", "base")
         window_size = getattr(self.mask_decoder_cfg.MODEL.SWIN, "WINDOW_SIZE", 12)
         version = getattr(cfg, "VERSION", "v1")
+        wti_stages = list(getattr(cfg, "WTI_STAGES", [1, 2, 3]))
+        num_stages = int(getattr(cfg, "NUM_STAGES", len(wti_stages)))
 
         self.tg_swin_tcf = TextConditionFactory(
             text_dim=text_dim,
@@ -214,7 +216,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             reliability_init=getattr(cfg, "RELIABILITY_INIT", 0.0),
             use_phrase_pool=getattr(cfg, "USE_PHRASE_POOL", True),
             version=version,
-            num_stages=int(getattr(cfg, "NUM_STAGES", 4)),
+            num_stages=num_stages,
             stage_router=bool(getattr(cfg, "STAGE_ROUTER", version in ("v1.5", "v1.6"))),
             router_hidden_dim=int(getattr(cfg, "ROUTER_HIDDEN_DIM", 512)),
             use_relation_pool=bool(getattr(cfg, "USE_RELATION_AWARE_POOL", True)),
@@ -226,7 +228,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.tg_swin_controller = TGSwimController(
             cond_dim=cond_dim,
             wti_rank=getattr(cfg, "WTI_RANK", 16),
-            wti_stages=list(getattr(cfg, "WTI_STAGES", [1, 2, 3])),
+            wti_stages=wti_stages,
             wti_start_layer=getattr(cfg, "WTI_START_LAYER", 0),
             bias_max=getattr(cfg, "BIAS_MAX", 4.0),
             alpha_init=getattr(cfg, "ALPHA_INIT", 0.0),
@@ -234,7 +236,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             swin_type=swin_type,
             log_stats=getattr(cfg, "LOG_STATS", False),
             head_aware=bool(getattr(cfg, "HEAD_AWARE", version in ("v1.5", "v1.6"))),
-            num_text_stages=int(getattr(cfg, "NUM_STAGES", 4)),
+            num_text_stages=num_stages,
             use_evidence_state=bool(getattr(cfg, "USE_EVIDENCE_STATE", False)),
             evidence_state_dim=int(getattr(cfg, "EVIDENCE_STATE_DIM", 64)),
         )
