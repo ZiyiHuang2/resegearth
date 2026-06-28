@@ -9,6 +9,7 @@ set -euo pipefail
 #
 # Common overrides:
 #   GPU_ID=0 MAX_STEPS=500 SAVE_STEPS=250 bash scripts/train_merge_eval_setpp.sh
+#   ABLATION=A0 bash scripts/train_merge_eval_setpp.sh
 #   RUN_TRAIN=0 MERGE_CHECKPOINT=/path/to/checkpoint-250 bash scripts/train_merge_eval_setpp.sh
 #   RUN_MERGE=0 RUN_EVAL=1 EVAL_MODEL=/path/to/merged_model bash scripts/train_merge_eval_setpp.sh
 ########################################
@@ -17,7 +18,37 @@ export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-1}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export WANDB_PROJECT="${WANDB_PROJECT:-segearth-setpp}"
-export WANDB_NAME="${WANDB_NAME:-setpp-lasers-warmstart-8w-gd4}"
+
+########################################
+# Ablation matrix (A0–A3)
+########################################
+ABLATION="${ABLATION:-A3}"
+
+case "${ABLATION}" in
+  A0)
+    SETPP_CLOSED_LOOP=False
+    SETPP_CSQR_ENABLE=False
+    ;;
+  A1)
+    SETPP_CLOSED_LOOP=True
+    SETPP_CSQR_ENABLE=False
+    ;;
+  A2)
+    SETPP_CLOSED_LOOP=False
+    SETPP_CSQR_ENABLE=True
+    ;;
+  A3)
+    SETPP_CLOSED_LOOP=True
+    SETPP_CSQR_ENABLE=True
+    ;;
+  *)
+    echo "[ERROR] unknown ABLATION=${ABLATION}, expected A0/A1/A2/A3"
+    exit 1
+    ;;
+esac
+
+RUN_TAG="${RUN_TAG:-setpp-${ABLATION}-lasers-warmstart-5w-gd4}"
+export WANDB_NAME="${WANDB_NAME:-${RUN_TAG}}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
 RUN_TRAIN="${RUN_TRAIN:-1}"
@@ -34,7 +65,7 @@ GPU_ID="${GPU_ID:-0}"
 GPU_SLOT="${GPU_SLOT:-localhost:${GPU_ID}}"
 MASTER_PORT="${MASTER_PORT:-29621}"
 
-WARM_START_MODEL="${WARM_START_MODEL:-/root/rivermind-data/huangziyi/reseg/output/base/standard-base-lasers-siglip1-8w-gd4/merged_model}"
+WARM_START_MODEL="${WARM_START_MODEL:-/root/rivermind-data/huangziyi/reseg/output/base/standard-base-lasers-siglip1-5w-gd4/merged_model}"
 VISION_TOWER="${VISION_TOWER:-/root/rivermind-data/huangziyi/reseg/pretrained_model/CLIP/siglip-so400m-patch14-384}"
 VISION_TOWER_MASK="${VISION_TOWER_MASK:-/root/rivermind-data/huangziyi/reseg/pretrained_model/mask2former/model_final_54b88a.pkl}"
 MASK_CONFIG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml}"
@@ -46,9 +77,9 @@ EVAL_BASE_DATA_PATH="${EVAL_BASE_DATA_PATH:-${TRAIN_BASE_DATA_PATH}}"
 EVAL_SPLIT="${EVAL_SPLIT:-test}"
 EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-1}"
+RUN_CROSS_DATASET_EVAL="${RUN_CROSS_DATASET_EVAL:-1}"
 LASERS_HOLDOUT_RATIO="${LASERS_HOLDOUT_RATIO:-0.05}"
 
-RUN_TAG="${RUN_TAG:-setpp-lasers-$(date +%Y%m%d_%H%M%S)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/root/rivermind-data/huangziyi/reseg/output/setpp}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_TAG}}"
 MERGED_DIR="${MERGED_DIR:-${OUTPUT_DIR}/merged_model}"
@@ -133,12 +164,14 @@ require_path () {
 
 check_merged_setpp_model () {
   local model_dir="$1"
-  MERGED_MODEL_DIR="${model_dir}" "${PYTHON}" - <<'PY'
+  local expect_csqr="${2:-0}"
+  MERGED_MODEL_DIR="${model_dir}" EXPECT_CSQR="${expect_csqr}" "${PYTHON}" - <<'PY'
 import json
 import os
 import sys
 
 model_dir = os.environ["MERGED_MODEL_DIR"]
+expect_csqr = os.environ.get("EXPECT_CSQR", "0") == "1"
 index_path = os.path.join(model_dir, "model.safetensors.index.json")
 required_substrings = ("SET_token_projector", "SET_query_embed")
 
@@ -158,6 +191,15 @@ if missing:
 for name in required_substrings:
     matched = [k for k in keys if name in k]
     print(f"[OK] {name}: {matched[0]}")
+
+csqr_keys = [k for k in keys if "csqr_block" in k]
+if expect_csqr and not csqr_keys:
+    print("[ERROR] setpp_csqr_enable=True but merged model has no predictor.csqr_block weights")
+    sys.exit(1)
+if csqr_keys:
+    print(f"[OK] csqr_block: {len(csqr_keys)} tensors (e.g. {csqr_keys[0]})")
+else:
+    print("[WARN] no csqr_block weights (setpp_csqr_enable=False or legacy run)")
 PY
 }
 
@@ -169,7 +211,8 @@ preflight () {
   echo "========================================"
   echo "[0/4] Preflight (LaSeRS)"
   echo "========================================"
-  echo "[INFO] REPO_DIR=${REPO_DIR}"
+  echo "[INFO] ABLATION=${ABLATION} closed_loop=${SETPP_CLOSED_LOOP} csqr=${SETPP_CSQR_ENABLE}"
+  echo "[INFO] RUN_TAG=${RUN_TAG}"
   echo "[INFO] WARM_START_MODEL=${WARM_START_MODEL}"
   echo "[INFO] TRAIN_DATASET=${TRAIN_DATASET}"
   echo "[INFO] TRAIN_BASE_DATA_PATH=${TRAIN_BASE_DATA_PATH}"
@@ -246,6 +289,8 @@ train_model () {
       --data_seed "${DATA_SEED}" \
       --lasers_holdout_ratio "${LASERS_HOLDOUT_RATIO}" \
       --lasers_holdout_seed "${DATA_SEED}" \
+      --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
+      --setpp_csqr_enable "${SETPP_CSQR_ENABLE}" \
       --deepspeed "${DEEPSPEED_CONFIG}" \
       --report_to wandb
 }
@@ -280,9 +325,16 @@ merge_model () {
     --save_path "${MERGED_DIR}" \
     --lora_r "${LORA_R}" \
     --lora_alpha "${LORA_ALPHA}" \
-    --lora_dropout "${LORA_DROPOUT}"
+    --lora_dropout "${LORA_DROPOUT}" \
+    --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
+    --setpp_csqr_enable "${SETPP_CSQR_ENABLE}"
 
-  check_merged_setpp_model "${MERGED_DIR}"
+  if [[ "${SETPP_CSQR_ENABLE}" == "True" ]]; then
+    EXPECT_CSQR=1
+  else
+    EXPECT_CSQR=0
+  fi
+  check_merged_setpp_model "${MERGED_DIR}" "${EXPECT_CSQR}"
 }
 
 eval_model () {
@@ -290,14 +342,29 @@ eval_model () {
     echo "[SKIP] eval disabled"
     return
   fi
-  echo "========================================"
-  echo "[3/4] Eval merged model on LaSeRS test"
-  echo "========================================"
   local model_dir="${EVAL_MODEL}"
   if [[ -z "${model_dir}" ]]; then
     model_dir="${MERGED_DIR}"
   fi
   require_path "${model_dir}" dir
+
+  if [[ "${RUN_CROSS_DATASET_EVAL}" == "1" ]]; then
+    echo "========================================"
+    echo "[3/4] Eval merged model on 5 datasets (test, parallel)"
+    echo "========================================"
+    MODEL_PATH="${model_dir}" \
+    OUT_DIR="${OUTPUT_DIR}" \
+    CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+    EVAL_SPLIT="${EVAL_SPLIT}" \
+    PYTHON="${PYTHON}" \
+    REPO_DIR="${REPO_DIR}" \
+    bash "${REPO_DIR}/run_cross_dataset_test_eval.sh"
+    return
+  fi
+
+  echo "========================================"
+  echo "[3/4] Eval merged model on ${EVAL_DATASET} ${EVAL_SPLIT}"
+  echo "========================================"
   mkdir -p "${EVAL_OUTPUT_DIR}"
   CUDA_VISIBLE_DEVICES="${GPU_ID}" "${PYTHON}" segearth_r2/eval/eval.py \
     --base_data_path "${EVAL_BASE_DATA_PATH}" \
@@ -321,7 +388,7 @@ finish () {
   echo "========================================"
   echo "[INFO] output: ${OUTPUT_DIR}"
   echo "[INFO] merged: ${MERGED_DIR}"
-  echo "[INFO] eval: ${EVAL_OUTPUT_DIR}"
+  echo "[INFO] eval: ${OUTPUT_DIR}/*_test_results (5 datasets when RUN_CROSS_DATASET_EVAL=1)"
   echo "[INFO] log: ${LOG_FILE}"
 }
 

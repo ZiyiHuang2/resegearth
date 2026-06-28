@@ -131,7 +131,16 @@ def calculate_uncertainty(logits):
 class Criterion(nn.Module):
 
     def __init__(self, matcher, losses, num_points, oversample_ratio, importance_sample_ratio, device,
-                 union_weight=0.1, union_warmup_steps=2000):
+                 union_weight=0.1, union_warmup_steps=2000,
+                 setpp_closed_loop=True,
+                 lambda_union_single=0.01,
+                 lambda_union_multi=0.05,
+                 lambda_coverage_single=0.005,
+                 lambda_coverage_multi=0.02,
+                 lambda_consistency_single=0.005,
+                 lambda_consistency_multi=0.02,
+                 closed_loop_warmup_steps=2000,
+                 consistency_mode="seg_align_set"):
         super().__init__()
         self.matcher = matcher
         self.losses = losses
@@ -142,6 +151,15 @@ class Criterion(nn.Module):
         self.pos_weight = torch.tensor([99.0])
         self.union_weight = union_weight
         self.union_warmup_steps = union_warmup_steps
+        self.setpp_closed_loop = setpp_closed_loop
+        self.lambda_union_single = lambda_union_single
+        self.lambda_union_multi = lambda_union_multi
+        self.lambda_coverage_single = lambda_coverage_single
+        self.lambda_coverage_multi = lambda_coverage_multi
+        self.lambda_consistency_single = lambda_consistency_single
+        self.lambda_consistency_multi = lambda_consistency_multi
+        self.closed_loop_warmup_steps = closed_loop_warmup_steps
+        self.consistency_mode = consistency_mode
         self._global_step = 0
 
 
@@ -149,6 +167,157 @@ class Criterion(nn.Module):
         pass
 
     
+
+    def soft_union(self, seg_logits, valid_seg_mask):
+        """
+        seg_logits: [B, Kmax, H, W]
+        valid_seg_mask: [B, Kmax], bool, True=valid
+        return: [B, 1, H, W]
+        """
+        seg_prob = seg_logits.sigmoid()
+        seg_prob = seg_prob * valid_seg_mask[:, :, None, None].float()
+        return 1.0 - torch.prod(1.0 - seg_prob, dim=1, keepdim=True)
+
+    def dice_prob_loss(self, pred_prob, tgt_prob, sample_weight=None, eps=1.0):
+        """
+        pred_prob/tgt_prob: [B, 1, H, W], already probabilities
+        """
+        pred = pred_prob.flatten(1)
+        tgt = tgt_prob.flatten(1)
+
+        numerator = 2 * (pred * tgt).sum(dim=1) + eps
+        denominator = pred.sum(dim=1) + tgt.sum(dim=1) + eps
+        loss = 1.0 - numerator / denominator
+
+        if sample_weight is not None:
+            return (loss * sample_weight).mean()
+
+        return loss.mean()
+
+    def build_union_target_tensor(self, targets, size, device):
+        union_list = []
+        for t in targets:
+            masks = t["masks"].float().to(device)  # [K,H,W]
+            union = (masks.sum(dim=0, keepdim=True) > 0).float()  # [1,H,W]
+            if union.shape[-2:] != size:
+                union = F.interpolate(
+                    union.unsqueeze(0),
+                    size=size,
+                    mode="nearest",
+                ).squeeze(0)
+            union_list.append(union)
+        return torch.stack(union_list, dim=0)  # [B,1,H,W]
+
+    def build_sample_weights(self, targets, single_weight, multi_weight, device):
+        weights = []
+        for t in targets:
+            k = len(t["labels"])
+            weights.append(single_weight if k <= 1 else multi_weight)
+        return torch.tensor(weights, dtype=torch.float32, device=device)
+
+    def closed_loop_warmup(self):
+        if self.closed_loop_warmup_steps <= 0:
+            return 1.0
+        return min(1.0, float(self._global_step) / float(self.closed_loop_warmup_steps))
+
+    def loss_set_union(self, outputs, targets):
+        pred_set = outputs.get("pred_set_union_mask", outputs["pred_masks"][:, 0:1])  # [B,1,H,W]
+        gt_union = self.build_union_target_tensor(
+            targets,
+            size=pred_set.shape[-2:],
+            device=pred_set.device,
+        )
+
+        weights = self.build_sample_weights(
+            targets,
+            self.lambda_union_single,
+            self.lambda_union_multi,
+            pred_set.device,
+        )
+
+        bce = F.binary_cross_entropy_with_logits(
+            pred_set,
+            gt_union,
+            reduction="none",
+        ).flatten(1).mean(dim=1)
+        bce = (bce * weights).mean()
+
+        dice = self.dice_prob_loss(
+            pred_set.sigmoid(),
+            gt_union,
+            sample_weight=weights,
+        )
+
+        warmup = self.closed_loop_warmup()
+        return {
+            "loss_union_mask": bce * warmup,
+            "loss_union_dice": dice * warmup,
+        }
+
+    def loss_setpp_coverage(self, outputs, targets):
+        pred_seg = outputs["pred_seg_masks"]      # [B,Kmax,H,W]
+        valid = outputs["valid_seg_mask"]         # [B,Kmax]
+
+        gt_union = self.build_union_target_tensor(
+            targets,
+            size=pred_seg.shape[-2:],
+            device=pred_seg.device,
+        )
+
+        seg_union = self.soft_union(pred_seg, valid)
+
+        weights = self.build_sample_weights(
+            targets,
+            self.lambda_coverage_single,
+            self.lambda_coverage_multi,
+            pred_seg.device,
+        )
+
+        loss = self.dice_prob_loss(
+            seg_union,
+            gt_union,
+            sample_weight=weights,
+        )
+
+        return {"loss_setpp_coverage": loss * self.closed_loop_warmup()}
+
+    def loss_setpp_consistency(self, outputs, targets):
+        pred_set = outputs["pred_set_union_mask"]  # [B,1,H,W]
+        pred_seg = outputs["pred_seg_masks"]       # [B,Kmax,H,W]
+        valid = outputs["valid_seg_mask"]
+
+        set_prob = pred_set.sigmoid()
+        seg_union = self.soft_union(pred_seg, valid)
+
+        weights = self.build_sample_weights(
+            targets,
+            self.lambda_consistency_single,
+            self.lambda_consistency_multi,
+            pred_set.device,
+        )
+
+        if self.consistency_mode == "seg_align_set":
+            # SET constrains SEG union; set_prob.detach() blocks consistency grad to SET
+            loss = self.dice_prob_loss(
+                seg_union,
+                set_prob.detach(),
+                sample_weight=weights,
+            )
+        elif self.consistency_mode == "set_align_seg":
+            loss = self.dice_prob_loss(
+                set_prob,
+                seg_union.detach(),
+                sample_weight=weights,
+            )
+        elif self.consistency_mode == "bidirectional":
+            loss = (
+                self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=weights)
+                + 0.5 * self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=weights)
+            )
+        else:
+            raise ValueError(f"Unknown consistency_mode: {self.consistency_mode}")
+
+        return {"loss_setpp_consistency": loss * self.closed_loop_warmup()}
 
     def loss_union_mask(self, outputs, union_targets, num_masks):
         """Dice + sigmoid CE loss on query 0 (SET union mask)."""
@@ -317,10 +486,12 @@ class Criterion(nn.Module):
         loss_map = {
             'SEG_labels': self.loss_SEG_labels,
             'masks': self.loss_masks,
-            'union': self.loss_union_mask,
+            'union': self.loss_set_union if self.setpp_closed_loop else self.loss_union_mask,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         if loss == 'union':
+            if self.setpp_closed_loop:
+                return loss_map[loss](outputs, targets)
             return loss_map[loss](outputs, union_targets, num_masks)
         return loss_map[loss](outputs, targets, indices, num_masks)
 
@@ -382,13 +553,21 @@ class Criterion(nn.Module):
         losses = {}
         for loss in self.losses:
             if loss == 'union':
-                l_dict = self.get_loss(loss, outputs, None, None, num_masks, union_targets=union_targets)
+                l_dict = self.get_loss(loss, outputs_without_aux, targets, None, num_masks, union_targets=union_targets)
                 for k, v in l_dict.items():
                     if v is not None:
-                        losses[k] = v * self.union_weight * warmup_factor * k1_scale
+                        if self.setpp_closed_loop:
+                            # lambda already applied inside loss_set_union; only weight_dict scales BCE/Dice
+                            losses[k] = v
+                        else:
+                            losses[k] = v * self.union_weight * warmup_factor * k1_scale
             else:
                 l_dict = self.get_loss(loss, instance_outputs, targets, indices, num_masks)
                 losses.update(l_dict)
+
+        if self.setpp_closed_loop and "valid_seg_mask" in outputs_without_aux:
+            losses.update(self.loss_setpp_coverage(outputs_without_aux, targets))
+            losses.update(self.loss_setpp_consistency(outputs_without_aux, targets))
 
         # --- Auxiliary losses: strip query 0 from each aux output ---
         if "aux_outputs" in outputs:
@@ -408,10 +587,13 @@ class Criterion(nn.Module):
                 aux_indices = self.matcher(aux_instance, targets)
                 for loss in self.losses:
                     if loss == 'union':
-                        l_dict = self.get_loss(loss, aux_outputs, None, None, num_masks, union_targets=union_targets)
+                        l_dict = self.get_loss(loss, aux_outputs, targets, None, num_masks, union_targets=union_targets)
                         for k, v in l_dict.items():
                             if v is not None:
-                                losses[k + f"_{i}"] = v * self.union_weight * warmup_factor * k1_scale
+                                if self.setpp_closed_loop:
+                                    losses[k + f"_{i}"] = v
+                                else:
+                                    losses[k + f"_{i}"] = v * self.union_weight * warmup_factor * k1_scale
                     else:
                         l_dict = self.get_loss(loss, aux_instance, targets, aux_indices, num_masks)
                         l_dict = {k + f"_{i}": v for k, v in l_dict.items()}

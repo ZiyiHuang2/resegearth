@@ -5,15 +5,18 @@ set -euo pipefail
 # SET++ 全流程：Warm-start Train → Merge → LaSeRS Test Eval → W&B Metrics
 #
 # 数据集：LaSeRS（dataset_name=lasers）
-# 起点：LaSeRS base merged_model（含 [SEG]，warm-start 训练 [SET]）
+# 起点：LaSeRS base-5w merged_model（standard-base-lasers-siglip1-5w-gd4，含 [SEG]）
 #
 # 官方 LaSeRS 只有 train + test（无 val）：
 #   - 训练：train_data.json；训练期 validation 从 train holdout 5%
-#   - 最终评估：test/annotations/*.json（9 个 benchmark）
-#   - 指标：eval_val_metrics.py LASERS_BENCHMARK=all
+#   - 最终评估：5 数据集 test 并行（LaSeRS + RRSISD + RefSegRS + RISBench + EarthReason）
 #
 # Override examples:
 #   GPU_ID=0 MAX_STEPS=50000 bash run_train_merge_test.sh
+#   ABLATION=A0 bash run_train_merge_test.sh   # Base only
+#   ABLATION=A1 bash run_train_merge_test.sh   # +ClosedLoop
+#   ABLATION=A2 bash run_train_merge_test.sh   # +CSQR only
+#   ABLATION=A3 bash run_train_merge_test.sh   # Full (default)
 #   WARM_START_MODEL=/path/to/merged_model bash run_train_merge_test.sh
 ########################################
 
@@ -24,7 +27,37 @@ export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export WANDB_PROJECT="${WANDB_PROJECT:-segearth-setpp}"
-export WANDB_NAME="${WANDB_NAME:-setpp-lasers-warmstart-8w-gd4}"
+
+########################################
+# Ablation matrix (A0–A3)
+########################################
+ABLATION="${ABLATION:-A3}"
+
+case "${ABLATION}" in
+  A0)
+    SETPP_CLOSED_LOOP=False
+    SETPP_CSQR_ENABLE=False
+    ;;
+  A1)
+    SETPP_CLOSED_LOOP=True
+    SETPP_CSQR_ENABLE=False
+    ;;
+  A2)
+    SETPP_CLOSED_LOOP=False
+    SETPP_CSQR_ENABLE=True
+    ;;
+  A3)
+    SETPP_CLOSED_LOOP=True
+    SETPP_CSQR_ENABLE=True
+    ;;
+  *)
+    echo "[ERROR] unknown ABLATION=${ABLATION}, expected A0/A1/A2/A3"
+    exit 1
+    ;;
+esac
+
+RUN_TAG="${RUN_TAG:-setpp-${ABLATION}-lasers-warmstart-5w-gd4}"
+export WANDB_NAME="${WANDB_NAME:-${RUN_TAG}}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
 RESEG_ROOT="/root/rivermind-data/huangziyi/reseg"
@@ -64,9 +97,10 @@ EVAL_MAX_SAMPLES="${EVAL_MAX_SAMPLES:-0}"
 ########################################
 # Output
 ########################################
-OUTPUT_DIR="${OUTPUT_DIR:-${RESEG_ROOT}/output/setpp/setpp-lasers-warmstart-8w-gd4}"
+OUTPUT_DIR="${OUTPUT_DIR:-${RESEG_ROOT}/output/setpp/${RUN_TAG}}"
 MERGED_DIR="${MERGED_DIR:-${OUTPUT_DIR}/merged_model}"
 EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-${OUTPUT_DIR}/test_results}"
+RUN_CROSS_DATASET_EVAL="${RUN_CROSS_DATASET_EVAL:-1}"
 
 ########################################
 # Eval metrics config (auto upload to W&B)
@@ -74,10 +108,10 @@ EVAL_OUTPUT_DIR="${EVAL_OUTPUT_DIR:-${OUTPUT_DIR}/test_results}"
 EVAL_METRICS_SCRIPT="${RESEG_ROOT}/eval_val_metrics.py"
 EVAL_USE_WANDB="True"
 EVAL_WANDB_PROJECT="segearth-eval-setpp"
-EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-setpp-lasers-warmstart-8w-gd4}"
+EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-${RUN_TAG}}"
 
 ########################################
-# Train config（对齐 set/base LaSeRS 8w warm-start preset）
+# Train config（对齐 base-5w LaSeRS preset，SET++ 继续训 50k steps）
 ########################################
 MAX_STEPS="${MAX_STEPS:-50000}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
@@ -178,7 +212,9 @@ merge_ckpt () {
     --save_path "${save_dir}" \
     --lora_r "${LORA_R}" \
     --lora_alpha "${LORA_ALPHA}" \
-    --lora_dropout "${LORA_DROPOUT}"
+    --lora_dropout "${LORA_DROPOUT}" \
+    --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
+    --setpp_csqr_enable "${SETPP_CSQR_ENABLE}"
 }
 
 eval_model () {
@@ -206,12 +242,14 @@ eval_model () {
 
 check_merged_setpp_model () {
   local model_dir="$1"
-  MERGED_MODEL_DIR="${model_dir}" "${PYTHON}" - <<'PY'
+  local expect_csqr="${2:-1}"
+  MERGED_MODEL_DIR="${model_dir}" EXPECT_CSQR="${expect_csqr}" "${PYTHON}" - <<'PY'
 import json
 import os
 import sys
 
 model_dir = os.environ["MERGED_MODEL_DIR"]
+expect_csqr = os.environ.get("EXPECT_CSQR", "1") == "1"
 index_path = os.path.join(model_dir, "model.safetensors.index.json")
 required_substrings = ("SET_token_projector", "SET_query_embed")
 
@@ -226,13 +264,85 @@ keys = list(weight_map.keys())
 missing = [name for name in required_substrings if not any(name in k for k in keys)]
 if missing:
     print(f"[ERROR] merged model missing SET++ weights: {missing}")
-    print("[HINT] expected keys containing SET_token_projector and SET_query_embed")
     sys.exit(1)
 
 for name in required_substrings:
     matched = [k for k in keys if name in k]
     print(f"[OK] {name}: {matched[0]}")
+
+csqr_keys = [k for k in keys if "csqr_block" in k]
+if expect_csqr and not csqr_keys:
+    print("[ERROR] setpp_csqr_enable=True but merged model has no predictor.csqr_block weights")
+    sys.exit(1)
+if csqr_keys:
+    print(f"[OK] csqr_block: {len(csqr_keys)} tensors (e.g. {csqr_keys[0]})")
+else:
+    print("[WARN] no csqr_block weights (setpp_csqr_enable=False or legacy run)")
+
+config_path = os.path.join(model_dir, "config.json")
+if os.path.isfile(config_path):
+    cfg = json.load(open(config_path, encoding="utf-8"))
+    print(f"[OK] config setpp_csqr_enable={cfg.get('setpp_csqr_enable')}, "
+          f"setpp_closed_loop={cfg.get('setpp_closed_loop')}")
+
+tok_cfg = os.path.join(model_dir, "tokenizer_config.json")
+if os.path.isfile(tok_cfg):
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(model_dir, use_fast=False)
+    seg = tok.convert_tokens_to_ids("[SEG]")
+    set_id = tok.convert_tokens_to_ids("[SET]")
+    print(f"[OK] merged tokenizer len={len(tok)}, SEG_id={seg}, SET_id={set_id}")
+    if seg is None or set_id is None or seg < 0 or set_id < 0:
+        print("[ERROR] merged tokenizer missing [SEG]/[SET]")
+        sys.exit(1)
 PY
+}
+
+verify_training_checkpoint () {
+  local ckpt="$1"
+  if [[ ! -d "${ckpt}" ]]; then
+    echo "[ERROR] checkpoint directory not found: ${ckpt}"
+    exit 1
+  fi
+  if [[ ! -f "${ckpt}/trainer_state.json" ]]; then
+    echo "[ERROR] trainer_state.json missing in ${ckpt}"
+    exit 1
+  fi
+  if [[ ! -f "${ckpt}/zero_to_fp32.py" ]]; then
+    echo "[ERROR] DeepSpeed checkpoint incomplete (zero_to_fp32.py missing): ${ckpt}"
+    exit 1
+  fi
+  CKPT_DIR="${ckpt}" "${PYTHON}" - <<'PY'
+import json, os, sys
+ckpt = os.environ["CKPT_DIR"]
+state = json.load(open(os.path.join(ckpt, "trainer_state.json"), encoding="utf-8"))
+step = int(state.get("global_step", 0))
+best = state.get("best_model_checkpoint", "")
+print(f"[OK] trainer global_step={step}, best_model_checkpoint={best}")
+if step <= 0:
+    print("[ERROR] checkpoint global_step <= 0; training may not have run")
+    sys.exit(1)
+PY
+}
+
+run_cross_dataset_eval_all () {
+  local model_dir="$1"
+  echo "[INFO] 5-dataset parallel test eval: LaSeRS / RRSISD / RefSegRS / RISBench / EarthReason"
+  MODEL_PATH="${model_dir}" \
+  OUT_DIR="${OUTPUT_DIR}" \
+  CUDA_VISIBLE_DEVICES="${GPU_ID}" \
+  EVAL_SPLIT="${EVAL_SPLIT}" \
+  EVAL_USE_WANDB="${EVAL_USE_WANDB}" \
+  EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT}" \
+  EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME}" \
+  LASERS_BENCHMARK="${LASERS_BENCHMARK}" \
+  EVAL_METRICS_SCRIPT="${EVAL_METRICS_SCRIPT}" \
+  VISION_TOWER="${VISION_TOWER}" \
+  VISION_TOWER_MASK="${VISION_TOWER_MASK}" \
+  MASK_CONFIG="${MASK_CONFIG}" \
+  PYTHON="${PYTHON}" \
+  REPO_DIR="${REPO_DIR}" \
+  bash "${REPO_DIR}/run_cross_dataset_test_eval.sh"
 }
 
 run_eval_metrics () {
@@ -263,6 +373,8 @@ echo "[0/6] Preflight checks (LaSeRS train+test)"
 echo "========================================"
 
 echo "[INFO] REPO_DIR=${REPO_DIR}"
+echo "[INFO] ABLATION=${ABLATION} closed_loop=${SETPP_CLOSED_LOOP} csqr=${SETPP_CSQR_ENABLE}"
+echo "[INFO] RUN_TAG=${RUN_TAG}"
 echo "[INFO] WARM_START_MODEL=${WARM_START_MODEL}"
 echo "[INFO] BASE_DATA_PATH=${BASE_DATA_PATH}"
 echo "[INFO] DATASET_NAME=${DATASET_NAME}"
@@ -278,6 +390,8 @@ echo "[INFO] RUN_TRAIN=${RUN_TRAIN} RUN_MERGE=${RUN_MERGE} RUN_EVAL=${RUN_EVAL}"
 echo "[INFO] MERGE_CHECKPOINT=${MERGE_CHECKPOINT:-<auto>}"
 echo "[INFO] EVAL_WANDB_PROJECT=${EVAL_WANDB_PROJECT}"
 echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
+echo "[INFO] SET++ defaults: closed_loop=True, csqr=True"
+echo "[INFO] RUN_CROSS_DATASET_EVAL=${RUN_CROSS_DATASET_EVAL} (5 datasets test parallel)"
 
 if [[ ! -d "${WARM_START_MODEL}" ]]; then
   echo "[ERROR] warm-start model not found: ${WARM_START_MODEL}"
@@ -395,6 +509,8 @@ echo "========================================"
   --data_seed "${DATA_SEED}" \
   --lasers_holdout_ratio "${LASERS_HOLDOUT_RATIO}" \
   --lasers_holdout_seed "${DATA_SEED}" \
+  --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
+  --setpp_csqr_enable "${SETPP_CSQR_ENABLE}" \
   --report_to wandb
 fi
 
@@ -419,6 +535,8 @@ if [[ -z "${BEST_CHECKPOINT}" ]]; then
   echo "[ERROR] no checkpoint found under ${OUTPUT_DIR}"
   exit 1
 fi
+
+verify_training_checkpoint "${BEST_CHECKPOINT}"
 
 echo "[OK] SELECTED_CHECKPOINT=${BEST_CHECKPOINT}"
 
@@ -449,10 +567,16 @@ if [[ ! -f "${MERGED_DIR}/config.json" ]]; then
   exit 1
 fi
 
-check_merged_setpp_model "${MERGED_DIR}"
+if [[ "${SETPP_CSQR_ENABLE}" == "True" ]]; then
+  EXPECT_CSQR=1
+else
+  EXPECT_CSQR=0
+fi
+
+check_merged_setpp_model "${MERGED_DIR}" "${EXPECT_CSQR}"
 
 ########################################
-# 5) Eval on LaSeRS test benchmarks + metrics
+# 5) Eval on 5 datasets (test) in parallel + metrics
 ########################################
 if [[ "${RUN_EVAL}" != "1" ]]; then
   echo "========================================"
@@ -460,11 +584,15 @@ if [[ "${RUN_EVAL}" != "1" ]]; then
   echo "========================================"
 else
 echo "========================================"
-echo "[5/6] Eval on LaSeRS test benchmarks + upload metrics"
+echo "[5/6] Eval on 5 datasets (test, parallel) + upload metrics"
 echo "========================================"
 
-eval_model "${MERGED_DIR}" "${EVAL_OUTPUT_DIR}"
-run_eval_metrics "${EVAL_OUTPUT_DIR}" "${EVAL_WANDB_RUN_NAME}"
+if [[ "${RUN_CROSS_DATASET_EVAL}" == "1" ]]; then
+  run_cross_dataset_eval_all "${MERGED_DIR}"
+else
+  eval_model "${MERGED_DIR}" "${EVAL_OUTPUT_DIR}"
+  run_eval_metrics "${EVAL_OUTPUT_DIR}" "${EVAL_WANDB_RUN_NAME}"
+fi
 fi
 
 ########################################
@@ -476,8 +604,9 @@ echo "Dataset           : LaSeRS (train + test, no val)"
 echo "Output dir        : ${OUTPUT_DIR}"
 echo "Selected ckpt     : ${BEST_CHECKPOINT}"
 echo "Merged model      : ${MERGED_DIR}"
-echo "Test outputs      : ${EVAL_OUTPUT_DIR}"
-echo "Metrics summary   : ${OUTPUT_DIR}/lasers_${EVAL_SPLIT}_metrics_summary.json"
+echo "Test outputs      : ${OUTPUT_DIR}/*_test_results (5 datasets)"
+echo "Eval logs         : ${OUTPUT_DIR}/*_test_eval.log"
+echo "LaSeRS metrics    : ${OUTPUT_DIR}/lasers_test_metrics.json (if generated)"
 echo "Eval W&B project  : ${EVAL_WANDB_PROJECT}"
 echo "Eval W&B run name : ${EVAL_WANDB_RUN_NAME}"
 echo "========================================"

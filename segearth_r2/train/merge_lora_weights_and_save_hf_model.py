@@ -7,6 +7,7 @@ sys.path.insert(0, project_root)
 import argparse
 import glob
 import copy
+import json
 
 import numpy as np
 import torch
@@ -47,8 +48,45 @@ def parse_args(args):
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
+
+    parser.add_argument("--setpp_closed_loop", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
+    parser.add_argument("--setpp_csqr_enable", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
+    parser.add_argument("--setpp_csqr_fusion_alpha_init", default=0.99, type=float)
     
     return parser.parse_args(args)
+
+
+def resolve_merge_arch_path(checkpoint_path):
+    """DeepSpeed checkpoints often lack config.json; use PEFT base_model for architecture init."""
+    config_path = os.path.join(checkpoint_path, "config.json")
+    if os.path.isfile(config_path):
+        return checkpoint_path
+    adapter_cfg = os.path.join(checkpoint_path, "adapter_config.json")
+    if os.path.isfile(adapter_cfg):
+        with open(adapter_cfg, "r", encoding="utf-8") as f:
+            base = json.load(f).get("base_model_name_or_path")
+        if base and os.path.isdir(base):
+            print(f"[merge] checkpoint has no config.json; init architecture from base: {base}")
+            return base
+    return checkpoint_path
+
+
+def ensure_seg_set_tokens(tokenizer, model):
+    """Match train.py tokenizer setup for [SEG]/[SET] and lm_head safety."""
+    added = tokenizer.add_tokens(["[SEG]", "[SET]"])
+    if added > 0:
+        model.resize_token_embeddings(len(tokenizer))
+    lm_head_size = model.lm_head.out_features
+    tokenizer_len = len(tokenizer)
+    seg_id = tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    set_id = tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    if tokenizer_len > lm_head_size or seg_id >= lm_head_size or set_id >= lm_head_size:
+        raise RuntimeError(
+            f"Tokenizer/lm_head mismatch after merge init: "
+            f"tokenizer_len={tokenizer_len}, lm_head={lm_head_size}, SEG_id={seg_id}, SET_id={set_id}"
+        )
+    print(f"[merge] tokenizer_len={tokenizer_len}, lm_head={lm_head_size}, SEG_id={seg_id}, SET_id={set_id}")
+    return tokenizer
 
 
 def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_module_list=[]): 
@@ -90,8 +128,9 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
-    model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    arch_path = resolve_merge_arch_path(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+    model = SegEarthR2.from_pretrained(arch_path, mask_decoder_cfg=mask_cfg, **kwargs)
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
     model.use_vmtf = model_args.use_vmtf if hasattr(model_args, 'use_vmtf') else False
@@ -99,6 +138,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     mask2former_ckpt = model_args.vision_tower_mask
     model.initial_mask_module(mask2former_ckpt, model_args)
+    model.ensure_setpp_predictor(model_args)
+    model.persist_setpp_config(model_args)
 
     model.get_model().initialize_vision_modules(model_args)
 
@@ -125,9 +166,10 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         )
         model = get_peft_model(model, lora_config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    tokenizer = ensure_seg_set_tokens(tokenizer, model)
 
     from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
+    print(f"[merge] loading DeepSpeed ZeRO weights from: {model_path}")
     model = load_state_dict_from_zero_checkpoint(model, model_path)
     model = model.merge_and_unload()
 

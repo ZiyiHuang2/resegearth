@@ -55,7 +55,7 @@ class DataArguments:
 
     # 新增：数据集类型与 split
     dataset_name: str = "lasers"   # lasers / rrsisd / refsegrs / risbench / earthreason
-    split: str = "val"             # train / val / test
+    split: str = "test"             # train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
 

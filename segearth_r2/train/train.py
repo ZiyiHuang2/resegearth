@@ -42,6 +42,21 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
+    setpp_closed_loop: bool = field(default=True)
+    setpp_lambda_union_single: float = field(default=0.01)
+    setpp_lambda_union_multi: float = field(default=0.05)
+    setpp_lambda_coverage_single: float = field(default=0.005)
+    setpp_lambda_coverage_multi: float = field(default=0.02)
+    setpp_lambda_consistency_single: float = field(default=0.005)
+    setpp_lambda_consistency_multi: float = field(default=0.02)
+    setpp_closed_loop_warmup_steps: int = field(default=2000)
+    setpp_consistency_mode: str = field(default="seg_align_set")
+
+    setpp_csqr_enable: bool = field(default=True)
+    setpp_csqr_fusion_alpha_init: float = field(default=0.99)
+    # Ablation on grouped SET/SEG base:
+    #   A0: closed_loop=False csqr=False | A1: True False | A2: False True | A3: True True (default)
+
 @dataclass
 class DataArguments:
     lazy_preprocess: bool = True
@@ -299,6 +314,13 @@ def train():
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+    else:
+        model.ensure_setpp_predictor(model_args)
+        model.mask_decoder_training_init(mask_cfg, model_args=model_args)
+
+    use_csqr, closed_loop = model.persist_setpp_config(model_args)
+    if training_args.local_rank in (-1, 0):
+        print(f"[SET++] config: setpp_csqr_enable={use_csqr}, setpp_closed_loop={closed_loop}")
 
     model.config.use_cache = False
 

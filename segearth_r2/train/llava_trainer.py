@@ -184,6 +184,61 @@ def get_mm_adapter_state_maybe_zero_3(named_params, keys_to_match):
 
 class LLaVATrainer(Trainer):
 
+    LOSS_LOG_KEYS = (
+        "loss_llm",
+        "loss_mask",
+        "loss_dice",
+        "loss_union",
+        "loss_setpp_coverage",
+        "loss_setpp_consistency",
+        "loss_attention",
+    )
+
+    def _iter_output_items(self, outputs):
+        if isinstance(outputs, dict):
+            return outputs.items()
+        if hasattr(outputs, "keys"):
+            return ((k, outputs[k]) for k in outputs.keys())
+        return ()
+
+    def _loss_value(self, value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            return float(value.detach().float().item())
+        if isinstance(value, (float, int)):
+            return float(value)
+        return None
+
+    def _extract_loss_dict(self, outputs):
+        loss_dict = {}
+        for name, value in self._iter_output_items(outputs):
+            if "loss" not in name or name == "loss":
+                continue
+            loss_value = self._loss_value(value)
+            if loss_value is None:
+                continue
+            if loss_value == 0 and hasattr(self, "history_loss_dict") and name in self.history_loss_dict:
+                loss_value = self.history_loss_dict[name]
+            loss_dict[name] = loss_value
+        return loss_dict
+
+    def _log_losses_to_output(self, loss_dict):
+        if not loss_dict:
+            return
+        if self.args.local_rank not in (-1, 0):
+            return
+        ordered = []
+        for key in self.LOSS_LOG_KEYS:
+            if key in loss_dict:
+                ordered.append(f"{key}={loss_dict[key]:.6f}")
+        for key in sorted(loss_dict.keys()):
+            if key not in self.LOSS_LOG_KEYS:
+                ordered.append(f"{key}={loss_dict[key]:.6f}")
+        logger.info("[step %d] losses: %s", self.state.global_step, " | ".join(ordered))
+
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
@@ -211,16 +266,18 @@ class LLaVATrainer(Trainer):
         else:
             super(LLaVATrainer, self)._save(output_dir, state_dict)
 
-    def update_history_loss_dict(self,outputs):
-        if not hasattr(self,'history_loss_dict'):
+    def update_history_loss_dict(self, outputs):
+        if not hasattr(self, 'history_loss_dict'):
             self.history_loss_dict = {}
-        for name, value in outputs.items():
+        for name, value in self._iter_output_items(outputs):
             if 'loss' in name and name != 'loss':
+                loss_value = self._loss_value(value)
+                if loss_value is None:
+                    continue
                 if name not in self.history_loss_dict:
-                    self.history_loss_dict[name] = value.item()
-                else:
-                    if value != 0:
-                        self.history_loss_dict[name] = value.item()
+                    self.history_loss_dict[name] = loss_value
+                elif loss_value != 0:
+                    self.history_loss_dict[name] = loss_value
 
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -253,17 +310,18 @@ class LLaVATrainer(Trainer):
                     f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-            if isinstance(outputs, dict) and 'loss_dice' in outputs:
-                loss_dict = {}
-                for name,value in outputs.items():
-                    if 'loss' in name and name != 'loss':
-                        loss_value = value.item()
-                        if loss_value == 0 and hasattr(self,'history_loss_dict'):
-                            loss_value = self.history_loss_dict[name]
-                        loss_dict[name] = loss_value
+            if hasattr(outputs, "loss"):
+                loss = outputs.loss
+            elif isinstance(outputs, dict):
+                loss = outputs["loss"]
+            else:
+                loss = outputs[0]
+            loss_dict = self._extract_loss_dict(outputs)
+            if loss_dict:
                 self.update_history_loss_dict(outputs)
                 self.log(loss_dict)
+                if self.state.global_step > 0 and (self.state.global_step + 1) % max(1, self.args.logging_steps) == 0:
+                    self._log_losses_to_output(loss_dict)
 
         return (loss, outputs) if return_outputs else loss
 

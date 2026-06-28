@@ -40,6 +40,8 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
     loss_union: Optional[torch.FloatTensor] = None
+    loss_setpp_coverage: Optional[torch.FloatTensor] = None
+    loss_setpp_consistency: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
@@ -169,7 +171,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.test_topk_per_image = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         input_shape = self.output_shape()
         self.pixel_decoder = self.pixel_decoder_init(cfg=self.mask_decoder_cfg, input_shape=input_shape)
-        self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
+        self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg, model_args=model_args)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
         self.SET_token_projector = nn.Linear(
@@ -179,7 +181,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
         self._copy_set_projector_from_seg()
 
-        self.mask_decoder_training_init(self.mask_decoder_cfg)
+        self.mask_decoder_training_init(self.mask_decoder_cfg, model_args=model_args)
         if pretrained_path is not None:
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
@@ -225,7 +227,20 @@ class SegEarthR2(MiphaPhiForCausalLM):
             if seg.bias is not None and setp.bias is not None:
                 setp.bias.copy_(seg.bias)
 
+    def _normalize_csqr_state_dict(self, state_dict):
+        normalized = False
+        for key, alpha in list(state_dict.items()):
+            if not key.endswith('csqr_block.fusion_alpha_logit'):
+                continue
+            if getattr(alpha, 'ndim', None) == 0:
+                if not normalized:
+                    state_dict = dict(state_dict)
+                    normalized = True
+                state_dict[key] = alpha.reshape(1)
+        return state_dict
+
     def load_state_dict(self, state_dict, strict=True, assign=False):
+        state_dict = self._normalize_csqr_state_dict(state_dict)
         has_set_in_ckpt = any(k.startswith('SET_token_projector') for k in state_dict)
         if not has_set_in_ckpt:
             incompatible = super().load_state_dict(state_dict, strict=False, assign=assign)
@@ -251,7 +266,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             'res5': features[3], # bs, 1024, 32, 32
         }
         return features_dict
-    def mask_decoder_training_init(self, cfg):
+    def mask_decoder_training_init(self, cfg, model_args=None):
         # Loss parameters:
         deep_supervision = cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION
         no_object_weight = cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT
@@ -261,6 +276,21 @@ class SegEarthR2(MiphaPhiForCausalLM):
         dice_weight = cfg.MODEL.MASK_FORMER.DICE_WEIGHT
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         # boundary_weight = cfg.MODEL.MASK_FORMER.BOUNDARY_WEIGHT
+
+        setpp_closed_loop = getattr(model_args, 'setpp_closed_loop', True) if model_args else True
+        setpp_kwargs = {}
+        if model_args is not None:
+            setpp_kwargs = dict(
+                setpp_closed_loop=setpp_closed_loop,
+                lambda_union_single=getattr(model_args, 'setpp_lambda_union_single', 0.01),
+                lambda_union_multi=getattr(model_args, 'setpp_lambda_union_multi', 0.05),
+                lambda_coverage_single=getattr(model_args, 'setpp_lambda_coverage_single', 0.005),
+                lambda_coverage_multi=getattr(model_args, 'setpp_lambda_coverage_multi', 0.02),
+                lambda_consistency_single=getattr(model_args, 'setpp_lambda_consistency_single', 0.005),
+                lambda_consistency_multi=getattr(model_args, 'setpp_lambda_consistency_multi', 0.02),
+                closed_loop_warmup_steps=getattr(model_args, 'setpp_closed_loop_warmup_steps', 2000),
+                consistency_mode=getattr(model_args, 'setpp_consistency_mode', 'seg_align_set'),
+            )
         
         matcher = hungarian_matcher_InstructSeg(
             cost_class=class_weight,
@@ -269,9 +299,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
         
-        weight_dict = {"loss_SEG_class": class_weight,  "loss_mask": mask_weight,
-                       "loss_dice": dice_weight, "loss_union_mask": mask_weight,
-                       "loss_union_dice": dice_weight, }
+        weight_dict = {
+            "loss_SEG_class": class_weight,
+            "loss_mask": mask_weight,
+            "loss_dice": dice_weight,
+            "loss_union_mask": 1.0,
+            "loss_union_dice": 1.0,
+            "loss_setpp_coverage": 1.0,
+            "loss_setpp_consistency": 1.0,
+        }
+        if not setpp_closed_loop:
+            weight_dict["loss_union_mask"] = mask_weight
+            weight_dict["loss_union_dice"] = dice_weight
 
         self.weight_dict = weight_dict
         if deep_supervision:
@@ -287,7 +326,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-            device=self.device
+            device=self.device,
+            **setpp_kwargs,
         )
         self.size_divisibility = 32
         self.sem_seg_postprocess_before_inference = True
@@ -303,7 +343,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
-    def predictor_init(self, cfg):
+    def predictor_init(self, cfg, model_args=None):
         in_channels = cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         hidden_dim = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
         num_queries = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
@@ -316,6 +356,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_norm = cfg.MODEL.MASK_FORMER.SEG_NORM
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
+        if model_args is not None:
+            use_csqr = getattr(model_args, 'setpp_csqr_enable', True)
+            csqr_fusion_alpha_init = getattr(model_args, 'setpp_csqr_fusion_alpha_init', 0.99)
+        else:
+            use_csqr = getattr(self.config, 'setpp_csqr_enable', False)
+            csqr_fusion_alpha_init = getattr(self.config, 'setpp_csqr_fusion_alpha_init', 0.99)
 
         predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(in_channels,
                                                                      hidden_dim,
@@ -328,8 +374,52 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                                      enforce_input_project,
                                                                      seg_norm,
                                                                      seg_proj,
-                                                                     seg_fuse_score,)
+                                                                     seg_fuse_score,
+                                                                     use_csqr=use_csqr,
+                                                                     csqr_fusion_alpha_init=csqr_fusion_alpha_init,)
         return predictor
+
+    def resolve_setpp_flags(self, model_args=None):
+        if model_args is not None:
+            use_csqr = getattr(model_args, 'setpp_csqr_enable', True)
+            closed_loop = getattr(model_args, 'setpp_closed_loop', True)
+        else:
+            use_csqr = getattr(self.config, 'setpp_csqr_enable', True)
+            closed_loop = getattr(self.config, 'setpp_closed_loop', True)
+        return bool(use_csqr), bool(closed_loop)
+
+    def persist_setpp_config(self, model_args=None):
+        use_csqr, closed_loop = self.resolve_setpp_flags(model_args)
+        self.config.setpp_csqr_enable = use_csqr
+        self.config.setpp_closed_loop = closed_loop
+        return use_csqr, closed_loop
+
+    def ensure_setpp_predictor(self, model_args=None):
+        """Rebuild predictor when setpp_csqr_enable disagrees with loaded predictor.use_csqr."""
+        if not hasattr(self, 'mask_decoder_cfg') or self.mask_decoder_cfg is None:
+            return
+
+        target_use_csqr, _ = self.resolve_setpp_flags(model_args)
+
+        if not hasattr(self, 'predictor'):
+            self.predictor = self.predictor_init(self.mask_decoder_cfg, model_args=model_args)
+            return
+
+        current_use_csqr = getattr(self.predictor, 'use_csqr', False)
+        if current_use_csqr == target_use_csqr:
+            return
+
+        old_state = self.predictor.state_dict()
+        self.predictor = self.predictor_init(self.mask_decoder_cfg, model_args=model_args)
+        incompatible = self.predictor.load_state_dict(old_state, strict=False)
+        if target_use_csqr:
+            print('[SET++] enabled CSQR block on predictor (loaded compatible weights, strict=False)')
+        else:
+            print('[SET++] disabled CSQR block on predictor (dropped csqr_block weights)')
+        if incompatible.missing_keys:
+            print(f"[SET++] predictor missing keys after rebuild: {incompatible.missing_keys[:8]}")
+        if incompatible.unexpected_keys:
+            print(f"[SET++] predictor unexpected keys after rebuild: {incompatible.unexpected_keys[:8]}")
 
 
     def get_model(self):
@@ -795,6 +885,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             llm_loss = loss_fct(shift_logits, shift_labels)
             
         mask_loss = None
+        loss_mask = torch.tensor(0.0, device=hidden_states.device)
+        loss_dice = torch.tensor(0.0, device=hidden_states.device)
+        loss_union = torch.tensor(0.0, device=hidden_states.device)
+        loss_setpp_coverage = torch.tensor(0.0, device=hidden_states.device)
+        loss_setpp_consistency = torch.tensor(0.0, device=hidden_states.device)
         if seg_info is not None:
             if 'padding_mask' in seg_info[0]:
                 if isinstance(seg_info[0]["instances"], list):
@@ -842,16 +937,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_losses = self.criterion(mask_outputs, targets)
             weight_dict = self.weight_dict
 
-            loss_mask = 0.0
-            loss_dice = 0.0
-            loss_union = 0.0
+            loss_mask = torch.tensor(0.0, device=hidden_states.device)
+            loss_dice = torch.tensor(0.0, device=hidden_states.device)
+            loss_union = torch.tensor(0.0, device=hidden_states.device)
+            loss_setpp_coverage = torch.tensor(0.0, device=hidden_states.device)
+            loss_setpp_consistency = torch.tensor(0.0, device=hidden_states.device)
         
             for k in list(mask_losses.keys()):
                 if k in weight_dict:
                     if mask_losses[k] is not None:
                         mask_losses[k] *= weight_dict[k]
                     
-                    if 'union' in k:
+                    if 'coverage' in k:
+                        loss_setpp_coverage += mask_losses[k]
+                    elif 'consistency' in k:
+                        loss_setpp_consistency += mask_losses[k]
+                    elif 'union' in k:
                         loss_union += mask_losses[k]
                     elif '_mask' in k:
                         loss_mask += mask_losses[k]
@@ -859,7 +960,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         loss_dice += mask_losses[k]
                 else:
                     mask_losses.pop(k)
-            mask_loss = loss_mask + loss_dice + loss_union
+            mask_loss = loss_mask + loss_dice + loss_union + loss_setpp_coverage + loss_setpp_consistency
 
         loss_attention = None
         masks = [_seg_info['mask'] for _seg_info in seg_info]
@@ -896,7 +997,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
-            loss_union=loss_union.detach() if loss_union != 0.0 else torch.tensor(0.0, device=loss.device),
+            loss_union=loss_union.detach(),
+            loss_setpp_coverage=loss_setpp_coverage.detach(),
+            loss_setpp_consistency=loss_setpp_consistency.detach(),
         )
     
     def eval_seg(

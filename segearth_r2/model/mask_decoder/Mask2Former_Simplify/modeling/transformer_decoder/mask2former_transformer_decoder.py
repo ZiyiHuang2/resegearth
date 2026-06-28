@@ -199,7 +199,88 @@ class MLP(nn.Module):
         return x
 
 
+class SetGuidedQueryRefinementBlock(nn.Module):
+    """
+    Closed-loop Set-guided Query Refinement (CSQR).
 
+    Feature-level SET<->SEG interaction before the grouped mask decoder.
+    """
+
+    def __init__(
+            self,
+            hidden_dim,
+            nheads,
+            dim_feedforward=2048,
+            pre_norm=False,
+            fusion_alpha_init=0.99,
+    ):
+        super().__init__()
+        self.seg_self_attn = SelfAttentionLayer(
+            d_model=hidden_dim, nhead=nheads, dropout=0.0,
+            activation="relu", normalize_before=pre_norm,
+        )
+        self.set_from_seg_attn = CrossAttentionLayer(
+            d_model=hidden_dim, nhead=nheads, dropout=0.0,
+            activation="relu", normalize_before=pre_norm,
+        )
+        self.seg_from_set_attn = CrossAttentionLayer(
+            d_model=hidden_dim, nhead=nheads, dropout=0.0,
+            activation="relu", normalize_before=pre_norm,
+        )
+        self.seg_from_img_attn = CrossAttentionLayer(
+            d_model=hidden_dim, nhead=nheads, dropout=0.0,
+            activation="relu", normalize_before=pre_norm,
+        )
+        self.fusion_norm = nn.LayerNorm(hidden_dim)
+        self.fusion_mlp = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
+        init_logit = torch.log(torch.tensor(fusion_alpha_init) / (1.0 - fusion_alpha_init))
+        # Keep shape (1,) so HF weight loading can allocate with torch.empty(*param.size()).
+        self.fusion_alpha_logit = nn.Parameter(init_logit.reshape(1))
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        fusion_key = prefix + 'fusion_alpha_logit'
+        if fusion_key in state_dict:
+            alpha = state_dict[fusion_key]
+            if getattr(alpha, 'ndim', None) == 0:
+                state_dict[fusion_key] = alpha.reshape(1)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs,
+        )
+
+    def forward(self, q_set, q_seg, img_memory, img_pos=None, seg_key_padding_mask=None):
+        q_seg_orig = q_seg
+
+        seg_t = q_seg.permute(1, 0, 2)
+        seg_t = self.seg_self_attn(seg_t, tgt_key_padding_mask=seg_key_padding_mask)
+        q1 = seg_t.permute(1, 0, 2)
+
+        q_set_t = q_set.permute(1, 0, 2)
+        q1_t = q1.permute(1, 0, 2)
+        q_set_t = self.set_from_seg_attn(
+            q_set_t, q1_t, memory_key_padding_mask=seg_key_padding_mask,
+        )
+        q_set_refined = q_set_t.permute(1, 0, 2)
+
+        q_set_mem = q_set_refined.permute(1, 0, 2)
+        q2_t = self.seg_from_set_attn(q1_t, q_set_mem)
+        pad_mask_t = None
+        if seg_key_padding_mask is not None:
+            pad_mask_t = seg_key_padding_mask.transpose(0, 1).unsqueeze(-1)
+            q2_t = q2_t.masked_fill(pad_mask_t, 0.0)
+
+        q3_t = self.seg_from_img_attn(q2_t, img_memory, pos=img_pos)
+        if pad_mask_t is not None:
+            q3_t = q3_t.masked_fill(pad_mask_t, 0.0)
+        q3 = q3_t.permute(1, 0, 2)
+
+        alpha = torch.sigmoid(self.fusion_alpha_logit)
+        refined = self.fusion_mlp(self.fusion_norm(q3))
+        q_seg_refined = alpha * q_seg_orig + (1.0 - alpha) * refined
+        if seg_key_padding_mask is not None:
+            valid = (~seg_key_padding_mask).unsqueeze(-1).to(q_seg_refined.dtype)
+            q_seg_refined = q_seg_refined * valid
+
+        return q_set_refined, q_seg_refined
 
 
 class MultiScaleMaskedTransformerDecoder(nn.Module):
@@ -407,6 +488,8 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
             seg_proj=True,
             seg_fuse_score=False,
             use_seg_query=False,
+            use_csqr=False,
+            csqr_fusion_alpha_init=0.99,
     ):
         nn.Module.__init__(self)
         # positional encoding
@@ -420,6 +503,7 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.transformer_cross_attention_layers = nn.ModuleList()
         self.transformer_ffn_layers = nn.ModuleList()
         self.use_seg_query = use_seg_query
+        self.use_csqr = use_csqr
         for _ in range(self.num_layers):
             self.transformer_self_attention_layers.append(
                 SelfAttentionLayer(
@@ -484,6 +568,16 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
         self.SEG_proj = MLP(hidden_dim, hidden_dim, hidden_dim, 2)
 
+        if self.use_csqr:
+            print('SET++ CSQR block enabled (Set-guided Query Refinement)')
+            self.csqr_block = SetGuidedQueryRefinementBlock(
+                hidden_dim=hidden_dim,
+                nheads=nheads,
+                dim_feedforward=dim_feedforward,
+                pre_norm=pre_norm,
+                fusion_alpha_init=csqr_fusion_alpha_init,
+            )
+
 
     def forward(self, x, mask_features, mask=None, seg_query=None, SEG_embedding=None, SET_embedding=None, mask_num=None):
 
@@ -527,6 +621,23 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
 
         # Build SEG queries: P_SEG(h_SEG_i) + e_SEG (role embedding)
         SEG_query = SEG_padded + self.SEG_role_embed.weight.unsqueeze(0)  # [B, Kmax, C]
+
+        valid_seg_mask = torch.zeros(bs, Kmax, dtype=torch.bool, device=SEG_embedding.device)
+        for b_idx, k in enumerate(mask_num if mask_num is not None else [Kmax]):
+            valid_seg_mask[b_idx, :k] = True
+
+        # CSQR: feature-level SET<->SEG refinement before grouped decoder
+        seg_key_padding_mask = None
+        if Kmax > 0:
+            seg_key_padding_mask = ~valid_seg_mask  # True = padded SEG slot
+        if self.use_csqr and Kmax > 0:
+            SET_query, SEG_query = self.csqr_block(
+                q_set=SET_query,
+                q_seg=SEG_query,
+                img_memory=src[0],
+                img_pos=pos[0],
+                seg_key_padding_mask=seg_key_padding_mask,
+            )
 
         # Concat: [SET, SEG_1, ..., SEG_Kmax] -> [B, 1+Kmax, C] -> [1+Kmax, B, C]
         output = torch.cat([SET_query, SEG_query], dim=1)  # [B, 1+Kmax, C]
@@ -622,9 +733,15 @@ class MultiScaleMaskedTransformerDecoderForOPTPreTrain(nn.Module):
 
         assert len(predictions_SEG_class) == self.num_layers + 1
 
+        pred_masks = predictions_mask[-1]
+        pred_SEG_logits = predictions_SEG_class[-1]
         out = {
-            'pred_SEG_logits': predictions_SEG_class[-1],
-            'pred_masks': predictions_mask[-1],
+            'pred_SEG_logits': pred_SEG_logits,
+            'pred_masks': pred_masks,
+            'pred_set_union_mask': pred_masks[:, 0:1],
+            'pred_seg_masks': pred_masks[:, 1:],
+            'pred_seg_logits': pred_SEG_logits[:, 1:] if pred_SEG_logits is not None else None,
+            'valid_seg_mask': valid_seg_mask,
             'aux_outputs': self._set_aux_loss(
                 predictions_SEG_class, predictions_mask,
             )

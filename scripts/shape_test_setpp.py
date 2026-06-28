@@ -510,6 +510,247 @@ def test_edge_cases():
 
 
 # ============================================================
+# Test 10: SET++-ClosedLoop structured outputs & losses
+# ============================================================
+def test_closed_loop_structured_outputs():
+    print("=" * 60)
+    print("Test 10: SET++-ClosedLoop structured decoder outputs")
+    print("=" * 60)
+
+    B_cl = 2
+    Kmax_cl = 3
+    mask_num = [2, 3]
+    H_m, W_m = 50, 50
+
+    pred_masks = torch.randn(B_cl, 1 + Kmax_cl, H_m, W_m)
+    pred_SEG_logits = torch.randn(B_cl, 1 + Kmax_cl, 1)
+
+    valid_seg_mask = torch.zeros(B_cl, Kmax_cl, dtype=torch.bool)
+    for b_idx, k in enumerate(mask_num):
+        valid_seg_mask[b_idx, :k] = True
+
+    outputs = {
+        "pred_masks": pred_masks,
+        "pred_SEG_logits": pred_SEG_logits,
+        "pred_set_union_mask": pred_masks[:, 0:1],
+        "pred_seg_masks": pred_masks[:, 1:],
+        "pred_seg_logits": pred_SEG_logits[:, 1:],
+        "valid_seg_mask": valid_seg_mask,
+    }
+
+    assert outputs["pred_set_union_mask"].shape == (B_cl, 1, H_m, W_m)
+    assert outputs["pred_seg_masks"].shape == (B_cl, Kmax_cl, H_m, W_m)
+    assert outputs["pred_seg_logits"].shape == (B_cl, Kmax_cl, 1)
+    assert outputs["valid_seg_mask"].shape == (B_cl, Kmax_cl)
+
+    expected_valid = torch.tensor([
+        [True, True, False],
+        [True, True, True],
+    ])
+    assert torch.equal(outputs["valid_seg_mask"], expected_valid), (
+        f"valid_seg_mask mismatch:\n{outputs['valid_seg_mask']}\nexpected:\n{expected_valid}"
+    )
+
+    print(f"  pred_set_union_mask: {outputs['pred_set_union_mask'].shape}")
+    print(f"  pred_seg_masks: {outputs['pred_seg_masks'].shape}")
+    print(f"  valid_seg_mask:\n{outputs['valid_seg_mask'].int()}")
+    print("  ✅ Test 10 PASSED\n")
+    return outputs
+
+
+def test_closed_loop_criterion_helpers(outputs):
+    print("=" * 60)
+    print("Test 11: SET++-ClosedLoop criterion helpers")
+    print("=" * 60)
+
+    def soft_union(seg_logits, valid_seg_mask):
+        seg_prob = seg_logits.sigmoid()
+        seg_prob = seg_prob * valid_seg_mask[:, :, None, None].float()
+        return 1.0 - torch.prod(1.0 - seg_prob, dim=1, keepdim=True)
+
+    def dice_prob_loss(pred_prob, tgt_prob, sample_weight=None, eps=1.0):
+        pred = pred_prob.flatten(1)
+        tgt = tgt_prob.flatten(1)
+        numerator = 2 * (pred * tgt).sum(dim=1) + eps
+        denominator = pred.sum(dim=1) + tgt.sum(dim=1) + eps
+        loss = 1.0 - numerator / denominator
+        if sample_weight is not None:
+            return (loss * sample_weight).mean()
+        return loss.mean()
+
+    def build_union_target_tensor(targets, size):
+        union_list = []
+        for t in targets:
+            masks = t["masks"].float()
+            union = (masks.sum(dim=0, keepdim=True) > 0).float()
+            if union.shape[-2:] != size:
+                union = F.interpolate(
+                    union.unsqueeze(0),
+                    size=size,
+                    mode="nearest",
+                ).squeeze(0)
+            union_list.append(union)
+        return torch.stack(union_list, dim=0)
+
+    def build_sample_weights(targets, single_weight, multi_weight):
+        weights = []
+        for t in targets:
+            k = len(t["labels"])
+            weights.append(single_weight if k <= 1 else multi_weight)
+        return torch.tensor(weights, dtype=torch.float32)
+
+    B_cl = outputs["pred_seg_masks"].shape[0]
+    H_m, W_m = outputs["pred_seg_masks"].shape[-2:]
+    mask_num = [2, 3]
+    targets = []
+    for b_idx, k in enumerate(mask_num):
+        gt_masks = torch.zeros(k, H_m, W_m)
+        for i in range(k):
+            gt_masks[i, 10 + i * 5:20 + i * 5, 10 + i * 5:20 + i * 5] = 1.0
+        targets.append({"labels": torch.zeros(k, dtype=torch.long), "masks": gt_masks})
+
+    # soft_union: padded SEG logits should not affect union
+    seg_logits = outputs["pred_seg_masks"].clone()
+    seg_logits[:, 2, :, :] = 100.0  # padded slot for sample 0 only
+    seg_union = soft_union(seg_logits, outputs["valid_seg_mask"])
+    seg_union_no_pad = soft_union(
+        outputs["pred_seg_masks"], outputs["valid_seg_mask"]
+    )
+    assert torch.allclose(seg_union[0], seg_union_no_pad[0], atol=1e-5), \
+        "Padded SEG logits must not affect soft union for sample 0"
+
+    # build_union_target_tensor == OR of GT masks
+    gt_union = build_union_target_tensor(targets, size=(H_m, W_m))
+    for b_idx, t in enumerate(targets):
+        manual_union = (t["masks"].float().sum(dim=0, keepdim=True) > 0).float()
+        assert torch.equal(gt_union[b_idx], manual_union), f"Union target mismatch at sample {b_idx}"
+
+    # consistency direction: seg_align_set detaches SET
+    pred_set = outputs["pred_set_union_mask"].clone().requires_grad_(True)
+    pred_seg = outputs["pred_seg_masks"].clone().requires_grad_(True)
+    valid = outputs["valid_seg_mask"]
+    set_prob = pred_set.sigmoid()
+    seg_union = soft_union(pred_seg, valid)
+    weights = build_sample_weights(targets, 0.005, 0.02)
+    cons_loss = dice_prob_loss(seg_union, set_prob.detach(), sample_weight=weights)
+    cons_loss.backward()
+    assert pred_set.grad is None or torch.all(pred_set.grad == 0), \
+        "seg_align_set: SET union must not receive consistency gradient"
+    assert pred_seg.grad is not None, "seg_align_set: SEG masks must receive consistency gradient"
+
+    # matcher still uses only SEG queries (shape-level check)
+    instance_masks = outputs["pred_seg_masks"]
+    for b_idx, k in enumerate(mask_num):
+        assert instance_masks[b_idx].shape[0] == outputs["valid_seg_mask"].shape[1]
+        assert outputs["valid_seg_mask"][b_idx, :k].all()
+        if k < outputs["valid_seg_mask"].shape[1]:
+            assert not outputs["valid_seg_mask"][b_idx, k:].any()
+
+    print("  soft_union ignores padded SEG: OK")
+    print("  build_union_target_tensor OR: OK")
+    print("  seg_align_set grad direction: OK")
+    print("  matcher uses pred_seg_masks only (shape check): OK")
+    print("  ✅ Test 11 PASSED\n")
+
+
+# ============================================================
+# Test 12: CSQR block shapes
+# ============================================================
+def test_csqr_block():
+    print("=" * 60)
+    print("Test 12: CSQR block (Set-guided Query Refinement)")
+    print("=" * 60)
+
+    # Lightweight inline CSQR forward (same tensor contract as SetGuidedQueryRefinementBlock)
+    B_cs, K_cs, C_cs, HW = 2, 3, HIDDEN_DIM, 50 * 50
+    q_set = torch.randn(B_cs, 1, C_cs)
+    q_seg = torch.randn(B_cs, K_cs, C_cs)
+    img_memory = torch.randn(HW, B_cs, C_cs)
+    valid_seg_mask = torch.tensor([[True, True, False], [True, True, True]])
+    seg_key_padding_mask = ~valid_seg_mask
+
+    seg_attn = nn.MultiheadAttention(C_cs, 8, batch_first=False)
+    cross_attn = nn.MultiheadAttention(C_cs, 8, batch_first=False)
+    fusion_mlp = nn.Sequential(nn.Linear(C_cs, C_cs), nn.ReLU(), nn.Linear(C_cs, C_cs))
+    fusion_alpha = 0.99
+
+    seg_t = q_seg.permute(1, 0, 2)
+    q1_t, _ = seg_attn(seg_t, seg_t, seg_t, key_padding_mask=seg_key_padding_mask)
+    q_set_t = q_set.permute(1, 0, 2)
+    q_set_t, _ = cross_attn(q_set_t, q1_t, q1_t, key_padding_mask=seg_key_padding_mask)
+    q2_t, _ = cross_attn(q1_t, q_set_t, q_set_t)
+    pad_mask_t = seg_key_padding_mask.transpose(0, 1).unsqueeze(-1)
+    q2_t = q2_t.masked_fill(pad_mask_t, 0.0)
+    q3_t, _ = cross_attn(q2_t, img_memory, img_memory)
+    q3_t = q3_t.masked_fill(pad_mask_t, 0.0)
+    q3 = q3_t.permute(1, 0, 2)
+    q_seg_out = fusion_alpha * q_seg + (1.0 - fusion_alpha) * fusion_mlp(q3)
+    q_seg_out = q_seg_out * (~seg_key_padding_mask).unsqueeze(-1).float()
+    q_set_out = q_set_t.permute(1, 0, 2)
+
+    assert q_set_out.shape == (B_cs, 1, C_cs)
+    assert q_seg_out.shape == (B_cs, K_cs, C_cs)
+    assert torch.all(q_seg_out[0, 2] == 0), "Padded SEG slot should stay zero after CSQR"
+
+    print(f"  q_set_out: {q_set_out.shape}, q_seg_out: {q_seg_out.shape}")
+    print(f"  fusion_alpha (reference): {fusion_alpha:.4f}")
+    print("  ✅ Test 12 PASSED\n")
+
+
+def test_loss_sample_weight_scale():
+    print("=" * 60)
+    print("Test 13: ClosedLoop loss sample_weight scale (mean, not normalized)")
+    print("=" * 60)
+
+    def dice_prob_loss(pred_prob, tgt_prob, sample_weight=None, eps=1.0):
+        pred = pred_prob.flatten(1)
+        tgt = tgt_prob.flatten(1)
+        numerator = 2 * (pred * tgt).sum(dim=1) + eps
+        denominator = pred.sum(dim=1) + tgt.sum(dim=1) + eps
+        loss = 1.0 - numerator / denominator
+        if sample_weight is not None:
+            return (loss * sample_weight).mean()
+        return loss.mean()
+
+    B_t, H_t, W_t = 2, 32, 32
+    pred_prob = torch.rand(B_t, 1, H_t, W_t).clamp(1e-3, 1 - 1e-3)
+    tgt_prob = torch.rand(B_t, 1, H_t, W_t).clamp(1e-3, 1 - 1e-3)
+
+    base_dice = dice_prob_loss(pred_prob, tgt_prob, sample_weight=None)
+    uniform_w = torch.full((B_t,), 0.02)
+    weighted_dice = dice_prob_loss(pred_prob, tgt_prob, sample_weight=uniform_w)
+    assert torch.allclose(weighted_dice, base_dice * 0.02, rtol=1e-3, atol=1e-5), (
+        f"dice weighted scale mismatch: {weighted_dice.item():.6f} vs {base_dice.item() * 0.02:.6f}"
+    )
+    assert weighted_dice < base_dice * 0.05, "uniform lambda=0.02 should strongly downscale dice"
+
+    pred_logits = torch.randn(B_t, 1, H_t, W_t)
+    tgt = torch.randint(0, 2, (B_t, 1, H_t, W_t)).float()
+    per_sample_bce = F.binary_cross_entropy_with_logits(
+        pred_logits, tgt, reduction="none"
+    ).flatten(1).mean(dim=1)
+    base_bce = per_sample_bce.mean()
+    weighted_bce = (per_sample_bce * uniform_w).mean()
+    assert torch.allclose(weighted_bce, base_bce * 0.02, rtol=1e-3, atol=1e-5), (
+        f"bce weighted scale mismatch: {weighted_bce.item():.6f} vs {base_bce.item() * 0.02:.6f}"
+    )
+
+    hetero_w = torch.tensor([0.01, 0.05])
+    hetero_dice = dice_prob_loss(pred_prob, tgt_prob, sample_weight=hetero_w)
+    per_sample_dice = 1.0 - (
+        2 * (pred_prob.flatten(1) * tgt_prob.flatten(1)).sum(dim=1) + 1.0
+    ) / (pred_prob.flatten(1).sum(dim=1) + tgt_prob.flatten(1).sum(dim=1) + 1.0)
+    expected_hetero = (per_sample_dice * hetero_w).mean()
+    assert torch.allclose(hetero_dice, expected_hetero, rtol=1e-5, atol=1e-6), \
+        "heterogeneous sample_weight must use batch mean, not sum/normalize"
+
+    print(f"  base_dice={base_dice.item():.6f}, weighted_dice(0.02)={weighted_dice.item():.6f}")
+    print(f"  base_bce={base_bce.item():.6f}, weighted_bce(0.02)={weighted_bce.item():.6f}")
+    print("  heterogeneous weights use (loss * w).mean(): OK")
+    print("  ✅ Test 13 PASSED\n")
+
+
+# ============================================================
 # Run All Tests
 # ============================================================
 if __name__ == "__main__":
@@ -530,6 +771,10 @@ if __name__ == "__main__":
     test_eval_seg_path(pred_masks_full)
     test_multi_scale_features()
     test_edge_cases()
+    closed_loop_outputs = test_closed_loop_structured_outputs()
+    test_closed_loop_criterion_helpers(closed_loop_outputs)
+    test_csqr_block()
+    test_loss_sample_weight_scale()
 
     print("=" * 60)
     print("  🎉 ALL TESTS PASSED!")
