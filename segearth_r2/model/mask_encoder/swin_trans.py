@@ -66,6 +66,34 @@ def window_reverse(windows, window_size, H, W):
     return x
 
 
+def align_coarse_evidence_to_windows(
+    coarse_evidence: torch.Tensor,
+    H: int,
+    W: int,
+    window_size: int,
+    shift_size: int,
+    pad_l: int,
+    pad_r: int,
+    pad_t: int,
+    pad_b: int,
+) -> torch.Tensor:
+    """Map [B,1,Hm,Wm] coarse prob to window tokens [BW,Nw] with same geom as x_windows."""
+    ev = coarse_evidence
+    if ev.dim() == 3:
+        ev = ev.unsqueeze(1)
+    if ev.shape[-2:] != (H, W):
+        ev = F.interpolate(ev.float(), size=(H, W), mode="bilinear", align_corners=False)
+    ev = ev.to(dtype=coarse_evidence.dtype, device=coarse_evidence.device)
+    B = ev.shape[0]
+    ev = ev.permute(0, 2, 3, 1)  # B,H,W,1
+    ev = F.pad(ev, (0, 0, pad_l, pad_r, pad_t, pad_b))
+    _, Hp, Wp, _ = ev.shape
+    if shift_size > 0:
+        ev = torch.roll(ev, shifts=(-shift_size, -shift_size), dims=(1, 2))
+    ev_windows = window_partition(ev, window_size)
+    return ev_windows.view(-1, window_size * window_size).squeeze(-1)
+
+
 class WindowAttention(nn.Module):
     """ Window based multi-head self attention (W-MSA) module with relative position bias.
     It supports both of shifted and non-shifted window.
@@ -205,6 +233,8 @@ class SwinTransformerBlock(nn.Module):
         stage_idx=0,
         layer_idx=0,
         evidence_state=None,
+        coarse_evidence=None,
+        enable_tg_swin=True,
     ):
         """ Forward function.
 
@@ -241,10 +271,17 @@ class SwinTransformerBlock(nn.Module):
         x_windows = x_windows.view(-1, self.window_size * self.window_size, C)  # nW*B, window_size*window_size, C
 
         attn_text_bias = None
-        if tg_swin_controller is not None and text_cond is not None:
+        evidence_windows = None
+        if coarse_evidence is not None and tg_swin_controller is not None and enable_tg_swin:
+            evidence_windows = align_coarse_evidence_to_windows(
+                coarse_evidence, H, W, self.window_size, self.shift_size,
+                pad_l, pad_r, pad_t, pad_b,
+            )
+        if tg_swin_controller is not None and text_cond is not None and enable_tg_swin:
             attn_text_bias = tg_swin_controller.compute_bias(
                 stage_idx, layer_idx, x_windows, text_cond, reliability,
                 evidence_state=evidence_state,
+                evidence_windows=evidence_windows,
             )
 
         # W-MSA/SW-MSA
@@ -388,6 +425,8 @@ class BasicLayer(nn.Module):
         tg_swin_controller=None,
         stage_idx=0,
         evidence_state=None,
+        coarse_evidence=None,
+        enable_tg_swin=True,
     ):
         """ Forward function.
 
@@ -417,7 +456,11 @@ class BasicLayer(nn.Module):
         attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
         attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
 
-        tg_swin_active = tg_swin_controller is not None and text_cond is not None
+        tg_swin_active = (
+            enable_tg_swin
+            and tg_swin_controller is not None
+            and text_cond is not None
+        )
         for layer_idx, blk in enumerate(self.blocks):
             blk.H, blk.W = H, W
             if self.use_checkpoint and not tg_swin_active:
@@ -432,6 +475,8 @@ class BasicLayer(nn.Module):
                     stage_idx=stage_idx,
                     layer_idx=layer_idx,
                     evidence_state=evidence_state,
+                    coarse_evidence=coarse_evidence,
+                    enable_tg_swin=enable_tg_swin,
                 )
         new_evidence_state = evidence_state
         if tg_swin_controller is not None and getattr(tg_swin_controller, "use_evidence_state", False):
@@ -655,15 +700,16 @@ class SwinTransformer(nn.Module):
         text_cond=None,
         reliability=None,
         tg_swin_controller=None,
+        coarse_evidence=None,
+        enable_tg_swin=True,
     ):
         """Forward function."""
         x = self.patch_embed(x)
 
         Wh, Ww = x.size(2), x.size(3)
         if self.ape:
-            # interpolate the position embedding to the corresponding size
             absolute_pos_embed = F.interpolate(self.absolute_pos_embed, size=(Wh, Ww), mode='bicubic')
-            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)  # B Wh*Ww C
+            x = (x + absolute_pos_embed).flatten(2).transpose(1, 2)
         else:
             x = x.flatten(2).transpose(1, 2)
         x = self.pos_drop(x)
@@ -681,6 +727,8 @@ class SwinTransformer(nn.Module):
                 tg_swin_controller=tg_swin_controller,
                 stage_idx=i,
                 evidence_state=evidence_state,
+                coarse_evidence=coarse_evidence,
+                enable_tg_swin=enable_tg_swin,
             )
 
             if i in self.out_indices:

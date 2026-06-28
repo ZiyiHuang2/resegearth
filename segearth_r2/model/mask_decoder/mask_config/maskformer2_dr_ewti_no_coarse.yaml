@@ -1,0 +1,6 @@
+_BASE_: ./maskformer2_tgswin_dr_ewti.yaml
+
+# Paper ablation: "DR w/o coarse evidence"
+# Disables Pass A coarse mask → evidence_windows; dr_wti_blocks fall back to standard WTI path.
+TG_SWIN:
+  USE_COARSE_EVIDENCE: false
