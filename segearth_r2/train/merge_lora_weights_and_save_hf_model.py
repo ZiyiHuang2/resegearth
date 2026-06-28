@@ -136,7 +136,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 def main(args):
     args = parse_args(args)
 
-    tokenizer, model = load_pretrained_model(args.model_path, model_args=args, mask_config=args.mask_config, device='cuda')
+    # Weight merge runs on CPU (model is loaded with device_map='cpu'); GPU is not required.
+    tokenizer, model = load_pretrained_model(args.model_path, model_args=args, mask_config=args.mask_config, device='cpu')
 
     state_dict = {}
     for k, v in model.state_dict().items():
