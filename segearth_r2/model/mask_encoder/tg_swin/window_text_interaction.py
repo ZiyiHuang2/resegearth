@@ -1,4 +1,4 @@
-"""Window Text Interaction — v1 key-bias / v1.5 head-aware low-rank pairwise bias."""
+"""Window Text Interaction — v1 key-bias / v1.5 head-aware / DR-EWTI dynamic relational."""
 
 from __future__ import annotations
 
@@ -190,6 +190,11 @@ class TGSwimController(nn.Module):
         num_text_stages: int = 4,
         use_evidence_state: bool = False,
         evidence_state_dim: int = 64,
+        use_dr_ewti: bool = False,
+        evidence_dim: int = 32,
+        evidence_eps: float = 1e-4,
+        evidence_logit_clip: float = 4.0,
+        evidence_relation_gate_init: float = 0.0,
     ):
         super().__init__()
         self.cond_dim = cond_dim
@@ -202,6 +207,7 @@ class TGSwimController(nn.Module):
         self.num_text_stages = num_text_stages
         self.use_evidence_state = use_evidence_state
         self.evidence_state_dim = evidence_state_dim
+        self.use_dr_ewti = use_dr_ewti
         self._last_stats: Dict[str, float] = {}
         self._stage_bias_abs_mean: Dict[int, float] = {}
         self._stage_dims_map: Dict[int, int] = {}
@@ -242,6 +248,7 @@ class TGSwimController(nn.Module):
 
         wti_cls = StageWTIHeadAware if head_aware else StageWTIKeyBias
         self.wti_blocks = nn.ModuleDict()
+        self.dr_wti_blocks: Optional[nn.ModuleDict] = nn.ModuleDict() if use_dr_ewti else None
         for stage_idx in self.wti_stages:
             if stage_idx >= len(stage_dims):
                 continue
@@ -259,15 +266,24 @@ class TGSwimController(nn.Module):
             if use_evidence_state and self.state_proj is not None:
                 block.set_state_proj(self.state_proj)
             self.wti_blocks[str(stage_idx)] = block
+            if use_dr_ewti and isinstance(block, StageWTIHeadAware):
+                from .dynamic_relational_wti import StageDynamicRelationalWTI
+
+                assert self.dr_wti_blocks is not None
+                self.dr_wti_blocks[str(stage_idx)] = StageDynamicRelationalWTI(
+                    dim=stage_dims[stage_idx],
+                    cond_dim=cond_dim,
+                    num_heads=stage_heads[stage_idx],
+                    rank=wti_rank,
+                    bias_max=bias_max,
+                    evidence_dim=evidence_dim,
+                    eps=evidence_eps,
+                    logit_clip=evidence_logit_clip,
+                    evidence_relation_gate_init=evidence_relation_gate_init,
+                )
 
     def _cond_index_for_swin_stage(self, swin_stage_idx: int, num_cond_stages: int) -> int:
-        """Map Swin stage index to TCF cond slice.
-
-        Compact layout (v1.5 default): ``text_cond.shape[1] == len(wti_stage_list)`` and
-        cond[i] corresponds to ``wti_stage_list[i]`` (e.g. Swin stages 1/2/3 → cond 0/1/2).
-
-        Legacy layout (v1.6): ``num_cond_stages == 4`` with cond indexed by Swin stage id.
-        """
+        """Compact layout: cond[i] ↔ wti_stage_list[i]. Legacy: cond indexed by Swin stage id."""
         if num_cond_stages == len(self.wti_stage_list):
             return self.wti_stage_list.index(swin_stage_idx)
         return min(swin_stage_idx, num_cond_stages - 1)
@@ -301,6 +317,7 @@ class TGSwimController(nn.Module):
         text_cond: Optional[torch.Tensor],
         reliability: Optional[torch.Tensor],
         evidence_state: Optional[torch.Tensor] = None,
+        evidence_windows: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if text_cond is None or reliability is None:
             return None
@@ -319,16 +336,41 @@ class TGSwimController(nn.Module):
                 batch_size, self.evidence_state_dim,
                 device=tc.device, dtype=tc.dtype,
             )
-        attn_bias, raw_bias, gate = module(x_windows, tc, rel, evidence_state=state_in)
 
-        if self.use_evidence_state:
-            self._stage_bias_abs_mean[stage_idx] = float(attn_bias.abs().mean().item())
+        diag: Dict[str, float] = {}
+        if (
+            self.use_dr_ewti
+            and self.dr_wti_blocks is not None
+            and key in self.dr_wti_blocks
+            and evidence_windows is not None
+        ):
+            dr_module = self.dr_wti_blocks[key]
+            attn_bias, raw_bias, gate, dr_diag = dr_module(
+                module,
+                x_windows,
+                tc,
+                rel,
+                evidence_windows=evidence_windows,
+                log_stats=self.log_stats,
+            )
+            if dr_diag is not None:
+                diag = dr_diag
+        else:
+            attn_bias, raw_bias, gate = module(x_windows, tc, rel, evidence_state=state_in)
+
+        if self.use_evidence_state and self.log_stats:
+            self._stage_bias_abs_mean[stage_idx] = float(attn_bias.detach().abs().mean().cpu())
 
         if self.log_stats:
-            st = module.stats(attn_bias, raw_bias, gate, rel)
+            if not diag:
+                st = module.stats(attn_bias, raw_bias, gate, rel)
+            else:
+                st = dict(diag)
             st["stage_idx"] = float(stage_idx)
             st["layer_idx"] = float(layer_idx)
             st["active"] = 1.0
+            if "reliability_mean" not in st:
+                st["reliability_mean"] = float(rel.detach().mean().cpu())
             self._last_stats.update(st)
         return attn_bias
 
