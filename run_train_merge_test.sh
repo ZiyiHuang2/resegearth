@@ -2,25 +2,16 @@
 set -euo pipefail
 
 ########################################
-# Full DR-EWTI + SET++：Warm-start Train → Merge → LaSeRS Test Eval → W&B Metrics
+# Enhanced WTI v2 + SET control + SET++：Train → Merge → Eval → W&B
 #
-# 数据集：LaSeRS（dataset_name=lasers）
-# 起点：LaSeRS base-8w merged_model（standard-base-lasers-siglip1-8w-gd4）
+# 数据集：LaSeRS | 起点：base-8w merged_model
 #
 # Quick start:
 #   GPU_ID=0 RUN_PREFLIGHT=0 bash run_train_merge_test.sh
 #
-# 官方 LaSeRS 只有 train + test（无 val）：
-#   - 训练：train_data.json；训练期 validation 从 train holdout 5%
-#   - 最终评估：5 数据集 test 并行（LaSeRS + RRSISD + RefSegRS + RISBench + EarthReason）
-#
-# Override examples:
-#   GPU_ID=0 MAX_STEPS=50000 bash run_train_merge_test.sh
-#   ABLATION=A0 bash run_train_merge_test.sh   # Base only
-#   ABLATION=A1 bash run_train_merge_test.sh   # +ClosedLoop
-#   ABLATION=A2 bash run_train_merge_test.sh   # +CSQR only
-#   ABLATION=A3 bash run_train_merge_test.sh   # Full (default)
-#   WARM_START_MODEL=/path/to/merged_model bash run_train_merge_test.sh
+# Override:
+#   MAX_STEPS=50000 bash run_train_merge_test.sh
+#   RUN_TAG=ewti-v2-sc-30k MAX_STEPS=30000 bash run_train_merge_test.sh
 ########################################
 
 ########################################
@@ -29,39 +20,17 @@ set -euo pipefail
 export NCCL_P2P_DISABLE=1
 export NCCL_IB_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export WANDB_PROJECT="${WANDB_PROJECT:-segearth-dr-ewti-setpp}"
+export WANDB_PROJECT="${WANDB_PROJECT:-segearth-ewti-v2-sc}"
 export NETRC="${NETRC:-/root/rivermind-data/.netrc}"
 export WANDB_DIR="${WANDB_DIR:-/root/rivermind-data/.wandb}"
 
 ########################################
-# Ablation matrix (A0–A3)
+# SET++ decoder（固定全开）
 ########################################
-ABLATION="${ABLATION:-A3}"
+SETPP_CLOSED_LOOP=True
+SETPP_CSQR_ENABLE=True
 
-case "${ABLATION}" in
-  A0)
-    SETPP_CLOSED_LOOP=False
-    SETPP_CSQR_ENABLE=False
-    ;;
-  A1)
-    SETPP_CLOSED_LOOP=True
-    SETPP_CSQR_ENABLE=False
-    ;;
-  A2)
-    SETPP_CLOSED_LOOP=False
-    SETPP_CSQR_ENABLE=True
-    ;;
-  A3)
-    SETPP_CLOSED_LOOP=True
-    SETPP_CSQR_ENABLE=True
-    ;;
-  *)
-    echo "[ERROR] unknown ABLATION=${ABLATION}, expected A0/A1/A2/A3"
-    exit 1
-    ;;
-esac
-
-RUN_TAG="${RUN_TAG:-dr-ewti-setpp-${ABLATION}-lasers-warmstart-2w-bs2-gd4}"
+RUN_TAG="${RUN_TAG:-ewti-v2-sc}"
 export WANDB_NAME="${WANDB_NAME:-${RUN_TAG}}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
@@ -87,7 +56,7 @@ cd "${REPO_DIR}"
 WARM_START_MODEL="${WARM_START_MODEL:-${RESEG_ROOT}/output/base/standard-base-lasers-siglip1-8w-gd4/merged_model}"
 VISION_TOWER="${RESEG_ROOT}/pretrained_model/CLIP/siglip-so400m-patch14-384"
 VISION_TOWER_MASK="${RESEG_ROOT}/pretrained_model/mask2former/model_final_54b88a.pkl"
-MASK_CONFIG="segearth_r2/model/mask_decoder/mask_config/maskformer2_dr_ewti_setpp.yaml"
+MASK_CONFIG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/maskformer2_enhanced_wti_v2_setpp.yaml}"
 
 ########################################
 # LaSeRS 数据集配置
@@ -112,12 +81,13 @@ RUN_CROSS_DATASET_EVAL="${RUN_CROSS_DATASET_EVAL:-1}"
 ########################################
 EVAL_METRICS_SCRIPT="${RESEG_ROOT}/eval_val_metrics.py"
 EVAL_USE_WANDB="True"
-EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-dr-ewti-setpp}"
+EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-ewti-v2-sc}"
 EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-${RUN_TAG}}"
 
 ########################################
 # Train config（对齐 base-5w LaSeRS preset，SET++ 继续训 50k steps）
 ########################################
+# Enhanced WTI v2：关闭 LLM attention loss 后可开 gradient checkpointing + bs=2
 MAX_STEPS="${MAX_STEPS:-30000}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
@@ -134,7 +104,7 @@ LOGGING_STEPS="10"
 BF16="True"
 TF32="False"
 MODEL_MAX_LENGTH="2048"
-GRADIENT_CHECKPOINTING="False"
+GRADIENT_CHECKPOINTING="True"
 DATALOADER_NUM_WORKERS="8"
 
 LORA_R="8"
@@ -158,12 +128,10 @@ export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 ########################################
 # Helpers
 ########################################
-run_dr_ewti_preflight () {
-  echo "[INFO] DR-EWTI preflight: warmstart load + LaSeRS single-batch probe"
-  "${PYTHON}" tools/diagnostics/probe_tgswin_dr_ewti_warmstart_load.py \
-    --model-path "${WARM_START_MODEL}"
-  "${PYTHON}" tools/diagnostics/probe_tgswin_dr_ewti_lasers_preflight.py \
-    --model-path "${WARM_START_MODEL}"
+run_preflight () {
+  echo "[INFO] Enhanced WTI v2 + SET control preflight"
+  "${PYTHON}" tools/diagnostics/smoke_enhanced_wti_v2_setpp.py
+  "${PYTHON}" tools/diagnostics/probe_enhanced_wti_v2_seg_loss_gradient.py --phase alpha005
 }
 
 assert_gpu_available () {
@@ -402,8 +370,8 @@ echo "[0/6] Preflight checks (LaSeRS train+test)"
 echo "========================================"
 
 echo "[INFO] REPO_DIR=${REPO_DIR}"
-echo "[INFO] ABLATION=${ABLATION} closed_loop=${SETPP_CLOSED_LOOP} csqr=${SETPP_CSQR_ENABLE}"
 echo "[INFO] RUN_TAG=${RUN_TAG}"
+echo "[INFO] MASK_CONFIG=${MASK_CONFIG}"
 echo "[INFO] WARM_START_MODEL=${WARM_START_MODEL}"
 echo "[INFO] BASE_DATA_PATH=${BASE_DATA_PATH}"
 echo "[INFO] DATASET_NAME=${DATASET_NAME}"
@@ -411,6 +379,8 @@ echo "[INFO] EVAL_SPLIT=${EVAL_SPLIT} (LaSeRS 无 val，评估应对 test 子集
 echo "[INFO] LASERS_BENCHMARK=${LASERS_BENCHMARK}"
 echo "[INFO] LASERS_HOLDOUT_RATIO=${LASERS_HOLDOUT_RATIO}"
 echo "[INFO] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[INFO] WANDB_PROJECT=${WANDB_PROJECT}"
+echo "[INFO] WANDB_NAME=${WANDB_NAME}"
 echo "[INFO] GPU_SLOT=${GPU_SLOT}"
 echo "[INFO] GPU_ID=${GPU_ID}"
 echo "[INFO] LEARNING_RATE=${LEARNING_RATE}"
@@ -419,7 +389,7 @@ echo "[INFO] RUN_TRAIN=${RUN_TRAIN} RUN_MERGE=${RUN_MERGE} RUN_EVAL=${RUN_EVAL}"
 echo "[INFO] MERGE_CHECKPOINT=${MERGE_CHECKPOINT:-<auto>}"
 echo "[INFO] EVAL_WANDB_PROJECT=${EVAL_WANDB_PROJECT}"
 echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
-echo "[INFO] SET++ defaults: closed_loop=True, csqr=True"
+echo "[INFO] SET++ closed_loop=True csqr=True"
 echo "[INFO] RUN_CROSS_DATASET_EVAL=${RUN_CROSS_DATASET_EVAL} (5 datasets test parallel)"
 
 if [[ ! -d "${WARM_START_MODEL}" ]]; then
@@ -492,8 +462,8 @@ mkdir -p "${OUTPUT_DIR}"
 echo "[OK] preflight passed (train + test present, no val required)"
 
 if [[ "${RUN_PREFLIGHT}" == "1" && "${RUN_TRAIN}" == "1" ]]; then
-  run_dr_ewti_preflight
-  echo "[OK] DR-EWTI preflight probes passed"
+  run_preflight
+  echo "[OK] preflight probes passed"
 fi
 
 ########################################
@@ -506,7 +476,7 @@ if [[ "${RUN_TRAIN}" != "1" ]]; then
   echo "========================================"
 else
 echo "========================================"
-echo "[1/6] Training DR-EWTI + SET++ on LaSeRS train (holdout eval)"
+echo "[1/6] Training Enhanced WTI v2 + SET control + SET++ on LaSeRS (holdout eval)"
 echo "========================================"
 
 assert_gpu_available
@@ -594,6 +564,11 @@ fi
 ########################################
 # 4) Check merged SET++ weights
 ########################################
+if [[ "${RUN_MERGE}" != "1" ]]; then
+  echo "========================================"
+  echo "[4/6] SKIP merged weight check (RUN_MERGE=${RUN_MERGE})"
+  echo "========================================"
+else
 echo "========================================"
 echo "[4/6] Check merged SET++ weights"
 echo "========================================"
@@ -603,13 +578,8 @@ if [[ ! -f "${MERGED_DIR}/config.json" ]]; then
   exit 1
 fi
 
-if [[ "${SETPP_CSQR_ENABLE}" == "True" ]]; then
-  EXPECT_CSQR=1
-else
-  EXPECT_CSQR=0
+check_merged_setpp_model "${MERGED_DIR}" "1"
 fi
-
-check_merged_setpp_model "${MERGED_DIR}" "${EXPECT_CSQR}"
 
 ########################################
 # 5) Eval on 5 datasets (test) in parallel + metrics

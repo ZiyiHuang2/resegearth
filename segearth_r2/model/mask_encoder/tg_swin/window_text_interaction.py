@@ -168,6 +168,163 @@ class StageWTIHeadAware(nn.Module):
         }
 
 
+class StageEnhancedWTIHeadAware(nn.Module):
+    """Enhanced WTI v2: MLP visual/text projectors + optional head mixer → [BW,H,N,N] bias."""
+
+    def __init__(
+        self,
+        dim: int,
+        cond_dim: int,
+        num_heads: int,
+        window_size: int,
+        rank: int = 16,
+        bias_max: float = 4.0,
+        alpha_init: float = 0.0,
+        stage_scale: float = 1.0,
+        projector_hidden_ratio: float = 2.0,
+        projector_max_hidden: int = 512,
+        use_head_mixer: bool = True,
+        head_mixer_ratio: float = 2.0,
+        gamma_init: float = 0.0,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.cond_dim = cond_dim
+        self.num_heads = num_heads
+        self.N = window_size * window_size
+        self.rank = rank
+        self.bias_max = bias_max
+        self.stage_scale = stage_scale
+        self.use_head_mixer = use_head_mixer
+        H, r = num_heads, rank
+        hr = H * r
+
+        hidden_v = min(int(dim * projector_hidden_ratio), projector_max_hidden)
+        hidden_t = min(int(cond_dim * projector_hidden_ratio), projector_max_hidden)
+
+        self.visual_norm = nn.LayerNorm(dim)
+        self.visual_proj = nn.Sequential(
+            nn.Linear(dim, hidden_v),
+            nn.GELU(),
+            nn.Linear(hidden_v, 2 * hr),
+        )
+        self.text_norm = nn.LayerNorm(cond_dim)
+        self.text_proj = nn.Sequential(
+            nn.Linear(cond_dim, hidden_t),
+            nn.GELU(),
+            nn.Linear(hidden_t, 2 * hr),
+        )
+        for seq in (self.visual_proj, self.text_proj):
+            nn.init.normal_(seq[-1].weight, std=1e-3)
+            if seq[-1].bias is not None:
+                nn.init.zeros_(seq[-1].bias)
+
+        if use_head_mixer:
+            mixer_hidden = max(int(num_heads * head_mixer_ratio), num_heads)
+            self.head_mixer_norm = nn.LayerNorm(num_heads)
+            self.head_mixer = nn.Sequential(
+                nn.Linear(num_heads, mixer_hidden),
+                nn.GELU(),
+                nn.Linear(mixer_hidden, num_heads),
+            )
+            self.head_mixer_gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
+        else:
+            self.head_mixer_norm = None
+            self.head_mixer = None
+            self.head_mixer_gamma = None
+
+        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+
+    @staticmethod
+    def _broadcast_text_cond(text_cond: torch.Tensor, bw: int) -> torch.Tensor:
+        batch_size = text_cond.shape[0]
+        num_windows = bw // batch_size
+        return text_cond.unsqueeze(1).expand(batch_size, num_windows, -1).reshape(bw, -1)
+
+    def compute_raw_bias(
+        self,
+        x_windows: torch.Tensor,
+        text_cond: torch.Tensor,
+        reliability: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        bw, n_tokens, _ = x_windows.shape
+        H, r = self.num_heads, self.rank
+
+        tc = self._broadcast_text_cond(text_cond, bw)
+
+        v = self.visual_proj(self.visual_norm(x_windows)).view(bw, n_tokens, H, 2, r)
+        Q_v = v[..., 0, :].permute(0, 2, 1, 3)
+        K_v = v[..., 1, :].permute(0, 2, 1, 3)
+
+        t = self.text_proj(self.text_norm(tc)).view(bw, H, 2, r)
+        Q_t, K_t = t[:, :, 0, :], t[:, :, 1, :]
+
+        Q_prime = Q_v * Q_t.unsqueeze(2)
+        K_prime = K_v * K_t.unsqueeze(2)
+
+        B_0 = torch.einsum("bhnr,bhmr->bhnm", Q_prime, K_prime) / math.sqrt(r)
+
+        if self.use_head_mixer and self.head_mixer is not None:
+            if self.training:
+                from torch.utils.checkpoint import checkpoint
+                B_mix = checkpoint(self._head_mixer_mix, B_0, use_reentrant=False)
+            else:
+                B_mix = self._head_mixer_mix(B_0)
+        else:
+            B_mix = B_0
+
+        return torch.tanh(B_mix) * self.bias_max
+
+    def _head_mixer_mix(self, B_0: torch.Tensor) -> torch.Tensor:
+        bias_h = B_0.permute(0, 2, 3, 1)
+        bias_h = self.head_mixer(self.head_mixer_norm(bias_h))
+        bias_delta = bias_h.permute(0, 3, 1, 2)
+        gamma = torch.tanh(self.head_mixer_gamma)
+        return B_0 + gamma * bias_delta
+
+    def forward(
+        self,
+        x_windows: torch.Tensor,
+        text_cond: torch.Tensor,
+        reliability: torch.Tensor,
+        set_control: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bw = x_windows.shape[0]
+        batch_size = text_cond.shape[0]
+        num_windows = bw // batch_size
+        rel = reliability.view(batch_size, -1)[:, :1]
+        rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
+
+        raw_bias = self.compute_raw_bias(x_windows, text_cond, reliability)
+        gate = torch.tanh(self.alpha) * self.stage_scale * rel
+        if set_control is not None:
+            gate = gate * set_control
+        attn_bias = raw_bias * gate
+        return attn_bias, raw_bias, gate
+
+    def stats(self, attn_bias, raw_bias, gate, reliability, set_control=None):
+        head_mean = attn_bias.abs().mean(dim=(0, 2, 3)) if attn_bias is not None else None
+        ent = 0.0
+        if head_mean is not None and head_mean.sum() > 0:
+            p = head_mean / head_mean.sum().clamp_min(1e-8)
+            ent = float(-(p * (p + 1e-8).log()).sum().item())
+        mixer_gamma = 0.0
+        if self.head_mixer_gamma is not None:
+            mixer_gamma = float(torch.tanh(self.head_mixer_gamma).item())
+        st = {
+            "alpha": float(torch.tanh(self.alpha).item()),
+            "head_mixer_gamma": mixer_gamma,
+            "bias_abs_mean": float(attn_bias.abs().mean().item()) if attn_bias is not None else 0.0,
+            "bias_abs_max": float(attn_bias.abs().max().item()) if attn_bias is not None else 0.0,
+            "raw_bias_abs_mean": float(raw_bias.abs().mean().item()) if raw_bias is not None else 0.0,
+            "reliability_mean": float(reliability.mean().item()) if reliability is not None else 0.0,
+            "head_bias_entropy": ent,
+        }
+        if set_control is not None:
+            st["set_control_mean"] = float(set_control.detach().mean().cpu())
+        return st
+
+
 class TGSwimController(nn.Module):
     """Per-stage WTI registry; selects stage slice from [B,S,C] text cond."""
 
@@ -195,6 +352,12 @@ class TGSwimController(nn.Module):
         evidence_eps: float = 1e-4,
         evidence_logit_clip: float = 4.0,
         evidence_relation_gate_init: float = 0.0,
+        enhanced_wti: bool = False,
+        wti_projector_ratio: float = 2.0,
+        wti_projector_max_hidden: int = 512,
+        wti_head_mixer: bool = True,
+        wti_head_mixer_ratio: float = 2.0,
+        wti_head_mixer_gamma_init: float = 0.0,
     ):
         super().__init__()
         self.cond_dim = cond_dim
@@ -204,10 +367,11 @@ class TGSwimController(nn.Module):
         self.window_size = window_size
         self.log_stats = log_stats
         self.head_aware = head_aware
+        self.enhanced_wti = enhanced_wti
         self.num_text_stages = num_text_stages
         self.use_evidence_state = use_evidence_state
         self.evidence_state_dim = evidence_state_dim
-        self.use_dr_ewti = use_dr_ewti
+        self.use_dr_ewti = use_dr_ewti and not enhanced_wti
         self._last_stats: Dict[str, float] = {}
         self._stage_bias_abs_mean: Dict[int, float] = {}
         self._stage_dims_map: Dict[int, int] = {}
@@ -246,14 +410,21 @@ class TGSwimController(nn.Module):
             self.state_proj = None
             self.visual_pool_projs = None
 
-        wti_cls = StageWTIHeadAware if head_aware else StageWTIKeyBias
+        if enhanced_wti:
+            wti_cls = StageEnhancedWTIHeadAware
+        elif head_aware:
+            wti_cls = StageWTIHeadAware
+        else:
+            wti_cls = StageWTIKeyBias
         self.wti_blocks = nn.ModuleDict()
-        self.dr_wti_blocks: Optional[nn.ModuleDict] = nn.ModuleDict() if use_dr_ewti else None
+        self.dr_wti_blocks: Optional[nn.ModuleDict] = (
+            nn.ModuleDict() if self.use_dr_ewti else None
+        )
         for stage_idx in self.wti_stages:
             if stage_idx >= len(stage_dims):
                 continue
             self._stage_dims_map[stage_idx] = stage_dims[stage_idx]
-            block = wti_cls(
+            block_kwargs = dict(
                 dim=stage_dims[stage_idx],
                 cond_dim=cond_dim,
                 num_heads=stage_heads[stage_idx],
@@ -263,10 +434,19 @@ class TGSwimController(nn.Module):
                 alpha_init=alpha_init,
                 stage_scale=stage_scales[stage_idx] if stage_idx < len(stage_scales) else 1.0,
             )
-            if use_evidence_state and self.state_proj is not None:
+            if enhanced_wti:
+                block_kwargs.update(
+                    projector_hidden_ratio=wti_projector_ratio,
+                    projector_max_hidden=wti_projector_max_hidden,
+                    use_head_mixer=wti_head_mixer,
+                    head_mixer_ratio=wti_head_mixer_ratio,
+                    gamma_init=wti_head_mixer_gamma_init,
+                )
+            block = wti_cls(**block_kwargs)
+            if use_evidence_state and self.state_proj is not None and hasattr(block, "set_state_proj"):
                 block.set_state_proj(self.state_proj)
             self.wti_blocks[str(stage_idx)] = block
-            if use_dr_ewti and isinstance(block, StageWTIHeadAware):
+            if self.use_dr_ewti and isinstance(block, StageWTIHeadAware):
                 from .dynamic_relational_wti import StageDynamicRelationalWTI
 
                 assert self.dr_wti_blocks is not None
@@ -318,6 +498,7 @@ class TGSwimController(nn.Module):
         reliability: Optional[torch.Tensor],
         evidence_state: Optional[torch.Tensor] = None,
         evidence_windows: Optional[torch.Tensor] = None,
+        set_control: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
         if text_cond is None or reliability is None:
             return None
@@ -328,6 +509,15 @@ class TGSwimController(nn.Module):
             return None
 
         tc, rel = self._select_stage_cond(text_cond, reliability, stage_idx)
+        sc = None
+        if set_control is not None:
+            sc, _ = self._select_stage_cond(set_control, set_control, stage_idx)
+            bw = x_windows.shape[0]
+            batch_size = tc.shape[0]
+            num_windows = bw // batch_size
+            sc = sc.view(batch_size, -1)[:, :1]
+            sc = sc.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
+
         module = self.wti_blocks[key]
         state_in = evidence_state
         if self.use_evidence_state and state_in is None:
@@ -356,14 +546,20 @@ class TGSwimController(nn.Module):
             if dr_diag is not None:
                 diag = dr_diag
         else:
-            attn_bias, raw_bias, gate = module(x_windows, tc, rel, evidence_state=state_in)
+            if isinstance(module, StageEnhancedWTIHeadAware):
+                attn_bias, raw_bias, gate = module(x_windows, tc, rel, set_control=sc)
+            else:
+                attn_bias, raw_bias, gate = module(x_windows, tc, rel, evidence_state=state_in)
 
         if self.use_evidence_state and self.log_stats:
             self._stage_bias_abs_mean[stage_idx] = float(attn_bias.detach().abs().mean().cpu())
 
         if self.log_stats:
             if not diag:
-                st = module.stats(attn_bias, raw_bias, gate, rel)
+                if isinstance(module, StageEnhancedWTIHeadAware):
+                    st = module.stats(attn_bias, raw_bias, gate, rel, set_control=sc)
+                else:
+                    st = module.stats(attn_bias, raw_bias, gate, rel)
             else:
                 st = dict(diag)
             st["stage_idx"] = float(stage_idx)
@@ -371,6 +567,8 @@ class TGSwimController(nn.Module):
             st["active"] = 1.0
             if "reliability_mean" not in st:
                 st["reliability_mean"] = float(rel.detach().mean().cpu())
+            if sc is not None and "set_control_mean" not in st:
+                st["set_control_mean"] = float(sc.detach().mean().cpu())
             self._last_stats.update(st)
         return attn_bias
 

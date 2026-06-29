@@ -54,8 +54,9 @@ class ModelArguments:
 
     setpp_csqr_enable: bool = field(default=True)
     setpp_csqr_fusion_alpha_init: float = field(default=0.99)
-    # Ablation on grouped SET/SEG base:
-    #   A0: closed_loop=False csqr=False | A1: True False | A2: False True | A3: True True (default)
+    # Auxiliary LLM attention alignment (0.01 weight). Off by default — saves ~10–15GB
+    # and allows LLM gradient checkpointing (incompatible with output_attentions=True).
+    enable_attention_loss: bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -319,8 +320,10 @@ def train():
         model.mask_decoder_training_init(mask_cfg, model_args=model_args)
 
     use_csqr, closed_loop = model.persist_setpp_config(model_args)
+    model.config.enable_attention_loss = bool(getattr(model_args, "enable_attention_loss", False))
     if training_args.local_rank in (-1, 0):
         print(f"[SET++] config: setpp_csqr_enable={use_csqr}, setpp_closed_loop={closed_loop}")
+        print(f"[train] enable_attention_loss={model.config.enable_attention_loss}")
 
     model.config.use_cache = False
 
@@ -411,6 +414,11 @@ def train():
     train_module_list = [
         "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "SET_token_projector",
     ]
+
+    if getattr(mask_cfg, "TG_SWIN", None) and getattr(mask_cfg.TG_SWIN, "ENABLED", False):
+        train_module_list.extend(["tg_swin_tcf", "tg_swin_controller"])
+        if getattr(mask_cfg.TG_SWIN, "USE_SET_TGSWIN_CONTROL", False):
+            train_module_list.append("tg_swin_set_control")
 
     if model_args.train_swin_backbone:
         train_module_list.append('vision_tower_mask')

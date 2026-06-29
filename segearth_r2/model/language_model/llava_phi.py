@@ -20,7 +20,7 @@ from segearth_r2.utils.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, REFER_T
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import MultiScaleMaskedTransformerDecoderForOPTPreTrain
 from ..mask_decoder.Mask2Former_Simplify.modeling.pixel_decoder.msdeformattn import MSDeformAttnPixelDecoder
 from ..mask_encoder.swin_trans import build_swin_b, build_swin_l
-from ..mask_encoder.tg_swin import TextConditionFactory, TGSwimController
+from ..mask_encoder.tg_swin import TextConditionFactory, TGSwimController, SETControlHead
 
 from ..mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.position_encoding import PositionEmbeddingSine
 
@@ -274,11 +274,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
         cfg = self._get_tg_swin_cfg()
         return bool(cfg and str(getattr(cfg, "VERSION", "")).lower() == "dr-ewti")
 
+    def _is_enhanced_wti_v2(self):
+        cfg = self._get_tg_swin_cfg()
+        if not cfg:
+            return False
+        version = str(getattr(cfg, "VERSION", "")).lower()
+        return version == "enhanced-wti-v2" or bool(getattr(cfg, "ENHANCED_WTI", False))
+
     def _init_tg_swin_modules(self):
         cfg = self._get_tg_swin_cfg()
         if not cfg or not getattr(cfg, "ENABLED", False):
             self.tg_swin_tcf = None
             self.tg_swin_controller = None
+            self.tg_swin_set_control = None
             return
 
         text_dim = getattr(cfg, "TEXT_DIM", None) or self.config.hidden_size
@@ -288,16 +296,24 @@ class SegEarthR2(MiphaPhiForCausalLM):
         version = getattr(cfg, "VERSION", "v1")
         wti_stages = list(getattr(cfg, "WTI_STAGES", [1, 2, 3]))
         num_stages = int(getattr(cfg, "NUM_STAGES", len(wti_stages)))
-        use_dr_ewti = self._is_dr_ewti() or bool(getattr(cfg, "USE_COARSE_EVIDENCE", False))
+        enhanced_wti = self._is_enhanced_wti_v2()
+        use_dr_ewti = bool(
+            getattr(cfg, "USE_DR_EWTI", self._is_dr_ewti() or bool(getattr(cfg, "USE_COARSE_EVIDENCE", False)))
+        )
+        if enhanced_wti:
+            use_dr_ewti = False
+
+        tcf_version = version if version not in ("dr-ewti", "enhanced-wti-v2") else "v1.5"
+        stage_router_default = version in ("v1.5", "v1.6", "dr-ewti", "enhanced-wti-v2")
 
         self.tg_swin_tcf = TextConditionFactory(
             text_dim=text_dim,
             cond_dim=cond_dim,
             reliability_init=getattr(cfg, "RELIABILITY_INIT", 0.0),
             use_phrase_pool=getattr(cfg, "USE_PHRASE_POOL", True),
-            version=version if version not in ("dr-ewti",) else "v1.5",
+            version=tcf_version,
             num_stages=num_stages,
-            stage_router=bool(getattr(cfg, "STAGE_ROUTER", version in ("v1.5", "v1.6", "dr-ewti"))),
+            stage_router=bool(getattr(cfg, "STAGE_ROUTER", stage_router_default)),
             router_hidden_dim=int(getattr(cfg, "ROUTER_HIDDEN_DIM", 512)),
             use_relation_pool=bool(getattr(cfg, "USE_RELATION_AWARE_POOL", True)),
             use_stage_phrase=bool(getattr(cfg, "USE_STAGE_PHRASE", False)),
@@ -315,7 +331,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             window_size=window_size,
             swin_type=swin_type,
             log_stats=getattr(cfg, "LOG_STATS", False),
-            head_aware=bool(getattr(cfg, "HEAD_AWARE", version in ("v1.5", "v1.6", "dr-ewti"))),
+            head_aware=bool(getattr(cfg, "HEAD_AWARE", version in ("v1.5", "v1.6", "dr-ewti", "enhanced-wti-v2"))),
             num_text_stages=num_stages,
             use_evidence_state=bool(getattr(cfg, "USE_EVIDENCE_STATE", False)),
             evidence_state_dim=int(getattr(cfg, "EVIDENCE_STATE_DIM", 64)),
@@ -324,11 +340,29 @@ class SegEarthR2(MiphaPhiForCausalLM):
             evidence_eps=float(getattr(cfg, "EVIDENCE_EPS", 1e-4)),
             evidence_logit_clip=float(getattr(cfg, "EVIDENCE_LOGIT_CLIP", 4.0)),
             evidence_relation_gate_init=float(getattr(cfg, "EVIDENCE_RELATION_GATE_INIT", 0.0)),
+            enhanced_wti=enhanced_wti,
+            wti_projector_ratio=float(getattr(cfg, "WTI_PROJECTOR_RATIO", 2.0)),
+            wti_projector_max_hidden=int(getattr(cfg, "WTI_PROJECTOR_MAX_HIDDEN", 512)),
+            wti_head_mixer=bool(getattr(cfg, "WTI_HEAD_MIXER", True)),
+            wti_head_mixer_ratio=float(getattr(cfg, "WTI_HEAD_MIXER_RATIO", 2.0)),
+            wti_head_mixer_gamma_init=float(getattr(cfg, "WTI_HEAD_MIXER_GAMMA_INIT", 0.0)),
         )
+        use_set_control = bool(getattr(cfg, "USE_SET_TGSWIN_CONTROL", False))
+        if use_set_control and enhanced_wti:
+            set_dim = int(self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+            self.tg_swin_set_control = SETControlHead(
+                text_dim=set_dim,
+                num_stages=num_stages,
+                init_bias=float(getattr(cfg, "SET_CONTROL_INIT_BIAS", 4.0)),
+            )
+        else:
+            self.tg_swin_set_control = None
         print(
             f"[TG_SWIN] Initialized v={version} TCF + WTI "
-            f"(cond_dim={cond_dim}, head_aware={getattr(cfg, 'HEAD_AWARE', version in ('v1.5', 'v1.6', 'dr-ewti'))}, "
+            f"(cond_dim={cond_dim}, enhanced_wti={enhanced_wti}, "
+            f"head_aware={getattr(cfg, 'HEAD_AWARE', version in ('v1.5', 'v1.6', 'dr-ewti', 'enhanced-wti-v2'))}, "
             f"dr_ewti={use_dr_ewti}, coarse_evidence={getattr(cfg, 'USE_COARSE_EVIDENCE', False)}, "
+            f"set_control={use_set_control and enhanced_wti}, "
             f"stage_phrase={getattr(cfg, 'USE_STAGE_PHRASE', False)}, "
             f"hybrid_rho={getattr(cfg, 'USE_HYBRID_RELIABILITY', False)}, "
             f"evidence_state={getattr(cfg, 'USE_EVIDENCE_STATE', False)}, "
@@ -367,6 +401,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         for seq_hidden, seg_mask, ref_mask in zip(hidden_states, seg_indices, refer_span_mask):
             seg_mask = seg_mask.bool()
             ref_mask = ref_mask.bool()
+            seq_len = seq_hidden.shape[0]
+            if ref_mask.shape[0] != seq_len:
+                if ref_mask.shape[0] < seq_len:
+                    pad = torch.zeros(
+                        seq_len - ref_mask.shape[0],
+                        dtype=ref_mask.dtype,
+                        device=ref_mask.device,
+                    )
+                    ref_mask = torch.cat([ref_mask, pad])
+                else:
+                    ref_mask = ref_mask[:seq_len]
             seg_positions = seg_mask.nonzero(as_tuple=False).squeeze(-1)
             if seg_positions.numel() == 0:
                 continue
@@ -419,11 +464,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
         return seg_hidden, text_cond, reliability
 
+    def build_set_control(self, set_embedding_t):
+        """set_embedding_t: [T, 1, C] after repeat_interleave. Returns [T, S, 1] or None."""
+        if self.tg_swin_set_control is None:
+            return None
+        set_hidden = set_embedding_t.squeeze(1)
+        return self.tg_swin_set_control(set_hidden)
+
     def get_vision_tower_feature(
         self,
         images,
         text_cond=None,
         reliability=None,
+        set_control=None,
         coarse_evidence=None,
         enable_tg_swin=True,
     ):
@@ -441,6 +494,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "tg_swin_controller": self.tg_swin_controller,
                 "coarse_evidence": coarse_evidence,
                 "enable_tg_swin": True,
+                "set_control": set_control,
             }
         elif self._tg_swin_enabled():
             tg_kwargs = {
@@ -1067,6 +1121,25 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     new_image_features_indices_align.append(new_image_features_indice)
                 new_image_features_indices = torch.stack(new_image_features_indices_align, dim=0)
 
+            if new_refer_span_mask:
+                new_refer_span_mask_align = []
+                for cur_refer_mask in new_refer_span_mask:
+                    pad_len = max_len - cur_refer_mask.shape[0]
+                    if pad_len > 0:
+                        cur_refer_mask = torch.cat(
+                            (
+                                cur_refer_mask,
+                                torch.zeros(
+                                    pad_len,
+                                    dtype=cur_refer_mask.dtype,
+                                    device=cur_refer_mask.device,
+                                ),
+                            ),
+                            dim=0,
+                        )
+                    new_refer_span_mask_align.append(cur_refer_mask)
+                new_refer_span_mask = torch.stack(new_refer_span_mask_align, dim=0)
+
             if attention_mask is not None:
                 new_attention_mask = []
                 for cur_attention_mask, cur_new_labels, cur_new_labels_align in zip(attention_mask, _new_labels,
@@ -1095,6 +1168,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if new_image_features_indices is not None:
                 new_image_features_indices = torch.stack(new_image_features_indices, dim=0)
+
+            if new_refer_span_mask:
+                new_refer_span_mask = torch.stack(new_refer_span_mask, dim=0)
             
             if attention_mask is not None:
                 new_attn_mask_pad_left = torch.full(
@@ -1151,7 +1227,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             batch_dataset_type = dataset_type[0]
         else:
             batch_dataset_type = []
-        output_attentions = True
+        enable_attention_loss = (
+            self.training
+            and seg_info is not None
+            and bool(getattr(self.config, "enable_attention_loss", False))
+        )
+        if output_attentions is None:
+            output_attentions = enable_attention_loss
 
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1194,7 +1276,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
         
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
-        attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        if enable_attention_loss and outputs.attentions is not None:
+            attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
+        else:
+            attentions = None
 
         SET_embedding_b = self.SET_token_projector(self.get_SET_embedding(hidden_states, SET_token_embedding_indices))
         per_target_mode = False
@@ -1212,6 +1297,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             )
             target_to_image = self._build_target_to_image(mask_num, hidden_states.device)
             SET_embedding = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
+            set_control = self.build_set_control(SET_embedding)
+            assert text_cond.shape[0] == n_target, (
+                f"TG_SWIN alignment: text_cond batch={text_cond.shape[0]} != n_target={n_target}"
+            )
+            if set_control is not None:
+                assert set_control.shape[0] == n_target, (
+                    f"TG_SWIN alignment: set_control batch={set_control.shape[0]} != n_target={n_target}"
+                )
             per_target_mode = True
             coarse_evidence = None
             if self._use_coarse_evidence():
@@ -1223,6 +1316,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 images_expanded,
                 text_cond=text_cond,
                 reliability=reliability,
+                set_control=set_control,
                 coarse_evidence=coarse_evidence,
                 enable_tg_swin=True,
             )
@@ -1354,28 +1448,31 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_loss = loss_mask + loss_dice + loss_union + loss_setpp_coverage + loss_setpp_consistency
 
         loss_attention = None
-        masks = [_seg_info['mask'] for _seg_info in seg_info]
-        masks_resized = [
-            F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
-            for m in masks
-        ]
-        masks = torch.stack(masks_resized, dim=0) # [4, 1, 800, 800]
-        masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
-        masks_down = masks_down.view(masks_down.size(0), -1)
-        masks_down[masks_down > 0] = 1
-        
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
-        for full_attention_map in attentions:
-            batch_attentions_list = []
-            for batch_idx in range(bs):
-                attention_map = full_attention_map[batch_idx]
-                SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
-                image_features_mask = image_features_indices[batch_idx].bool()
-                attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
-                batch_attentions_list.append(attention)
-            batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
-            loss_attention += self.attention_loss(batch_attentions, masks_down)
-                             
+        if enable_attention_loss and attentions is not None and seg_info is not None:
+            masks = [_seg_info['mask'] for _seg_info in seg_info]
+            masks_resized = [
+                F.interpolate(m.unsqueeze(0).float(), size=(800, 800), mode="nearest").squeeze(0)
+                for m in masks
+            ]
+            masks = torch.stack(masks_resized, dim=0) # [4, 1, 800, 800]
+            masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
+            masks_down = masks_down.view(masks_down.size(0), -1)
+            masks_down[masks_down > 0] = 1
+
+            loss_attention = torch.tensor(0.0, device=mask_loss.device)
+            for full_attention_map in attentions:
+                batch_attentions_list = []
+                for batch_idx in range(bs):
+                    attention_map = full_attention_map[batch_idx]
+                    SEG_mask = SEG_token_embedding_indices[batch_idx].bool()
+                    image_features_mask = image_features_indices[batch_idx].bool()
+                    attention = attention_map[SEG_mask][:, image_features_mask] # [1, 729]
+                    batch_attentions_list.append(attention)
+                batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
+                loss_attention += self.attention_loss(batch_attentions, masks_down)
+        else:
+            loss_attention = torch.tensor(0.0, device=hidden_states.device)
+
         loss = llm_loss + mask_loss + 0.01 * loss_attention
 
         return CausalOutputWithMask(
@@ -1451,7 +1548,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
             )
             SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
+            n_target = SEG_embedding.shape[0]
             SET_embedding = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
+            set_control = self.build_set_control(SET_embedding)
+            assert text_cond.shape[0] == n_target, (
+                f"TG_SWIN alignment: text_cond batch={text_cond.shape[0]} != n_target={n_target}"
+            )
+            if set_control is not None:
+                assert set_control.shape[0] == n_target, (
+                    f"TG_SWIN alignment: set_control batch={set_control.shape[0]} != n_target={n_target}"
+                )
             per_target_mode = True
             coarse_evidence = None
             if self._use_coarse_evidence():
@@ -1463,6 +1569,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 images_expanded,
                 text_cond=text_cond,
                 reliability=reliability,
+                set_control=set_control,
                 coarse_evidence=coarse_evidence,
                 enable_tg_swin=True,
             )

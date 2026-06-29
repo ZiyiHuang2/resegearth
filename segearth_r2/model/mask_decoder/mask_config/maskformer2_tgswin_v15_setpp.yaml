@@ -1,0 +1,6 @@
+_BASE_: ./maskformer2_tgswin_v15.yaml
+
+# v1.5 head-aware WTI, no coarse / no DR — SET++ via train.py flags.
+TG_SWIN:
+  USE_COARSE_EVIDENCE: false
+  USE_DR_EWTI: false

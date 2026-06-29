@@ -235,6 +235,7 @@ class SwinTransformerBlock(nn.Module):
         evidence_state=None,
         coarse_evidence=None,
         enable_tg_swin=True,
+        set_control=None,
     ):
         """ Forward function.
 
@@ -282,6 +283,7 @@ class SwinTransformerBlock(nn.Module):
                 stage_idx, layer_idx, x_windows, text_cond, reliability,
                 evidence_state=evidence_state,
                 evidence_windows=evidence_windows,
+                set_control=set_control,
             )
 
         # W-MSA/SW-MSA
@@ -427,6 +429,7 @@ class BasicLayer(nn.Module):
         evidence_state=None,
         coarse_evidence=None,
         enable_tg_swin=True,
+        set_control=None,
     ):
         """ Forward function.
 
@@ -477,6 +480,7 @@ class BasicLayer(nn.Module):
                     evidence_state=evidence_state,
                     coarse_evidence=coarse_evidence,
                     enable_tg_swin=enable_tg_swin,
+                    set_control=set_control,
                 )
         new_evidence_state = evidence_state
         if tg_swin_controller is not None and getattr(tg_swin_controller, "use_evidence_state", False):
@@ -702,6 +706,7 @@ class SwinTransformer(nn.Module):
         tg_swin_controller=None,
         coarse_evidence=None,
         enable_tg_swin=True,
+        set_control=None,
     ):
         """Forward function."""
         x = self.patch_embed(x)
@@ -729,6 +734,7 @@ class SwinTransformer(nn.Module):
                 evidence_state=evidence_state,
                 coarse_evidence=coarse_evidence,
                 enable_tg_swin=enable_tg_swin,
+                set_control=set_control,
             )
 
             if i in self.out_indices:

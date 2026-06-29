@@ -1,6 +1,8 @@
 from .dynamic_relational_wti import EvidenceTokenFusion, StageDynamicRelationalWTI
 from .text_condition_factory import StageWiseTextRouter, TextConditionFactory
+from .set_control_head import SETControlHead
 from .window_text_interaction import (
+    StageEnhancedWTIHeadAware,
     StageWTIHeadAware,
     StageWTIKeyBias,
     TGSwimController,
@@ -14,7 +16,9 @@ __all__ = [
     "StageWiseTextRouter",
     "StageWTI",
     "StageWTIHeadAware",
+    "StageEnhancedWTIHeadAware",
     "StageWTIKeyBias",
+    "SETControlHead",
     "TGSwimController",
     "EvidenceTokenFusion",
     "StageDynamicRelationalWTI",

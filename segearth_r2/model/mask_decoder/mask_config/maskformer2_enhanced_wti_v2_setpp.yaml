@@ -1,0 +1,18 @@
+_BASE_: ./maskformer2_dr_ewti_setpp.yaml
+
+# No-coarse Enhanced WTI v2 + SET++ (single Swin pass, MLP projectors + head mixer).
+TG_SWIN:
+  VERSION: "enhanced-wti-v2"
+  ENABLED: true
+  USE_COARSE_EVIDENCE: false
+  USE_DR_EWTI: false
+  USE_EVIDENCE_STATE: false
+  ENHANCED_WTI: true
+  WTI_PROJECTOR_MLP: true
+  WTI_HEAD_MIXER: true
+  WTI_PROJECTOR_RATIO: 2.0
+  WTI_PROJECTOR_MAX_HIDDEN: 512
+  WTI_HEAD_MIXER_RATIO: 2.0
+  WTI_HEAD_MIXER_GAMMA_INIT: 0.0
+  USE_SET_TGSWIN_CONTROL: true
+  SET_CONTROL_INIT_BIAS: 4.0

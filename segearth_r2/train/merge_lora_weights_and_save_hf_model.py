@@ -155,6 +155,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     ]
     if getattr(mask_cfg, "TG_SWIN", None) and getattr(mask_cfg.TG_SWIN, "ENABLED", False):
         train_module_list.extend(["tg_swin_tcf", "tg_swin_controller"])
+        if getattr(mask_cfg.TG_SWIN, "USE_SET_TGSWIN_CONTROL", False):
+            train_module_list.append("tg_swin_set_control")
 
     if model_args.lora_enable:
         lora_r = model_args.lora_r
