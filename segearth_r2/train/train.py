@@ -42,6 +42,21 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
+    setpp_closed_loop: bool = field(default=True)
+    setpp_lambda_union_single: float = field(default=0.01)
+    setpp_lambda_union_multi: float = field(default=0.05)
+    setpp_lambda_coverage_single: float = field(default=0.005)
+    setpp_lambda_coverage_multi: float = field(default=0.02)
+    setpp_lambda_consistency_single: float = field(default=0.005)
+    setpp_lambda_consistency_multi: float = field(default=0.02)
+    setpp_closed_loop_warmup_steps: int = field(default=2000)
+    setpp_consistency_mode: str = field(default="seg_align_set")
+
+    setpp_csqr_enable: bool = field(default=True)
+    setpp_csqr_fusion_alpha_init: float = field(default=0.99)
+    # Ablation on grouped SET/SEG base:
+    #   A0: closed_loop=False csqr=False | A1: True False | A2: False True | A3: True True (default)
+
 @dataclass
 class DataArguments:
     lazy_preprocess: bool = True
@@ -54,7 +69,7 @@ class DataArguments:
     fix_dataset_len: int = 0
     segmentation: bool = True
     dataset_name: str = field(default="rrsisd")
-    lasers_holdout_ratio: float = field(default=0.0)
+    lasers_holdout_ratio: float = field(default=0.05)
     lasers_holdout_seed: int = field(default=42)
 
 @dataclass
@@ -141,47 +156,6 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
     return sorted(list(lora_module_names))
 
 
-def _tg_swin_enabled_from_cfg(mask_cfg):
-    tg = getattr(mask_cfg, "TG_SWIN", None)
-    return bool(tg and getattr(tg, "ENABLED", False))
-
-
-def print_trainable_param_summary(model, train_module_list):
-    groups = {
-        "TG_SWIN": ["tg_swin_tcf", "tg_swin_controller"],
-        "SEG_token_projector": ["SEG_token_projector"],
-        "pixel_decoder": ["pixel_decoder"],
-        "predictor": ["predictor"],
-        "frozen_swin_backbone": ["vision_tower_mask"],
-        "other_trainable": [],
-    }
-    counts = {k: {"trainable": 0, "total": 0} for k in groups}
-
-    for name, param in model.named_parameters():
-        matched = False
-        for group, keys in groups.items():
-            if group == "other_trainable":
-                continue
-            if any(k in name for k in keys):
-                counts[group]["total"] += param.numel()
-                if param.requires_grad:
-                    counts[group]["trainable"] += param.numel()
-                matched = True
-                break
-        if not matched and param.requires_grad:
-            counts["other_trainable"]["trainable"] += param.numel()
-            counts["other_trainable"]["total"] += param.numel()
-
-    print("[Trainable Param Summary]")
-    for group, stat in counts.items():
-        if stat["total"] == 0 and group != "TG_SWIN":
-            continue
-        print(f"  {group}: trainable={stat['trainable']:,} / total={stat['total']:,}")
-    total_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total_all = sum(p.numel() for p in model.parameters())
-    print(f"  ALL: trainable={total_trainable:,} / total={total_all:,}")
-
-
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
                                    output_dir: str):
     """Collects the state dict and dump to disk."""
@@ -249,34 +223,23 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
                 split="val"
             )
         elif dataset_name == "lasers":
-            holdout_ratio = float(getattr(data_args, "lasers_holdout_ratio", 0.0) or 0)
             holdout_seed = int(getattr(data_args, "lasers_holdout_seed", training_args.data_seed))
-            if holdout_ratio > 0:
-                train_dataset = LaSeRSDataset(
-                    base_data_path=data_args.base_data_path,
-                    tokenizer=tokenizer,
-                    data_args=data_args,
-                    split="train_data.json",
-                    holdout_mode="train",
-                    holdout_seed=holdout_seed,
-                )
-                eval_dataset = LaSeRSDataset(
-                    base_data_path=data_args.base_data_path,
-                    tokenizer=tokenizer,
-                    data_args=data_args,
-                    split="train_data.json",
-                    holdout_mode="eval",
-                    holdout_seed=holdout_seed,
-                )
-            else:
-                train_dataset = LaSeRSDataset(
-                    base_data_path=data_args.base_data_path,
-                    tokenizer=tokenizer,
-                    data_args=data_args,
-                    split="train_data.json",
-                    holdout_mode=None,
-                )
-                eval_dataset = None
+            train_dataset = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train_data.json",
+                holdout_mode="train",
+                holdout_seed=holdout_seed,
+            )
+            eval_dataset = LaSeRSDataset(
+                base_data_path=data_args.base_data_path,
+                tokenizer=tokenizer,
+                data_args=data_args,
+                split="train_data.json",
+                holdout_mode="eval",
+                holdout_seed=holdout_seed,
+            )
         elif dataset_name == "refsegrs":
             train_dataset = RefSegRSDataset(
                 base_data_path=data_args.base_data_path,
@@ -351,6 +314,13 @@ def train():
     if not model.is_train_mask_decode:
         mask2former_ckpt = model_args.vision_tower_mask if model_args.load_mask2former else None
         model.initial_mask_module(mask2former_ckpt, model_args)
+    else:
+        model.ensure_setpp_predictor(model_args)
+        model.mask_decoder_training_init(mask_cfg, model_args=model_args)
+
+    use_csqr, closed_loop = model.persist_setpp_config(model_args)
+    if training_args.local_rank in (-1, 0):
+        print(f"[SET++] config: setpp_csqr_enable={use_csqr}, setpp_closed_loop={closed_loop}")
 
     model.config.use_cache = False
 
@@ -411,15 +381,36 @@ def train():
             for p in model.get_model().mm_projector.parameters():
                 p.requires_grad = False
 
-    tokenizer.add_tokens("[SEG]")
+    tokenizer.add_tokens(["[SEG]", "[SET]"])
     model.resize_token_embeddings(len(tokenizer))
-    train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
-    ]
 
-    if _tg_swin_enabled_from_cfg(mask_cfg):
-        train_module_list.extend(["tg_swin_tcf", "tg_swin_controller"])
-        print(f"[TG_SWIN] train_module_list includes TG-Swin modules: {train_module_list}")
+    # --- Tokenizer / lm_head safety check ---
+    _lm_head_size = model.lm_head.out_features
+    _tokenizer_len = len(tokenizer)
+    _seg_id = tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    _set_id = tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+
+    if _tokenizer_len > _lm_head_size:
+        raise RuntimeError(
+            f"Tokenizer size ({_tokenizer_len}) exceeds lm_head.out_features ({_lm_head_size}). "
+            f"Either increase lm_head_size in config or reduce special tokens."
+        )
+    if _seg_id >= _lm_head_size:
+        raise RuntimeError(
+            f"[SEG] token id ({_seg_id}) >= lm_head.out_features ({_lm_head_size}). "
+            f"lm_head is too small for the tokenizer's [SEG] index."
+        )
+    if _set_id >= _lm_head_size:
+        raise RuntimeError(
+            f"[SET] token id ({_set_id}) >= lm_head.out_features ({_lm_head_size}). "
+            f"lm_head is too small for the tokenizer's [SET] index."
+        )
+    print(f"[safety] tokenizer_len={_tokenizer_len}, lm_head_size={_lm_head_size}, "
+          f"SEG_id={_seg_id}, SET_id={_set_id}  -- OK")
+
+    train_module_list = [
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "SET_token_projector",
+    ]
 
     if model_args.train_swin_backbone:
         train_module_list.append('vision_tower_mask')
@@ -449,34 +440,27 @@ def train():
 
                 p.requires_grad = True
 
-    if training_args.local_rank in (-1, 0):
-        print_trainable_param_summary(model, train_module_list)
-
-    model.get_special_token(SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'], EOS=tokenizer.eos_token_id)
+    model.get_special_token(
+        SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'],
+        SET=tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'],
+        EOS=tokenizer.eos_token_id,
+    )
     
     clip_image_processor = SiglipImageProcessor.from_pretrained(model_args.vision_tower)
     
     data_module = make_unify_datamodule(clip_image_processor=clip_image_processor, tokenizer=tokenizer, data_args=data_args, training_args=training_args)
     training_args.dataloader_drop_last = True
+    if hasattr(training_args, "evaluation_strategy"):
+        training_args.evaluation_strategy = "steps"
+    if hasattr(training_args, "eval_strategy"):
+        training_args.eval_strategy = "steps"
     training_args.save_strategy = "steps"
     if training_args.save_steps is None or training_args.save_steps <= 0:
-        training_args.save_steps = 5000
-    eval_ds = data_module.get("eval_dataset")
-    if eval_ds is not None and len(eval_ds) > 0:
-        if hasattr(training_args, "evaluation_strategy"):
-            training_args.evaluation_strategy = "steps"
-        if hasattr(training_args, "eval_strategy"):
-            training_args.eval_strategy = "steps"
-        training_args.eval_steps = training_args.save_steps
-        training_args.load_best_model_at_end = True
-        training_args.metric_for_best_model = "eval_score"
-        training_args.greater_is_better = True
-    else:
-        if hasattr(training_args, "evaluation_strategy"):
-            training_args.evaluation_strategy = "no"
-        if hasattr(training_args, "eval_strategy"):
-            training_args.eval_strategy = "no"
-        training_args.load_best_model_at_end = False
+        training_args.save_steps = 500
+    training_args.eval_steps = training_args.save_steps
+    training_args.load_best_model_at_end = True
+    training_args.metric_for_best_model = "eval_score"
+    training_args.greater_is_better = True
     if training_args.save_total_limit is None or training_args.save_total_limit > 2:
         training_args.save_total_limit = 2
     

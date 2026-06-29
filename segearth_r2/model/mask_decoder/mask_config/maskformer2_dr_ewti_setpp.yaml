@@ -1,0 +1,4 @@
+_BASE_: ./maskformer2_tgswin_dr_ewti.yaml
+
+# Full model: DR-EWTI encoder + SET++ decoder (closed-loop + CSQR).
+# Training flags (--setpp_closed_loop / --setpp_csqr_enable) are passed via train.py.

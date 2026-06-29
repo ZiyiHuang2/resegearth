@@ -39,10 +39,9 @@ def _make_controller(**kwargs):
 
 
 def check_v15_equiv_flags_off():
-    """All v1.6 flags off + VERSION v1.5 → compact 3-stage TCF (matches v1.5 yaml)."""
+    """All v1.6 flags off + VERSION v1.5 → same shapes as v1.5."""
     tcf = _make_tcf(
         version="v1.5",
-        num_stages=3,
         use_stage_phrase=False,
         use_hybrid_reliability=False,
     )
@@ -50,8 +49,8 @@ def check_v15_equiv_flags_off():
     phr = torch.randn(3, 5, 64)
     mask = torch.ones(3, 5, dtype=torch.bool)
     tc, rel = tcf(seg, phrase_hidden=phr, phrase_mask=mask)
-    assert tc.shape == (3, 3, 32), tc.shape
-    assert rel.shape == (3, 3, 1), rel.shape
+    assert tc.shape == (3, 4, 32), tc.shape
+    assert rel.shape == (3, 4, 1), rel.shape
     assert rel.mean().item() > 0.4
     print("[PASS] 1/8 v1.5-equiv: flags off → [N,S,C] + [N,S,1]")
 

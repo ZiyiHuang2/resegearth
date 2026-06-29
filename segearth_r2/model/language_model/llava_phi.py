@@ -40,15 +40,18 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_dice: Optional[torch.FloatTensor] = None
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
+    loss_union: Optional[torch.FloatTensor] = None
+    loss_setpp_coverage: Optional[torch.FloatTensor] = None
+    loss_setpp_consistency: Optional[torch.FloatTensor] = None
 
 class AttentionLoss(nn.Module):
     def __init__(self, reduction='batchmean'):
         super(AttentionLoss, self).__init__()
         self.reduction = reduction
-
+        
     def forward(self, model_attention_logits: torch.Tensor, gt_mask: torch.Tensor) -> torch.Tensor:
         device = model_attention_logits.device
-
+        
         # Initialize loss
         loss = torch.tensor(0.0, device=device)  # Make sure the tensor is on the correct device
         epsilon = 1e-8  # To avoid log(0)
@@ -90,7 +93,7 @@ class SegEarthR2Model(MiphaPhiModel):
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
-
+    
     def get_vision_tower_mask(self):
         vision_tower = getattr(self, 'vision_tower_mask', None)
         if type(vision_tower) is list:
@@ -120,6 +123,17 @@ class SegEarthR2Model(MiphaPhiModel):
         vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
 
 class SegEarthR2(MiphaPhiForCausalLM):
+    @classmethod
+    def from_pretrained(cls, *model_args, **kwargs):
+        requested_loading_info = kwargs.pop('output_loading_info', False)
+        kwargs['output_loading_info'] = True
+        model, loading_info = super().from_pretrained(*model_args, **kwargs)
+        if any(k.startswith('SET_token_projector') for k in loading_info.get('missing_keys', [])):
+            model._copy_set_projector_from_seg()
+        if requested_loading_info:
+            return model, loading_info
+        return model
+
     def __init__(self, config, model_args=None, mask_decoder_cfg=None, add_cross_attn=True, cross_attn_index=None):
         super(SegEarthR2, self).__init__(config)
 
@@ -128,7 +142,17 @@ class SegEarthR2(MiphaPhiForCausalLM):
         self.mask_decoder_cfg = mask_decoder_cfg
         self.cross_attn_index = cross_attn_index
 
-        self.lm_head = nn.Linear(config.hidden_size, 51200, bias=False)
+        # --- lm_head size decision logic ---
+        # Priority: 1) config.lm_head_size (explicit override),
+        #           2) max(config.vocab_size, 51200) to be compatible with:
+        #              - Mipha-3B pretrained (vocab_size=51200)
+        #              - merged_model whose config.vocab_size may be 50296
+        #                but actual lm_head.weight is [51200, hidden]
+        lm_head_size = getattr(config, 'lm_head_size', None)
+        if lm_head_size is None:
+            lm_head_size = max(config.vocab_size, 51200)
+        self.lm_head = nn.Linear(config.hidden_size, lm_head_size, bias=False)
+        self.config.lm_head_size = lm_head_size
 
         is_train_mask_decode = getattr(config, 'mask_decode_train', False)
         self.is_train_mask_decode = is_train_mask_decode
@@ -144,17 +168,23 @@ class SegEarthR2(MiphaPhiForCausalLM):
             self.config.mask_decode_train = True
 
         self.attention_loss = AttentionLoss()
-
+        
         self.test_topk_per_image = self.mask_decoder_cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
         input_shape = self.output_shape()
         self.pixel_decoder = self.pixel_decoder_init(cfg=self.mask_decoder_cfg, input_shape=input_shape)
-        self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg)
+        self.predictor = self.predictor_init(cfg=self.mask_decoder_cfg, model_args=model_args)
 
         self.SEG_token_projector = nn.Linear(self.config.hidden_size, self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM)
+        self.SET_token_projector = nn.Linear(
+            self.config.hidden_size,
+            self.mask_decoder_cfg.MODEL.MASK_FORMER.HIDDEN_DIM,
+            bias=self.SEG_token_projector.bias is not None,
+        )
+        self._copy_set_projector_from_seg()
 
         self._init_tg_swin_modules()
 
-        self.mask_decoder_training_init(self.mask_decoder_cfg)
+        self.mask_decoder_training_init(self.mask_decoder_cfg, model_args=model_args)
         if pretrained_path is not None:
             def get_w(weights, keyword):
                 return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
@@ -187,6 +217,47 @@ class SegEarthR2(MiphaPhiForCausalLM):
             diff_predictor_msg = self.predictor.load_state_dict(predictor_weights,strict=False)
             print(diff_predictor_msg)
             print(diff_pixel_msg)
+
+    def _copy_set_projector_from_seg(self):
+        if not (hasattr(self, 'SET_token_projector') and hasattr(self, 'SEG_token_projector')):
+            return
+        seg = self.SEG_token_projector
+        setp = self.SET_token_projector
+        if getattr(seg.weight, 'is_meta', seg.weight.device.type == 'meta'):
+            return
+        with torch.no_grad():
+            setp.weight.copy_(seg.weight)
+            if seg.bias is not None and setp.bias is not None:
+                setp.bias.copy_(seg.bias)
+
+    def _normalize_csqr_state_dict(self, state_dict):
+        normalized = False
+        for key, alpha in list(state_dict.items()):
+            if not key.endswith('csqr_block.fusion_alpha_logit'):
+                continue
+            if getattr(alpha, 'ndim', None) == 0:
+                if not normalized:
+                    state_dict = dict(state_dict)
+                    normalized = True
+                state_dict[key] = alpha.reshape(1)
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        state_dict = self._normalize_csqr_state_dict(state_dict)
+        has_set_in_ckpt = any(k.startswith('SET_token_projector') for k in state_dict)
+        if not has_set_in_ckpt:
+            incompatible = super().load_state_dict(state_dict, strict=False, assign=assign)
+            self._copy_set_projector_from_seg()
+            missing = [k for k in incompatible.missing_keys if not k.startswith('SET_token_projector.')]
+            if strict and (missing or incompatible.unexpected_keys):
+                raise RuntimeError(
+                    f"Error(s) in loading state_dict:\n"
+                    f"\tMissing key(s): {missing}\n"
+                    f"\tUnexpected key(s): {incompatible.unexpected_keys}"
+                )
+            from torch.nn.modules.module import _IncompatibleKeys
+            return _IncompatibleKeys(missing, incompatible.unexpected_keys)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def _get_tg_swin_cfg(self):
         return getattr(self.mask_decoder_cfg, "TG_SWIN", None)
@@ -289,7 +360,6 @@ class SegEarthR2(MiphaPhiForCausalLM):
         return torch.stack(repeated, dim=0)
 
     def _gather_refer_phrase_hidden(self, hidden_states, seg_indices, refer_span_mask):
-        """Gather refer-phrase hiddens per [SEG] target using region between previous SEG and current SEG."""
         if refer_span_mask is None:
             return None, None
 
@@ -418,11 +488,62 @@ class SegEarthR2(MiphaPhiForCausalLM):
             repeated[key] = torch.repeat_interleave(feat, repeats=mask_num_tensor, dim=0)
         return repeated
 
+    @staticmethod
+    def _build_target_to_image(mask_num, device):
+        repeats = torch.as_tensor(list(mask_num), device=device, dtype=torch.long)
+        return torch.repeat_interleave(torch.arange(len(mask_num), device=device, dtype=torch.long), repeats)
+
+    @staticmethod
+    def _repeat_set_embedding_per_target(set_embedding_b, mask_num):
+        """Expand image-level SET [B, 1, C] to target-level [T, 1, C]."""
+        if mask_num is None:
+            return set_embedding_b
+        total = int(sum(int(n) for n in mask_num))
+        if set_embedding_b.shape[0] == total:
+            return set_embedding_b
+        repeats = torch.as_tensor(list(mask_num), device=set_embedding_b.device, dtype=torch.long)
+        return torch.repeat_interleave(set_embedding_b, repeats, dim=0)
+
+    def _build_flat_seg_targets(self, seg_info, mask_num, device, pred_masks):
+        targets = []
+        offset = 0
+        for k in mask_num:
+            for _j in range(int(k)):
+                raw_mask = seg_info[offset]['mask'].to(device)
+                if raw_mask.ndim == 3 and raw_mask.shape[0] == 1:
+                    raw_mask = raw_mask.squeeze(0)
+                elif raw_mask.ndim == 3:
+                    raw_mask = raw_mask.squeeze(0)
+                targets.append({
+                    'labels': torch.zeros(1, dtype=torch.long, device=device),
+                    'masks': raw_mask.unsqueeze(0),
+                    'valid': None,
+                    'inst_id': None,
+                })
+                offset += 1
+        return targets
+
+    def predict_coarse_masks(self, multi_scale_features, mask_features, seg_embeddings, set_embedding_t):
+        """Pass A: detached coarse SEG masks [T, 1, H, W] via SET++ per-target predictor."""
+        with torch.no_grad():
+            mask_outputs = self.predictor(
+                multi_scale_features,
+                mask_features,
+                None,
+                None,
+                SEG_embedding=seg_embeddings,
+                SET_embedding=set_embedding_t,
+                mask_num=None,
+                per_target_mode=True,
+            )
+            return mask_outputs["pred_seg_masks"].sigmoid().detach()
+
     def get_shared_coarse_evidence(
         self,
         images,
         seg_embeddings,
         mask_num,
+        set_embedding_b=None,
     ) -> torch.Tensor:
         """Shared Pass A: detached coarse probabilities [T, 1, Hm, Wm]."""
         if isinstance(mask_num, torch.Tensor):
@@ -448,17 +569,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
             assert mask_features_t.shape[0] == n_target, (
                 f"coarse Pass A mask_features batch={mask_features_t.shape[0]} != targets={n_target}"
             )
-            mask_outputs = self.predictor(
-                multi_scale_list, mask_features_t, None, None, seg_emb_det
+            set_embedding_t = self._repeat_set_embedding_per_target(set_embedding_b, mask_num)
+            coarse_prob = self.predict_coarse_masks(
+                multi_scale_list, mask_features_t, seg_emb_det, set_embedding_t
             )
-            coarse_logits = mask_outputs["pred_masks"]
-            coarse_prob = coarse_logits.sigmoid().detach()
         assert coarse_prob.shape[0] == n_target, (
             f"coarse_prob batch={coarse_prob.shape[0]} != targets={n_target}, shape={tuple(coarse_prob.shape)}"
         )
         assert not coarse_prob.requires_grad
         return coarse_prob
-    def mask_decoder_training_init(self, cfg):
+    def mask_decoder_training_init(self, cfg, model_args=None):
         # Loss parameters:
         deep_supervision = cfg.MODEL.MASK_FORMER.DEEP_SUPERVISION
         no_object_weight = cfg.MODEL.MASK_FORMER.NO_OBJECT_WEIGHT
@@ -469,15 +589,40 @@ class SegEarthR2(MiphaPhiForCausalLM):
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         # boundary_weight = cfg.MODEL.MASK_FORMER.BOUNDARY_WEIGHT
 
+        setpp_closed_loop = getattr(model_args, 'setpp_closed_loop', True) if model_args else True
+        setpp_kwargs = {}
+        if model_args is not None:
+            setpp_kwargs = dict(
+                setpp_closed_loop=setpp_closed_loop,
+                lambda_union_single=getattr(model_args, 'setpp_lambda_union_single', 0.01),
+                lambda_union_multi=getattr(model_args, 'setpp_lambda_union_multi', 0.05),
+                lambda_coverage_single=getattr(model_args, 'setpp_lambda_coverage_single', 0.005),
+                lambda_coverage_multi=getattr(model_args, 'setpp_lambda_coverage_multi', 0.02),
+                lambda_consistency_single=getattr(model_args, 'setpp_lambda_consistency_single', 0.005),
+                lambda_consistency_multi=getattr(model_args, 'setpp_lambda_consistency_multi', 0.02),
+                closed_loop_warmup_steps=getattr(model_args, 'setpp_closed_loop_warmup_steps', 2000),
+                consistency_mode=getattr(model_args, 'setpp_consistency_mode', 'seg_align_set'),
+            )
+        
         matcher = hungarian_matcher_InstructSeg(
             cost_class=class_weight,
             cost_mask=mask_weight,
             cost_dice=dice_weight,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
-
-        weight_dict = {"loss_SEG_class": class_weight,  "loss_mask": mask_weight,
-                       "loss_dice": dice_weight, }
+        
+        weight_dict = {
+            "loss_SEG_class": class_weight,
+            "loss_mask": mask_weight,
+            "loss_dice": dice_weight,
+            "loss_union_mask": 1.0,
+            "loss_union_dice": 1.0,
+            "loss_setpp_coverage": 1.0,
+            "loss_setpp_consistency": 1.0,
+        }
+        if not setpp_closed_loop:
+            weight_dict["loss_union_mask"] = mask_weight
+            weight_dict["loss_union_dice"] = dice_weight
 
         self.weight_dict = weight_dict
         if deep_supervision:
@@ -486,30 +631,31 @@ class SegEarthR2(MiphaPhiForCausalLM):
             for i in range(dec_layers - 1):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
-        losses = ["SEG_labels", "masks",]
+        losses = ["SEG_labels", "masks", "union",]
         self.criterion = Criterion(
             matcher=matcher,
             losses=losses,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
-            device=self.device
+            device=self.device,
+            **setpp_kwargs,
         )
         self.size_divisibility = 32
         self.sem_seg_postprocess_before_inference = True
-
+    
     def encode_images(self, images):
         image_features = self.get_model().get_vision_tower()(images) # image_features: [4, 729, 1152]
         image_features = self.get_model().mm_projector(image_features) # image_features: [4, 729, 2560]
-
+        
         return image_features
-
+    
     def get_text_image_tokens(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+        image_features = self.get_model().get_vision_tower()(images) 
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
-    def predictor_init(self, cfg):
+    def predictor_init(self, cfg, model_args=None):
         in_channels = cfg.MODEL.SEM_SEG_HEAD.CONVS_DIM
         hidden_dim = cfg.MODEL.MASK_FORMER.HIDDEN_DIM
         num_queries = cfg.MODEL.MASK_FORMER.NUM_OBJECT_QUERIES
@@ -522,6 +668,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_norm = cfg.MODEL.MASK_FORMER.SEG_NORM
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
+        if model_args is not None:
+            use_csqr = getattr(model_args, 'setpp_csqr_enable', True)
+            csqr_fusion_alpha_init = getattr(model_args, 'setpp_csqr_fusion_alpha_init', 0.99)
+        else:
+            use_csqr = getattr(self.config, 'setpp_csqr_enable', False)
+            csqr_fusion_alpha_init = getattr(self.config, 'setpp_csqr_fusion_alpha_init', 0.99)
 
         predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(in_channels,
                                                                      hidden_dim,
@@ -534,8 +686,52 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                                      enforce_input_project,
                                                                      seg_norm,
                                                                      seg_proj,
-                                                                     seg_fuse_score,)
+                                                                     seg_fuse_score,
+                                                                     use_csqr=use_csqr,
+                                                                     csqr_fusion_alpha_init=csqr_fusion_alpha_init,)
         return predictor
+
+    def resolve_setpp_flags(self, model_args=None):
+        if model_args is not None:
+            use_csqr = getattr(model_args, 'setpp_csqr_enable', True)
+            closed_loop = getattr(model_args, 'setpp_closed_loop', True)
+        else:
+            use_csqr = getattr(self.config, 'setpp_csqr_enable', True)
+            closed_loop = getattr(self.config, 'setpp_closed_loop', True)
+        return bool(use_csqr), bool(closed_loop)
+
+    def persist_setpp_config(self, model_args=None):
+        use_csqr, closed_loop = self.resolve_setpp_flags(model_args)
+        self.config.setpp_csqr_enable = use_csqr
+        self.config.setpp_closed_loop = closed_loop
+        return use_csqr, closed_loop
+
+    def ensure_setpp_predictor(self, model_args=None):
+        """Rebuild predictor when setpp_csqr_enable disagrees with loaded predictor.use_csqr."""
+        if not hasattr(self, 'mask_decoder_cfg') or self.mask_decoder_cfg is None:
+            return
+
+        target_use_csqr, _ = self.resolve_setpp_flags(model_args)
+
+        if not hasattr(self, 'predictor'):
+            self.predictor = self.predictor_init(self.mask_decoder_cfg, model_args=model_args)
+            return
+
+        current_use_csqr = getattr(self.predictor, 'use_csqr', False)
+        if current_use_csqr == target_use_csqr:
+            return
+
+        old_state = self.predictor.state_dict()
+        self.predictor = self.predictor_init(self.mask_decoder_cfg, model_args=model_args)
+        incompatible = self.predictor.load_state_dict(old_state, strict=False)
+        if target_use_csqr:
+            print('[SET++] enabled CSQR block on predictor (loaded compatible weights, strict=False)')
+        else:
+            print('[SET++] disabled CSQR block on predictor (dropped csqr_block weights)')
+        if incompatible.missing_keys:
+            print(f"[SET++] predictor missing keys after rebuild: {incompatible.missing_keys[:8]}")
+        if incompatible.unexpected_keys:
+            print(f"[SET++] predictor unexpected keys after rebuild: {incompatible.unexpected_keys[:8]}")
 
 
     def get_model(self):
@@ -586,9 +782,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                                  transformer_in_features,
                                                  common_stride)
         return pixel_decoder
-
+    
     def prepare_targets(self, targets, images):
-
+        
         h_pad, w_pad = images.shape[-2:]
         new_targets = []
         has_gt_ids = False
@@ -615,8 +811,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             )
         return new_targets
 
-    def get_special_token(self, SEG, EOS):
+    def get_special_token(self, SEG, SET, EOS):
         self.SEG_id = SEG
+        self.SET_id = SET
         self.EOS_id = EOS
 
     def embed_refer_ids(self, refer_ids):
@@ -625,7 +822,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         embedded_refer = self.get_model().embed_tokens(refer_ids)
         return embedded_refer
 
-    def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, refer_embedding=None):
+    def concat_image_seg_cls_embeds(self, input_id, img_feature, label, SEG_token_embedding_indices=None, SET_token_embedding_indices=None, refer_embedding=None):
         image_token_indices = torch.where(input_id == IMAGE_TOKEN_INDEX)[0]
         assert len(image_token_indices) == 1, 'not supporting multi image index'
 
@@ -638,6 +835,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             cur_new_label = None
 
         cur_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
+        cur_SET_token_embedding_indices = [] if SET_token_embedding_indices is not None else None
         cur_refer_span_indices = []
         track_refer_span = SEG_token_embedding_indices is not None
 
@@ -664,6 +862,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(torch.full((img_feature.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if SET_token_embedding_indices is not None:
+                    cur_SET_token_embedding_indices.append(torch.full((img_feature.shape[0],), 0, device=input_id.device,
+                                   dtype=input_id.dtype))
                 if track_refer_span:
                     cur_refer_span_indices.append(torch.zeros(img_feature.shape[0], device=input_id.device, dtype=torch.bool))
                 if label is not None:
@@ -683,6 +884,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     cur_SEG_token_embedding_indices.append(
                         torch.full((refer_embed.shape[0],), 0, device=input_id.device,
                                    dtype=input_id.dtype))
+                if SET_token_embedding_indices is not None:
+                    cur_SET_token_embedding_indices.append(
+                        torch.full((refer_embed.shape[0],), 0, device=input_id.device,
+                                   dtype=input_id.dtype))
                 if track_refer_span:
                     cur_refer_span_indices.append(torch.ones(refer_embed.shape[0], device=input_id.device, dtype=torch.bool))
                 if label is not None:
@@ -697,6 +902,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
                 if SEG_token_embedding_indices is not None:
                     cur_SEG_token_embedding_indices.append(SEG_token_embedding_indices[:chunk_len])
+                if SET_token_embedding_indices is not None:
+                    cur_SET_token_embedding_indices.append(SET_token_embedding_indices[:chunk_len])
                 if track_refer_span:
                     cur_refer_span_indices.append(torch.zeros(chunk_len, device=input_id.device, dtype=torch.bool))
                 if label is not None:
@@ -706,6 +913,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 SEG_token_embedding_indices = SEG_token_embedding_indices[chunk_len:]
+            if SET_token_embedding_indices is not None:
+                SET_token_embedding_indices = SET_token_embedding_indices[chunk_len:]
             if label is not None:
                 label = label[chunk_len:]
 
@@ -719,6 +928,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             cur_SEG_token_embedding_indices = [x.to(device=self.device) for x in cur_SEG_token_embedding_indices]
             cur_SEG_token_embedding_indices = torch.cat(cur_SEG_token_embedding_indices, dim=0)
 
+        if SET_token_embedding_indices is not None:
+            cur_SET_token_embedding_indices = [x.to(device=self.device) for x in cur_SET_token_embedding_indices]
+            cur_SET_token_embedding_indices = torch.cat(cur_SET_token_embedding_indices, dim=0)
+
         cur_refer_span_mask = None
         if track_refer_span:
             cur_refer_span_indices = [x.to(device=self.device) for x in cur_refer_span_indices]
@@ -728,12 +941,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             image_features_indices = [x.to(device=self.device) for x in image_features_indices]
             image_features_indices = torch.cat(image_features_indices, dim=0)
 
-        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, image_features_indices, cur_refer_span_mask
+        return cur_new_input_embeds, cur_new_label, cur_SEG_token_embedding_indices, cur_SET_token_embedding_indices, image_features_indices, cur_refer_span_mask
 
-    def prepare_inputs_labels_for_multimodal(self, input_ids, attention_mask, past_key_values, labels, images, token_refer_id=None, SEG_token_embedding_indices=None):
+    def prepare_inputs_labels_for_multimodal(self, input_ids, attention_mask, past_key_values, labels, images, token_refer_id=None, SEG_token_embedding_indices=None, SET_token_embedding_indices=None):
 
         vision_tower = self.get_vision_tower()
-
+        
         if vision_tower is None or images is None or input_ids.shape[1] == 1:
             if past_key_values is not None and vision_tower is not None and images is not None and input_ids.shape[
                 1] == 1:
@@ -746,14 +959,16 @@ class SegEarthR2(MiphaPhiForCausalLM):
         new_input_embeds = []
         new_labels = [] if labels is not None else None
         new_image_features_indices = []
-
+        new_refer_span_mask = []
+        
         new_SEG_token_embedding_indices = [] if SEG_token_embedding_indices is not None else None
-        new_refer_span_mask = [] if SEG_token_embedding_indices is not None else None
+        new_SET_token_embedding_indices = [] if SET_token_embedding_indices is not None else None
         for batch_idx, cur_input_ids in enumerate(input_ids):
             cur_image_feature = image_features[batch_idx]
-
+            
             cur_SEG_token_embedding_indices = SEG_token_embedding_indices[batch_idx] if SEG_token_embedding_indices is not None else None
-
+            cur_SET_token_embedding_indices = SET_token_embedding_indices[batch_idx] if SET_token_embedding_indices is not None else None
+            
             if (cur_input_ids == IMAGE_TOKEN_INDEX).sum() == 0:
                 # multimodal LLM, but the current sample is not multimodal
                 cur_input_embeds = self.get_model().embed_tokens(cur_input_ids)
@@ -777,11 +992,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             cur_refer_embedding = self.embed_refer_ids(cur_token_refer_id)
 
-            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_image_features_indices, cur_refer_span_mask = self.concat_image_seg_cls_embeds(
+            cur_input_embeds, cur_label, cur_SEG_token_embedding_indices, cur_SET_token_embedding_indices, cur_image_features_indices, cur_refer_span_mask = self.concat_image_seg_cls_embeds(
                 input_id=cur_input_ids,
                 img_feature=cur_image_feature,
                 label=cur_label,
                 SEG_token_embedding_indices=cur_SEG_token_embedding_indices,
+                SET_token_embedding_indices=cur_SET_token_embedding_indices,
                 refer_embedding=cur_refer_embedding
             )
 
@@ -791,10 +1007,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices.append(cur_SEG_token_embedding_indices)
-                new_refer_span_mask.append(cur_refer_span_mask)
+
+            if SET_token_embedding_indices is not None:
+                new_SET_token_embedding_indices.append(cur_SET_token_embedding_indices)
 
             if new_image_features_indices is not None:
                 new_image_features_indices.append(cur_image_features_indices)
+            new_refer_span_mask.append(cur_refer_span_mask)
         if any(x.shape != new_input_embeds[0].shape for x in new_input_embeds):
             max_len = max(x.shape[0] for x in new_input_embeds)
 
@@ -817,26 +1036,27 @@ class SegEarthR2(MiphaPhiForCausalLM):
                                               dim=0)
                     new_labels_align.append(cur_new_label)
                 new_labels = torch.stack(new_labels_align, dim=0)
-
+            
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices_align = []
-                new_refer_span_mask_align = []
-                for new_SEG_token_embedding_indice, new_refer_span in zip(
-                    new_SEG_token_embedding_indices, new_refer_span_mask
-                ):
+                for new_SEG_token_embedding_indice in new_SEG_token_embedding_indices:
                     new_SEG_token_embedding_indice = torch.cat(
                         (new_SEG_token_embedding_indice,
                          torch.zeros((max_len - new_SEG_token_embedding_indice.shape[0]),dtype=new_SEG_token_embedding_indice.dtype, device=new_SEG_token_embedding_indice.device)),
                         dim=0)
-                    new_refer_span = torch.cat(
-                        (new_refer_span,
-                         torch.zeros((max_len - new_refer_span.shape[0]), dtype=torch.bool, device=new_refer_span.device)),
-                        dim=0)
                     new_SEG_token_embedding_indices_align.append(new_SEG_token_embedding_indice)
-                    new_refer_span_mask_align.append(new_refer_span)
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices_align, dim=0)
-                new_refer_span_mask = torch.stack(new_refer_span_mask_align, dim=0)
-
+            
+            if SET_token_embedding_indices is not None:
+                new_SET_token_embedding_indices_align = []
+                for new_SET_token_embedding_indice in new_SET_token_embedding_indices:
+                    new_SET_token_embedding_indice = torch.cat(
+                        (new_SET_token_embedding_indice,
+                         torch.zeros((max_len - new_SET_token_embedding_indice.shape[0]),dtype=new_SET_token_embedding_indice.dtype, device=new_SET_token_embedding_indice.device)),
+                        dim=0)
+                    new_SET_token_embedding_indices_align.append(new_SET_token_embedding_indice)
+                new_SET_token_embedding_indices = torch.stack(new_SET_token_embedding_indices_align, dim=0)
+            
             if new_image_features_indices is not None:
                 new_image_features_indices_align = []
                 for new_image_features_indice in new_image_features_indices:
@@ -861,7 +1081,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     new_attention_mask.append(cur_new_attention_mask)
                 attention_mask = torch.stack(new_attention_mask, dim=0)
                 assert attention_mask.shape == new_labels.shape
-
+            
         else:
             new_input_embeds = torch.stack(new_input_embeds, dim=0)
             if labels is not None:
@@ -869,27 +1089,42 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
             if SEG_token_embedding_indices is not None:
                 new_SEG_token_embedding_indices = torch.stack(new_SEG_token_embedding_indices, dim=0)
-                new_refer_span_mask = torch.stack(new_refer_span_mask, dim=0)
+
+            if SET_token_embedding_indices is not None:
+                new_SET_token_embedding_indices = torch.stack(new_SET_token_embedding_indices, dim=0)
 
             if new_image_features_indices is not None:
                 new_image_features_indices = torch.stack(new_image_features_indices, dim=0)
-
+            
             if attention_mask is not None:
                 new_attn_mask_pad_left = torch.full(
                     (attention_mask.shape[0], new_input_embeds.shape[1] - input_ids.shape[1]), True,
                     dtype=attention_mask.dtype, device=attention_mask.device)
                 attention_mask = torch.cat((new_attn_mask_pad_left, attention_mask), dim=1)
                 assert attention_mask.shape == new_input_embeds.shape[:2]
-
-        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_image_features_indices, new_refer_span_mask
-
+   
+        return None, attention_mask, past_key_values, new_input_embeds, new_labels, new_SEG_token_embedding_indices, new_SET_token_embedding_indices, new_image_features_indices, new_refer_span_mask
+    
     def get_SEG_embedding(self, hidden_states, SEG_embedding_indices):
+        assert SEG_embedding_indices is not None, "[BUG] SEG_embedding_indices is None in get_SEG_embedding"
+        assert (SEG_embedding_indices == 1).sum() > 0, "[BUG] SEG_embedding_indices contains no 1s -- [SEG] token not found in sequence"
         SEG_embedding_list = []
         for current_hidden_state, current_token_indice in zip(hidden_states, SEG_embedding_indices):
             current_refer_state = current_hidden_state[current_token_indice.bool()]
+            assert current_refer_state.shape[0] > 0, f"[BUG] No SEG token found in this sample. SEG_embedding_indices sum: {current_token_indice.sum().item()}"
             SEG_embedding_list.append(current_refer_state)
         return torch.cat(SEG_embedding_list, dim=0).unsqueeze(1)
 
+    def get_SET_embedding(self, hidden_states, SET_embedding_indices):
+        assert SET_embedding_indices is not None, "[BUG] SET_embedding_indices is None in get_SET_embedding -- [SET] token not registered or not passed through"
+        assert (SET_embedding_indices == 1).sum() > 0, "[BUG] SET_embedding_indices contains no 1s -- [SET] token not found in sequence"
+        SET_embedding_list = []
+        for current_hidden_state, current_token_indice in zip(hidden_states, SET_embedding_indices):
+            current_set_state = current_hidden_state[current_token_indice.bool()]
+            assert current_set_state.shape[0] == 1, f"[BUG] Expected exactly 1 SET token per sample, got {current_set_state.shape[0]}. SET_embedding_indices sum: {current_token_indice.sum().item()}"
+            SET_embedding_list.append(current_set_state)
+        return torch.cat(SET_embedding_list, dim=0).unsqueeze(1)
+           
     def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -906,10 +1141,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
+            SET_token_embedding_indices=None,
             global_step=None,
             mask_num=None,
             dataset_type=None,) -> Union[Tuple, CausalLMOutputWithPast]:
-
+        
         if dataset_type is not None:
             assert all(item == dataset_type[0] for item in dataset_type), f'this batch contain different dataset_type: {dataset_type}'
             batch_dataset_type = dataset_type[0]
@@ -925,17 +1161,25 @@ class SegEarthR2(MiphaPhiForCausalLM):
         bs = input_ids.shape[0]
         refer_span_mask = None
 
+        per_target_swin = (
+            tg_swin_enabled
+            and mask_num is not None
+            and seg_info is not None
+            and (input_ids is None or input_ids.shape[1] != 1)
+            and getattr(self._get_tg_swin_cfg(), "PER_TARGET_SWING_REPEAT", True)
+        )
+
         if (SEG_token_embedding_indices == 1).sum() != 0:
 
             # for generative mode only the 1th stage need
-            if input_ids.shape[1] != 1:
-                if not tg_swin_enabled:
-                    image_features = self.get_vision_tower_feature(images)
-                    bs = input_ids.shape[0]
-
-            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
+            if input_ids.shape[1] != 1 and not per_target_swin:
+                image_features = self.get_vision_tower_feature(images)
+                bs = input_ids.shape[0]
+            
+            input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, SET_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
                 input_ids, attention_mask, past_key_values, labels, images_clip,
-                token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
+                token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices,
+                SET_token_embedding_indices=SET_token_embedding_indices)
 
         outputs = self.model(
             input_ids=input_ids,
@@ -947,18 +1191,14 @@ class SegEarthR2(MiphaPhiForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
-
+        
         hidden_states = outputs.last_hidden_state
         logits = self.lm_head(hidden_states)
         attentions = [attention_item.sum(dim=1) for attention_item in outputs.attentions]
 
-        per_target_swin = (
-            tg_swin_enabled
-            and mask_num is not None
-            and seg_info is not None
-            and (input_ids is None or input_ids.shape[1] != 1)
-            and getattr(self._get_tg_swin_cfg(), "PER_TARGET_SWING_REPEAT", True)
-        )
+        SET_embedding_b = self.SET_token_projector(self.get_SET_embedding(hidden_states, SET_token_embedding_indices))
+        per_target_mode = False
+        target_to_image = None
 
         if per_target_swin:
             seg_hidden, text_cond, reliability = self.build_text_cond(
@@ -970,18 +1210,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
             assert n_target == int(mask_num_tensor.sum().item()), (
                 f"TG_SWIN alignment: SEG targets={n_target} != sum(mask_num)={int(mask_num_tensor.sum().item())}"
             )
+            target_to_image = self._build_target_to_image(mask_num, hidden_states.device)
+            SET_embedding = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
+            per_target_mode = True
             coarse_evidence = None
             if self._use_coarse_evidence():
                 coarse_evidence = self.get_shared_coarse_evidence(
-                    images, SEG_embedding, mask_num
-                )
-                assert coarse_evidence.shape[0] == n_target, (
-                    f"coarse evidence batch={coarse_evidence.shape[0]} != targets={n_target}"
+                    images, SEG_embedding, mask_num, set_embedding_b=SET_embedding_b
                 )
             images_expanded = self._repeat_images_per_target(images, mask_num)
-            assert images_expanded.shape[0] == n_target, (
-                f"TG_SWIN alignment: expanded images batch={images_expanded.shape[0]} != targets={n_target}"
-            )
             image_features = self.get_vision_tower_feature(
                 images_expanded,
                 text_cond=text_cond,
@@ -991,11 +1228,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             )
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
-            assert mask_features.shape[0] == n_target, (
-                f"TG_SWIN alignment: pixel_decoder batch={mask_features.shape[0]} != targets={n_target}"
-            )
         else:
             SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+            SET_embedding = SET_embedding_b
             if image_features is None:
                 image_features = self.get_vision_tower_feature(images)
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
@@ -1007,7 +1242,15 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 for feat in multi_scale_features
             ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None,
+                                      SEG_embedding=SEG_embedding,
+                                      SET_embedding=SET_embedding,
+                                      mask_num=mask_num if not per_target_mode else None,
+                                      per_target_mode=per_target_mode)
+        if per_target_mode:
+            mask_outputs["per_target_mode"] = True
+            mask_outputs["target_to_image"] = target_to_image
+            mask_outputs["mask_num"] = list(mask_num)
 
         # 开始计算loss
         loss = None
@@ -1026,8 +1269,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             # Enable model/pipeline parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             llm_loss = loss_fct(shift_logits, shift_labels)
-
+            
         mask_loss = None
+        loss_mask = torch.tensor(0.0, device=hidden_states.device)
+        loss_dice = torch.tensor(0.0, device=hidden_states.device)
+        loss_union = torch.tensor(0.0, device=hidden_states.device)
+        loss_setpp_coverage = torch.tensor(0.0, device=hidden_states.device)
+        loss_setpp_consistency = torch.tensor(0.0, device=hidden_states.device)
         if seg_info is not None:
             if 'padding_mask' in seg_info[0]:
                 if isinstance(seg_info[0]["instances"], list):
@@ -1037,37 +1285,73 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
                 targets = self.prepare_targets(gt_instances, images)
             elif 'mask' in seg_info[0]:
-                targets = []
-                for gt_mask in seg_info:
-                    targets.append(
-                        {
-                            'labels': torch.tensor([0]).to(mask_outputs['pred_masks'].device),
-                            'masks': gt_mask['mask'].to(mask_outputs['pred_masks'].device),
-                            'valid': None,
-                            'inst_id': None
-                        }
+                if per_target_mode:
+                    targets = self._build_flat_seg_targets(
+                        seg_info, mask_num, mask_outputs['pred_masks'].device, mask_outputs['pred_masks']
                     )
+                else:
+                    targets = []
+                    # Regroup flat per-mask seg_info into per-image targets using mask_num
+                    offset = 0
+                    for k in mask_num:
+                        image_masks = []
+                        for j in range(k):
+                            raw_mask = seg_info[offset + j]['mask'].to(mask_outputs['pred_masks'].device)
+                            # Dataset stores masks as [1, H, W]; squeeze to [H, W]
+                            if raw_mask.ndim == 3 and raw_mask.shape[0] == 1:
+                                raw_mask = raw_mask.squeeze(0)
+                            elif raw_mask.ndim == 3:
+                                raw_mask = raw_mask.squeeze(0)  # fallback: squeeze first dim
+                            image_masks.append(raw_mask)
+                        offset += k
+                        if len(image_masks) > 0:
+                            stacked_masks = torch.stack(image_masks, dim=0)  # [K, H, W]
+                            assert stacked_masks.ndim == 3, \
+                                f"[BUG] target masks should be [K, H, W], got {stacked_masks.shape}"
+                        else:
+                            stacked_masks = torch.zeros(0, *mask_outputs['pred_masks'].shape[-2:],
+                                                        device=mask_outputs['pred_masks'].device)
+                        targets.append(
+                            {
+                                'labels': torch.zeros(k, dtype=torch.long, device=mask_outputs['pred_masks'].device),
+                                'masks': stacked_masks,
+                                'valid': None,
+                                'inst_id': None
+                            }
+                        )
             else:
                 targets = None
+            # Warmup: set global step for union loss warmup
+            if global_step is not None:
+                self.criterion.set_global_step(global_step)
+
             mask_losses = self.criterion(mask_outputs, targets)
             weight_dict = self.weight_dict
 
-            loss_mask = 0.0
-            loss_dice = 0.0
-
+            loss_mask = torch.tensor(0.0, device=hidden_states.device)
+            loss_dice = torch.tensor(0.0, device=hidden_states.device)
+            loss_union = torch.tensor(0.0, device=hidden_states.device)
+            loss_setpp_coverage = torch.tensor(0.0, device=hidden_states.device)
+            loss_setpp_consistency = torch.tensor(0.0, device=hidden_states.device)
+        
             for k in list(mask_losses.keys()):
                 if k in weight_dict:
                     if mask_losses[k] is not None:
                         mask_losses[k] *= weight_dict[k]
-
-                    if '_mask' in k:
+                    
+                    if 'coverage' in k:
+                        loss_setpp_coverage += mask_losses[k]
+                    elif 'consistency' in k:
+                        loss_setpp_consistency += mask_losses[k]
+                    elif 'union' in k:
+                        loss_union += mask_losses[k]
+                    elif '_mask' in k:
                         loss_mask += mask_losses[k]
-
                     elif '_dice' in k:
                         loss_dice += mask_losses[k]
                 else:
                     mask_losses.pop(k)
-            mask_loss = loss_mask + loss_dice
+            mask_loss = loss_mask + loss_dice + loss_union + loss_setpp_coverage + loss_setpp_consistency
 
         loss_attention = None
         masks = [_seg_info['mask'] for _seg_info in seg_info]
@@ -1079,8 +1363,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         masks_down = F.interpolate(masks, size=(27, 27), mode="bilinear", align_corners=False)
         masks_down = masks_down.view(masks_down.size(0), -1)
         masks_down[masks_down > 0] = 1
-
-        loss_attention = torch.tensor(0.0, device=mask_loss.device)
+        
+        loss_attention = torch.tensor(0.0, device=mask_loss.device)           
         for full_attention_map in attentions:
             batch_attentions_list = []
             for batch_idx in range(bs):
@@ -1091,7 +1375,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 batch_attentions_list.append(attention)
             batch_attentions = torch.cat(batch_attentions_list, dim=0) # [4, 729]
             loss_attention += self.attention_loss(batch_attentions, masks_down)
-
+                             
         loss = llm_loss + mask_loss + 0.01 * loss_attention
 
         return CausalOutputWithMask(
@@ -1104,8 +1388,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_dice=loss_dice.detach(),
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
+            loss_union=loss_union.detach(),
+            loss_setpp_coverage=loss_setpp_coverage.detach(),
+            loss_setpp_consistency=loss_setpp_consistency.detach(),
         )
-
+    
     def eval_seg(
             self,
             input_ids: torch.LongTensor = None,
@@ -1122,8 +1409,9 @@ class SegEarthR2(MiphaPhiForCausalLM):
             seg_info=None,
             token_refer_id=None,
             SEG_token_embedding_indices=None,
+            SET_token_embedding_indices=None,
             mask_num = None):
-
+        
         output_attentions = False
         output_hidden_states = False
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -1138,10 +1426,11 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if not per_target_swin:
             image_features = self.get_vision_tower_feature(images)
 
-        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
+        input_ids, attention_mask, past_key_values, inputs_embeds, labels, SEG_token_embedding_indices, SET_token_embedding_indices, image_features_indices, refer_span_mask = self.prepare_inputs_labels_for_multimodal(
             input_ids, attention_mask, past_key_values, labels, images_clip,
-            token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices)
-
+            token_refer_id=token_refer_id, SEG_token_embedding_indices=SEG_token_embedding_indices,
+            SET_token_embedding_indices=SET_token_embedding_indices)
+    
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1154,20 +1443,22 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
 
         hidden_states = outputs.last_hidden_state
+        SET_embedding_b = self.SET_token_projector(self.get_SET_embedding(hidden_states, SET_token_embedding_indices))
+        per_target_mode = False
 
         if per_target_swin:
             seg_hidden, text_cond, reliability = self.build_text_cond(
                 hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
             )
             SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
-            n_target = SEG_embedding.shape[0]
+            SET_embedding = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
+            per_target_mode = True
             coarse_evidence = None
             if self._use_coarse_evidence():
                 coarse_evidence = self.get_shared_coarse_evidence(
-                    images, SEG_embedding, mask_num
+                    images, SEG_embedding, mask_num, set_embedding_b=SET_embedding_b
                 )
             images_expanded = self._repeat_images_per_target(images, mask_num)
-            assert images_expanded.shape[0] == n_target
             image_features = self.get_vision_tower_feature(
                 images_expanded,
                 text_cond=text_cond,
@@ -1180,6 +1471,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             images = [s[0] for s in torch.split(images_expanded, 1, dim=0)]
         else:
             SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+            SET_embedding = SET_embedding_b
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
             images = [image.repeat((num, 1, 1, 1)) for image, num in zip(images, mask_num)]
@@ -1191,18 +1483,78 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 for feat in multi_scale_features
             ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None, SEG_embedding)
-
+        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None,
+                                      SEG_embedding=SEG_embedding,
+                                      SET_embedding=SET_embedding,
+                                      mask_num=mask_num if not per_target_mode else None,
+                                      per_target_mode=per_target_mode)
 
         mask_pred_results = mask_outputs["pred_masks"]
-        images = ImageList.from_tensors(images, self.size_divisibility)
+        if per_target_mode:
+            if isinstance(images, torch.Tensor):
+                images_list = [images[i] for i in range(images.shape[0])]
+            else:
+                images_list = list(images)
+            image_list = ImageList.from_tensors(images_list, self.size_divisibility)
+            mask_pred_results = F.interpolate(
+                mask_pred_results,
+                size=(image_list.tensor.shape[-2], image_list.tensor.shape[-1]),
+                mode="bilinear",
+                align_corners=False,
+            )
+            offsets = [0] + list(torch.tensor(mask_num).cumsum(0).tolist())
+            union_masks = []
+            for b in range(len(mask_num)):
+                row_slice = slice(offsets[b], offsets[b + 1])
+                union_masks.append(mask_pred_results[row_slice, 0, :, :].max(dim=0).values)
+            union_mask_info = {
+                'union_preds': [(m.detach().float().cpu().numpy() > 0).astype(np.uint8) for m in union_masks],
+                'image_ids': [seg_info[offsets[b]]['image_id'] for b in range(len(mask_num))],
+                'data_ids': [seg_info[offsets[b]]['data_id'] for b in range(len(mask_num))],
+            }
+            mask_pred_results = mask_pred_results[:, 1, :, :]
+            processed_results = []
+            for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
+                instance_r = {
+                    'pred': ((mask_pred_result.detach().float().cpu().numpy() > 0) * 255).astype(np.uint8),
+                    'image_name': _seg_info['image_id'],
+                    'id': _seg_info['data_id'],
+                    'mask_id': _seg_info['mask_id'],
+                }
+                processed_results.append(instance_r)
+            return processed_results, union_mask_info
+
+        if isinstance(images, torch.Tensor):
+            images_list = [images[b] for b in range(images.shape[0])]
+        else:
+            images_list = list(images)
+        image_list = ImageList.from_tensors(images_list, self.size_divisibility)
         mask_pred_results = F.interpolate(
             mask_pred_results,
-            size=(images.tensor.shape[-2], images.tensor.shape[-1]),
+            size=(image_list.tensor.shape[-2], image_list.tensor.shape[-1]),
             mode="bilinear",
             align_corners=False,
         )
-
+        
+        # Extract union mask (query 0) for diagnostic metrics
+        union_masks = mask_pred_results[:, 0, :, :]  # [B, H, W]
+        # seg_info is flat per-mask; extract per-image image_id/data_id using mask_num
+        offsets = [0] + list(torch.tensor(mask_num).cumsum(0).tolist())
+        per_image_seg_info = seg_info  # keep flat, but use offsets to index
+        union_mask_info = {
+            'union_preds': [(m.detach().float().cpu().numpy() > 0).astype(np.uint8) for m in union_masks],
+            'image_ids': [per_image_seg_info[offsets[b]]['image_id'] for b in range(len(mask_num))],
+            'data_ids': [per_image_seg_info[offsets[b]]['data_id'] for b in range(len(mask_num))],
+        }
+        
+        # Strip query 0 (SET union mask) and remove padded SEG queries
+        # [B, 1+Kmax, H, W] -> [B, Kmax, H, W] -> flatten to [sum(K_i), H, W]
+        instance_masks = mask_pred_results[:, 1:, :, :]  # [B, Kmax, H, W]
+        flattened_masks = []
+        for b_idx, k in enumerate(mask_num):
+            flattened_masks.append(instance_masks[b_idx, :k, :, :])
+        mask_pred_results = torch.cat(flattened_masks, dim=0)  # [sum(K_i), H, W]
+        
         processed_results = []
         for _seg_info, mask_pred_result in zip(seg_info, mask_pred_results):
             instance_r = {
@@ -1212,4 +1564,4 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 'mask_id': _seg_info['mask_id'],
             }
             processed_results.append(instance_r)
-        return processed_results
+        return processed_results, union_mask_info

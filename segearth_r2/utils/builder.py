@@ -36,19 +36,35 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
             bnb_4bit_quant_type='nf4'
         )
     else:
-        kwargs['torch_dtype'] = torch.float32 if device == "cpu" else torch.float16
+        kwargs['torch_dtype'] = torch.float16
 
     mask_cfg = get_mask_config(mask_config)
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+    for tok in ("[SEG]", "[SET]"):
+        if tok not in tokenizer.get_vocab():
+            tokenizer.add_tokens([tok])
+
     model = SegEarthR2.from_pretrained(model_path, mask_decoder_cfg=mask_cfg, **kwargs)
+    model.ensure_setpp_predictor(model_args)
+    model.persist_setpp_config(model_args)
     
     vision_tower = model.get_model().get_vision_tower_mask()
     vision_tower.to(device=device)
     image_processor = vision_tower.image_processor
 
-    model.resize_token_embeddings(len(tokenizer))
+    if len(tokenizer) > model.get_input_embeddings().weight.shape[0]:
+        model.resize_token_embeddings(len(tokenizer))
+
+    lm_head_size = model.lm_head.out_features
+    seg_id = tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    set_id = tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    if len(tokenizer) > lm_head_size or seg_id >= lm_head_size or set_id >= lm_head_size:
+        raise RuntimeError(
+            f"[eval] tokenizer/lm_head mismatch: len={len(tokenizer)}, lm_head={lm_head_size}, "
+            f"SEG_id={seg_id}, SET_id={set_id}"
+        )
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

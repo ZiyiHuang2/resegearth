@@ -25,7 +25,7 @@ IDENTITY_THRESH = 1e-5
 def check_1_tcf_v15_init():
     """v1.5 TCF: stage-wise router → [N,S,C] + per-stage reliability."""
     tcf = TextConditionFactory(
-        text_dim=64, cond_dim=32, reliability_init=0.0, version="v1.5", num_stages=3, stage_router=True
+        text_dim=64, cond_dim=32, reliability_init=0.0, version="v1.5", num_stages=4, stage_router=True
     )
     seg_hidden = torch.randn(3, 64)
     phrase_hidden = torch.randn(3, 5, 64)
@@ -33,8 +33,8 @@ def check_1_tcf_v15_init():
     text_cond, reliability = tcf(
         seg_hidden, phrase_hidden=phrase_hidden, phrase_mask=phrase_mask
     )
-    assert text_cond.shape == (3, 3, 32), text_cond.shape
-    assert reliability.shape == (3, 3, 1), reliability.shape
+    assert text_cond.shape == (3, 4, 32), text_cond.shape
+    assert reliability.shape == (3, 4, 1), reliability.shape
     assert reliability.mean().item() > 0.4
     assert text_cond.abs().max().item() > 0
     print("[PASS] 1/7 v1.5 TCF stage_text_cond [N,S,C] + reliability [N,S,1]")
@@ -111,10 +111,7 @@ def check_4_forward_reorder(model_path: str):
 
 
 def check_5_refer_span_not_fallback():
-    tcf = TextConditionFactory(
-        text_dim=32, cond_dim=16, reliability_init=0.0, version="v1.5",
-        num_stages=3, stage_router=True,
-    )
+    tcf = TextConditionFactory(text_dim=32, cond_dim=16, reliability_init=0.0, version="v1.5", stage_router=True)
 
     def _boom(*args, **kwargs):
         raise AssertionError("_pool_local_context should not be called when refer span is present")
@@ -124,7 +121,7 @@ def check_5_refer_span_not_fallback():
     phrase_hidden = torch.randn(2, 4, 32)
     phrase_mask = torch.ones(2, 4, dtype=torch.bool)
     text_cond, _ = tcf(seg_hidden, phrase_hidden=phrase_hidden, phrase_mask=phrase_mask)
-    assert text_cond.shape == (2, 3, 16)
+    assert text_cond.shape == (2, 4, 16)
     print("[PASS] 5/7 refer span → v1.5 router skips local pool fallback")
 
 

@@ -21,26 +21,6 @@ from segearth_r2.datasets.dataset import get_mask_config
 from segearth_r2.model.language_model.llava_phi import SegEarthR2
 
 
-def resolve_merge_arch_path(checkpoint_path):
-    """DeepSpeed checkpoints often lack config.json; use PEFT base_model for architecture init."""
-    config_path = os.path.join(checkpoint_path, "config.json")
-    if os.path.isfile(config_path):
-        return checkpoint_path
-    adapter_cfg = os.path.join(checkpoint_path, "adapter_config.json")
-    if os.path.isfile(adapter_cfg):
-        with open(adapter_cfg, "r", encoding="utf-8") as f:
-            base = json.load(f).get("base_model_name_or_path")
-        if base and os.path.isdir(base):
-            print(f"[merge] checkpoint has no config.json; init architecture from base: {base}")
-            return base
-    return checkpoint_path
-
-
-def _tg_swin_enabled_from_cfg(mask_cfg):
-    tg = getattr(mask_cfg, "TG_SWIN", None)
-    return bool(tg and getattr(tg, "ENABLED", False))
-
-
 def parse_args(args):
     parser = argparse.ArgumentParser(
         description="merge lora weights and save model with hf format"
@@ -68,8 +48,45 @@ def parse_args(args):
     parser.add_argument("--local-rank", default=0, type=int, help="node rank")
     
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
+
+    parser.add_argument("--setpp_closed_loop", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
+    parser.add_argument("--setpp_csqr_enable", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
+    parser.add_argument("--setpp_csqr_fusion_alpha_init", default=0.99, type=float)
     
     return parser.parse_args(args)
+
+
+def resolve_merge_arch_path(checkpoint_path):
+    """DeepSpeed checkpoints often lack config.json; use PEFT base_model for architecture init."""
+    config_path = os.path.join(checkpoint_path, "config.json")
+    if os.path.isfile(config_path):
+        return checkpoint_path
+    adapter_cfg = os.path.join(checkpoint_path, "adapter_config.json")
+    if os.path.isfile(adapter_cfg):
+        with open(adapter_cfg, "r", encoding="utf-8") as f:
+            base = json.load(f).get("base_model_name_or_path")
+        if base and os.path.isdir(base):
+            print(f"[merge] checkpoint has no config.json; init architecture from base: {base}")
+            return base
+    return checkpoint_path
+
+
+def ensure_seg_set_tokens(tokenizer, model):
+    """Match train.py tokenizer setup for [SEG]/[SET] and lm_head safety."""
+    added = tokenizer.add_tokens(["[SEG]", "[SET]"])
+    if added > 0:
+        model.resize_token_embeddings(len(tokenizer))
+    lm_head_size = model.lm_head.out_features
+    tokenizer_len = len(tokenizer)
+    seg_id = tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    set_id = tokenizer("[SET]", return_tensors='pt', add_special_tokens=False)['input_ids'].item()
+    if tokenizer_len > lm_head_size or seg_id >= lm_head_size or set_id >= lm_head_size:
+        raise RuntimeError(
+            f"Tokenizer/lm_head mismatch after merge init: "
+            f"tokenizer_len={tokenizer_len}, lm_head={lm_head_size}, SEG_id={seg_id}, SET_id={set_id}"
+        )
+    print(f"[merge] tokenizer_len={tokenizer_len}, lm_head={lm_head_size}, SEG_id={seg_id}, SET_id={set_id}")
+    return tokenizer
 
 
 def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_module_list=[]): 
@@ -93,8 +110,7 @@ def find_linear_layers(model, lora_target_modules=['q_proj', 'v_proj'], train_mo
 
 def load_pretrained_model(model_path, model_args, mask_config='/mask_config/maskformer2_swin_base_384_bs16_50ep.yaml', load_8bit=False, load_4bit=False, device_map="auto", device="cuda"):
 
-    # TG-Swin uses scalar nn.Parameter tensors (alpha, reliability_logit). device_map
-    # triggers meta-tensor init where torch.empty(*param.size()) fails for 0-d scalars.
+    # TG-Swin scalar params break meta init with device_map; match tgswin merge script.
     kwargs = {"low_cpu_mem_usage": False}
 
     if load_8bit:
@@ -114,7 +130,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
     mask_cfg.MODEL.MASK_FORMER.SEG_TASK = model_args.seg_task if hasattr(model_args, 'seg_task') else 'instance'
 
     arch_path = resolve_merge_arch_path(model_path)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     model = SegEarthR2.from_pretrained(arch_path, mask_decoder_cfg=mask_cfg, **kwargs)
 
     model.use_temporal_query = model_args.use_temporal_query if hasattr(model_args, 'use_temporal_query') else False
@@ -123,6 +139,8 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
 
     mask2former_ckpt = model_args.vision_tower_mask
     model.initial_mask_module(mask2former_ckpt, model_args)
+    model.ensure_setpp_predictor(model_args)
+    model.persist_setpp_config(model_args)
 
     model.get_model().initialize_vision_modules(model_args)
 
@@ -133,9 +151,9 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         model.to(device=device)
 
     train_module_list = [
-        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector",
+        "lm_head", "pixel_decoder", "predictor", "SEG_token_projector", "SET_token_projector",
     ]
-    if _tg_swin_enabled_from_cfg(mask_cfg):
+    if getattr(mask_cfg, "TG_SWIN", None) and getattr(mask_cfg.TG_SWIN, "ENABLED", False):
         train_module_list.extend(["tg_swin_tcf", "tg_swin_controller"])
 
     if model_args.lora_enable:
@@ -153,7 +171,7 @@ def load_pretrained_model(model_path, model_args, mask_config='/mask_config/mask
         )
         model = get_peft_model(model, lora_config)
 
-    model.resize_token_embeddings(len(tokenizer))
+    tokenizer = ensure_seg_set_tokens(tokenizer, model)
 
     from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
     print(f"[merge] loading DeepSpeed ZeRO weights from: {model_path}")

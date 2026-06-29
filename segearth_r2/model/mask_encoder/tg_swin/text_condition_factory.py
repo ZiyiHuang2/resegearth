@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 
 class StageWiseTextRouter(nn.Module):
-    """Stage-wise text router: one condition vector per WTI injection stage."""
+    """Stage-wise text router: distinct condition per Swin stage."""
 
     def __init__(
         self,

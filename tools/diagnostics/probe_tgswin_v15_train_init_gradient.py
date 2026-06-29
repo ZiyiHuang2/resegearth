@@ -75,8 +75,8 @@ def main():
     assert isinstance(wti, StageWTIHeadAware)
     H, N = wti.num_heads, wti.N
     x_windows = torch.randn(4, N, wti.dim)
-    tc = stage_text_cond[:, 0, :]
-    rel = reliability[:, 0, :]
+    tc = stage_text_cond[:, 1, :]
+    rel = reliability[:, 1, :]
 
     with torch.no_grad():
         raw_bias = wti.compute_raw_bias(x_windows, tc, rel)
@@ -118,8 +118,8 @@ def main():
     stage_text_cond2, rel2 = tcf_b(
         seg_hidden, phrase_hidden=phrase_hidden, phrase_mask=phrase_mask
     )
-    tc2 = stage_text_cond2[:, 0, :]
-    rel2s = rel2[:, 0, :]
+    tc2 = stage_text_cond2[:, 1, :]
+    rel2s = rel2[:, 1, :]
     gated2, _, _ = wti_b(x_windows, tc2, rel2s)
     gated2.sum().backward()
     proj_grads = {

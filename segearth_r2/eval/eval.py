@@ -55,7 +55,7 @@ class DataArguments:
 
     # 新增：数据集类型与 split
     dataset_name: str = "lasers"   # lasers / rrsisd / refsegrs / risbench / earthreason
-    split: str = "val"             # train / val / test
+    split: str = "test"             # train / val / test
     zip_results: bool = True       # 是否自动打包输出目录
 
 
@@ -205,21 +205,18 @@ def evaluation():
 
     model_path = os.path.expanduser(data_args.model_path)
 
-    device = torch.device(
-        f"cuda:{data_args.local_rank}" if torch.cuda.is_available() else "cpu"
-    )
     tokenizer, model, image_processor, context_len = load_pretrained_model(
         model_path,
         model_args=data_args,
         mask_config=data_args.mask_config,
         load_8bit=data_args.load_8bit,
         load_4bit=data_args.load_4bit,
-        device=str(device),
+        device="cuda",
     )
+
+    device = torch.device(data_args.local_rank if torch.cuda.is_available() else "cpu")
     if data_args.load_8bit or data_args.load_4bit:
         model.to(device=device)
-    elif device.type == "cpu":
-        model.to(dtype=torch.float32, device=device)
     else:
         # fp16 inference saves VRAM vs casting the whole model to fp32
         model.to(dtype=torch.float16, device=device)
@@ -302,7 +299,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                     processed_samples += len(seg_info)
                     continue
 
-            outputs = model.eval_seg(
+            outputs, _ = model.eval_seg(
                 input_ids=inputs["input_ids"],
                 attention_mask=inputs["attention_mask"],
                 images=inputs["images"].to(device=device, dtype=infer_dtype),
@@ -310,6 +307,7 @@ def do_eval(model, eval_dataloader, save_folder, split, data_args, device):
                 seg_info=inputs["seg_info"],
                 token_refer_id=inputs["token_refer_id"],
                 SEG_token_embedding_indices=inputs["SEG_token_embedding_indices"],
+                SET_token_embedding_indices=inputs["SET_token_embedding_indices"],
                 labels=inputs["labels"],
                 mask_num=inputs["mask_num"],
             )

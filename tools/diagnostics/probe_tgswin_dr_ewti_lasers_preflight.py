@@ -104,8 +104,9 @@ def main():
             batch["images_clip"],
             token_refer_id=batch["token_refer_id"],
             SEG_token_embedding_indices=batch["SEG_token_embedding_indices"],
+            SET_token_embedding_indices=batch.get("SET_token_embedding_indices"),
         )
-        input_ids, attention_mask, _, inputs_embeds, _, seg_idx, _, refer_span = prep
+        _, attention_mask, _, inputs_embeds, _, seg_idx, set_idx, _, refer_span = prep
         backbone = model.model(
             input_ids=None,
             attention_mask=attention_mask,
@@ -116,7 +117,10 @@ def main():
         hidden = backbone.last_hidden_state
         seg_hidden, _, _ = model.build_text_cond(hidden, seg_idx, refer_span_mask=refer_span)
         seg_emb = model.SEG_token_projector(seg_hidden.unsqueeze(1))
-        coarse = model.get_shared_coarse_evidence(batch["images"], seg_emb, batch["mask_num"])
+        set_emb_b = model.SET_token_projector(model.get_SET_embedding(hidden, set_idx))
+        coarse = model.get_shared_coarse_evidence(
+            batch["images"], seg_emb, batch["mask_num"], set_embedding_b=set_emb_b
+        )
         print(
             f"[info] coarse_prob mean={float(coarse.mean()):.6f} "
             f"std={float(coarse.std()):.6f} shape={tuple(coarse.shape)}"
@@ -132,6 +136,7 @@ def main():
         mask_num=batch["mask_num"],
         token_refer_id=batch["token_refer_id"],
         SEG_token_embedding_indices=batch["SEG_token_embedding_indices"],
+        SET_token_embedding_indices=batch.get("SET_token_embedding_indices"),
         dataset_type=batch.get("dataset_type"),
     )
     loss = out.loss
