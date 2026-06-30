@@ -1,0 +1,11 @@
+_BASE_: ./maskformer2_enhanced_wti_v2_setpp.yaml
+
+# Full model + optional WTI-lite gate ablation (not default Full).
+TG_SWIN:
+  ENABLED: true
+  VERSION: "enhanced-wti-v2"
+  ENHANCED_WTI: true
+  USE_SET_TGSWIN_CONTROL: true
+  PER_TARGET_SWING_REPEAT: true
+  GATE_MODE: "set_lite"
+  SET_CONTROL_INIT_BIAS: 0.0

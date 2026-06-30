@@ -42,6 +42,8 @@ class ModelArguments:
     mm_use_im_patch_token: bool = field(default=False)
     mm_use_im_start_end: bool = field(default=False)
 
+    setpp_enable: bool = field(default=True)
+    setpp_regroup_set_loss: bool = field(default=True)
     setpp_closed_loop: bool = field(default=True)
     setpp_lambda_union_single: float = field(default=0.01)
     setpp_lambda_union_multi: float = field(default=0.05)
@@ -57,6 +59,7 @@ class ModelArguments:
     # Auxiliary LLM attention alignment (0.01 weight). Off by default — saves ~10–15GB
     # and allows LLM gradient checkpointing (incompatible with output_attentions=True).
     enable_attention_loss: bool = field(default=False)
+    debug_batch_semantics: bool = field(default=False)
 
 @dataclass
 class DataArguments:
@@ -285,6 +288,133 @@ def make_unify_datamodule(clip_image_processor, tokenizer, data_args, training_a
     )
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
+
+def _tg_swin_cfg_get(mask_cfg, key, default=None):
+    tg_swin = getattr(mask_cfg, "TG_SWIN", None)
+    if tg_swin is None:
+        return default
+    return getattr(tg_swin, key, default)
+
+
+def collect_experiment_flags(model_args, data_args, training_args, mask_cfg):
+    tg_enabled = bool(_tg_swin_cfg_get(mask_cfg, "ENABLED", False))
+    tg_version = str(_tg_swin_cfg_get(mask_cfg, "VERSION", ""))
+    enhanced_wti = bool(_tg_swin_cfg_get(mask_cfg, "ENHANCED_WTI", False))
+    use_set_control = bool(_tg_swin_cfg_get(mask_cfg, "USE_SET_TGSWIN_CONTROL", False))
+    per_target_repeat = bool(_tg_swin_cfg_get(mask_cfg, "PER_TARGET_SWING_REPEAT", True))
+    use_coarse = bool(_tg_swin_cfg_get(mask_cfg, "USE_COARSE_EVIDENCE", False))
+    use_dr = bool(_tg_swin_cfg_get(mask_cfg, "USE_DR_EWTI", False))
+    gate_mode = str(_tg_swin_cfg_get(mask_cfg, "GATE_MODE", "legacy")).lower()
+    setpp_enable = bool(getattr(model_args, "setpp_enable", True))
+    setpp_csqr = bool(getattr(model_args, "setpp_csqr_enable", True))
+    setpp_closed = bool(getattr(model_args, "setpp_closed_loop", True))
+    setpp_regroup = bool(getattr(model_args, "setpp_regroup_set_loss", True))
+
+    is_full = (
+        tg_enabled
+        and enhanced_wti
+        and use_set_control
+        and per_target_repeat
+        and not use_coarse
+        and not use_dr
+        and setpp_enable
+        and setpp_regroup
+    )
+
+    return {
+        "method": "full_enhanced_tgswin_setpp" if is_full else "custom",
+        "tg_swin_enabled": tg_enabled,
+        "tg_swin_version": tg_version,
+        "enhanced_wti": enhanced_wti,
+        "use_set_tgswin_control": use_set_control,
+        "per_target_swin_repeat": per_target_repeat,
+        "use_coarse_evidence": use_coarse,
+        "use_dr_ewti": use_dr,
+        "gate_mode": gate_mode,
+        "setpp_enable": setpp_enable,
+        "setpp_csqr_enable": setpp_csqr,
+        "setpp_closed_loop": setpp_closed,
+        "setpp_regroup_set_loss": setpp_regroup,
+        "TG_SWIN.ENABLED": tg_enabled,
+        "TG_SWIN.VERSION": tg_version,
+        "TG_SWIN.ENHANCED_WTI": enhanced_wti,
+        "TG_SWIN.USE_SET_TGSWIN_CONTROL": use_set_control,
+        "TG_SWIN.PER_TARGET_SWING_REPEAT": per_target_repeat,
+        "TG_SWIN.USE_COARSE_EVIDENCE": use_coarse,
+        "TG_SWIN.USE_DR_EWTI": use_dr,
+        "TG_SWIN.WTI_STAGES": list(_tg_swin_cfg_get(mask_cfg, "WTI_STAGES", [])),
+        "TG_SWIN.WTI_START_LAYER": int(_tg_swin_cfg_get(mask_cfg, "WTI_START_LAYER", 0)),
+        "TG_SWIN.GATE_MODE": gate_mode,
+        "model_args.setpp_enable": setpp_enable,
+        "model_args.setpp_csqr_enable": setpp_csqr,
+        "model_args.setpp_closed_loop": setpp_closed,
+        "model_args.setpp_regroup_set_loss": setpp_regroup,
+        "model_args.setpp_consistency_mode": str(getattr(model_args, "setpp_consistency_mode", "seg_align_set")),
+        "model_args.setpp_closed_loop_warmup_steps": int(getattr(model_args, "setpp_closed_loop_warmup_steps", 2000)),
+        "training_args.output_dir": str(training_args.output_dir),
+        "training_args.max_steps": int(training_args.max_steps) if training_args.max_steps is not None else None,
+        "training_args.per_device_train_batch_size": int(training_args.per_device_train_batch_size),
+        "training_args.gradient_accumulation_steps": int(training_args.gradient_accumulation_steps),
+        "training_args.learning_rate": float(training_args.learning_rate),
+        "training_args.lora_r": int(training_args.lora_r),
+        "data_args.dataset_name": str(data_args.dataset_name),
+        "data_args.switch_bs": int(data_args.switch_bs),
+        "data_args.data_ratio": str(data_args.data_ratio),
+        "mask_config": str(getattr(model_args, "mask_config", "")),
+    }
+
+
+def log_and_save_experiment_flags(model_args, data_args, training_args, mask_cfg, local_rank):
+    flags = collect_experiment_flags(model_args, data_args, training_args, mask_cfg)
+    if local_rank not in (-1, 0):
+        return flags
+
+    print("=" * 60)
+    print("[Experiment Flags]")
+    for key in sorted(flags.keys()):
+        print(f"  {key} = {flags[key]}")
+    print("=" * 60)
+
+    output_dir = training_args.output_dir
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+        flags_path = os.path.join(output_dir, "experiment_flags.json")
+        with open(flags_path, "w", encoding="utf-8") as f:
+            json.dump(flags, f, indent=2, ensure_ascii=False)
+        print(f"[Experiment Flags] Saved to {flags_path}")
+    return flags
+
+
+def save_trainable_parameters(model, output_dir, local_rank):
+    if local_rank not in (-1, 0) or not output_dir:
+        return
+
+    os.makedirs(output_dir, exist_ok=True)
+    lines = ["name\tshape\tnumel"]
+    total_trainable = 0
+    total_params = 0
+
+    for name, param in model.named_parameters():
+        numel = param.numel()
+        total_params += numel
+        if param.requires_grad:
+            shape_str = "x".join(str(s) for s in param.shape)
+            lines.append(f"{name}\t{shape_str}\t{numel}")
+            total_trainable += numel
+
+    ratio = total_trainable / total_params if total_params > 0 else 0.0
+    lines.append("")
+    lines.append(f"total_trainable_params\t{total_trainable}")
+    lines.append(f"total_params\t{total_params}")
+    lines.append(f"trainable_ratio\t{ratio:.6f}")
+
+    out_path = os.path.join(output_dir, "trainable_parameters.txt")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"[Trainable Params] Saved to {out_path} "
+          f"(trainable={total_trainable}, total={total_params}, ratio={ratio:.4f})")
+
+
 def train():
     global local_rank
 
@@ -302,6 +432,7 @@ def train():
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32)) # 用不着？
 
     mask_cfg = get_mask_config(config=model_args.mask_config)
+    log_and_save_experiment_flags(model_args, data_args, training_args, mask_cfg, training_args.local_rank)
     bnb_model_from_pretrained_args = {}
 
     model = SegEarthR2.from_pretrained(
@@ -321,8 +452,11 @@ def train():
 
     use_csqr, closed_loop = model.persist_setpp_config(model_args)
     model.config.enable_attention_loss = bool(getattr(model_args, "enable_attention_loss", False))
+    model.config.debug_batch_semantics = bool(getattr(model_args, "debug_batch_semantics", False))
     if training_args.local_rank in (-1, 0):
-        print(f"[SET++] config: setpp_csqr_enable={use_csqr}, setpp_closed_loop={closed_loop}")
+        print(f"[SET++] config: setpp_enable={getattr(model.config, 'setpp_enable', True)}, "
+              f"setpp_csqr_enable={use_csqr}, setpp_closed_loop={closed_loop}, "
+              f"setpp_regroup_set_loss={getattr(model.config, 'setpp_regroup_set_loss', True)}")
         print(f"[train] enable_attention_loss={model.config.enable_attention_loss}")
 
     model.config.use_cache = False
@@ -447,6 +581,8 @@ def train():
                 ]):
 
                 p.requires_grad = True
+
+    save_trainable_parameters(model, training_args.output_dir, training_args.local_rank)
 
     model.get_special_token(
         SEG=tokenizer("[SEG]", return_tensors='pt', add_special_tokens=False)['input_ids'],

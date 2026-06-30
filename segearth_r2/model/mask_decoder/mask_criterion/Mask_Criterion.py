@@ -140,7 +140,9 @@ class Criterion(nn.Module):
                  lambda_consistency_single=0.005,
                  lambda_consistency_multi=0.02,
                  closed_loop_warmup_steps=2000,
-                 consistency_mode="seg_align_set"):
+                 consistency_mode="seg_align_set",
+                 setpp_enable=True,
+                 setpp_regroup_set_loss=True):
         super().__init__()
         self.matcher = matcher
         self.losses = losses
@@ -151,6 +153,8 @@ class Criterion(nn.Module):
         self.pos_weight = torch.tensor([99.0])
         self.union_weight = union_weight
         self.union_warmup_steps = union_warmup_steps
+        self.setpp_enable = setpp_enable
+        self.setpp_regroup_set_loss = setpp_regroup_set_loss
         self.setpp_closed_loop = setpp_closed_loop
         self.lambda_union_single = lambda_union_single
         self.lambda_union_multi = lambda_union_multi
@@ -182,8 +186,8 @@ class Criterion(nn.Module):
         """
         pred_prob/tgt_prob: [B, 1, H, W], already probabilities
         """
-        pred = pred_prob.flatten(1)
-        tgt = tgt_prob.flatten(1)
+        pred = pred_prob.float().flatten(1)
+        tgt = tgt_prob.float().flatten(1)
 
         numerator = 2 * (pred * tgt).sum(dim=1) + eps
         denominator = pred.sum(dim=1) + tgt.sum(dim=1) + eps
@@ -215,13 +219,102 @@ class Criterion(nn.Module):
             weights.append(single_weight if k <= 1 else multi_weight)
         return torch.tensor(weights, dtype=torch.float32, device=device)
 
+    def build_sample_weights_from_mask_num(self, mask_num, single_weight, multi_weight, device):
+        weights = []
+        for k in mask_num:
+            k = int(k)
+            weights.append(single_weight if k <= 1 else multi_weight)
+        return torch.tensor(weights, dtype=torch.float32, device=device)
+
+    def _use_regrouped_set_loss(self, outputs):
+        return (
+            self.setpp_enable
+            and self.setpp_regroup_set_loss
+            and bool(outputs.get("per_target_mode", False))
+            and outputs.get("target_to_image", None) is not None
+            and outputs.get("mask_num", None) is not None
+        )
+
+    def regroup_per_target_union(self, pred_logits_t, target_to_image, batch_size):
+        """pred_logits_t: [T, 1, H, W] logits -> [B, 1, H, W] probability union."""
+        prob = pred_logits_t.sigmoid()
+        unions = []
+        for b in range(batch_size):
+            idx = target_to_image == b
+            if idx.any():
+                p = prob[idx]
+                union = 1.0 - torch.prod(1.0 - p, dim=0)
+            else:
+                union = torch.zeros_like(prob[0])
+            unions.append(union)
+        return torch.stack(unions, dim=0)
+
+    def build_regrouped_union_target_tensor(self, targets, target_to_image, batch_size, size, device):
+        """Flat per-target targets -> [B, 1, H, W] image-level GT union."""
+        if isinstance(size, torch.Size):
+            size = tuple(size[-2:])
+        elif len(size) > 2:
+            size = tuple(size[-2:])
+
+        unions = []
+        for b in range(batch_size):
+            idx = target_to_image == b
+            if idx.any():
+                mask_list = []
+                for t_idx in torch.where(idx)[0].tolist():
+                    m = targets[t_idx]["masks"].float().to(device)
+                    if m.ndim == 2:
+                        m = m.unsqueeze(0)
+                    for j in range(m.shape[0]):
+                        mask_j = m[j:j + 1]
+                        if mask_j.shape[-2:] != size:
+                            mask_j = F.interpolate(
+                                mask_j.unsqueeze(0),
+                                size=size,
+                                mode="nearest",
+                            ).squeeze(0)
+                        mask_list.append(mask_j)
+                stacked_masks = torch.cat(mask_list, dim=0)
+                union = (stacked_masks.sum(dim=0, keepdim=True) > 0).float()
+            else:
+                union = torch.zeros(1, size[0], size[1], device=device)
+            unions.append(union)
+        return torch.stack(unions, dim=0)
+
     def closed_loop_warmup(self):
         if self.closed_loop_warmup_steps <= 0:
             return 1.0
         return min(1.0, float(self._global_step) / float(self.closed_loop_warmup_steps))
 
     def loss_set_union(self, outputs, targets):
-        pred_set = outputs.get("pred_set_union_mask", outputs["pred_masks"][:, 0:1])  # [B,1,H,W]
+        pred_set = outputs.get("pred_set_union_mask", outputs["pred_masks"][:, 0:1])
+        warmup = self.closed_loop_warmup()
+
+        if self._use_regrouped_set_loss(outputs):
+            target_to_image = outputs["target_to_image"].to(pred_set.device)
+            batch_size = len(outputs["mask_num"])
+            pred_set_union_b = self.regroup_per_target_union(pred_set, target_to_image, batch_size)
+            gt_union_b = self.build_regrouped_union_target_tensor(
+                targets, target_to_image, batch_size, pred_set.shape[-2:], pred_set.device,
+            )
+            weights = self.build_sample_weights_from_mask_num(
+                outputs["mask_num"],
+                self.lambda_union_single,
+                self.lambda_union_multi,
+                pred_set.device,
+            )
+            bce = F.binary_cross_entropy(
+                pred_set_union_b.float().clamp(1e-6, 1 - 1e-6),
+                gt_union_b.float(),
+                reduction="none",
+            ).flatten(1).mean(dim=1)
+            bce = (bce * weights).mean()
+            dice = self.dice_prob_loss(pred_set_union_b, gt_union_b, sample_weight=weights)
+            return {
+                "loss_union_mask": bce * warmup,
+                "loss_union_dice": dice * warmup,
+            }
+
         gt_union = self.build_union_target_tensor(
             targets,
             size=pred_set.shape[-2:],
@@ -248,15 +341,31 @@ class Criterion(nn.Module):
             sample_weight=weights,
         )
 
-        warmup = self.closed_loop_warmup()
         return {
             "loss_union_mask": bce * warmup,
             "loss_union_dice": dice * warmup,
         }
 
     def loss_setpp_coverage(self, outputs, targets):
-        pred_seg = outputs["pred_seg_masks"]      # [B,Kmax,H,W]
-        valid = outputs["valid_seg_mask"]         # [B,Kmax]
+        if self._use_regrouped_set_loss(outputs):
+            pred_seg = outputs.get("pred_seg_masks", outputs["pred_masks"][:, 1:])
+            target_to_image = outputs["target_to_image"].to(pred_seg.device)
+            batch_size = len(outputs["mask_num"])
+            seg_union_b = self.regroup_per_target_union(pred_seg, target_to_image, batch_size)
+            gt_union_b = self.build_regrouped_union_target_tensor(
+                targets, target_to_image, batch_size, pred_seg.shape[-2:], pred_seg.device,
+            )
+            weights = self.build_sample_weights_from_mask_num(
+                outputs["mask_num"],
+                self.lambda_coverage_single,
+                self.lambda_coverage_multi,
+                pred_seg.device,
+            )
+            loss = self.dice_prob_loss(seg_union_b, gt_union_b, sample_weight=weights)
+            return {"loss_setpp_coverage": loss * self.closed_loop_warmup()}
+
+        pred_seg = outputs.get("pred_seg_masks", outputs["pred_masks"][:, 1:])
+        valid = outputs["valid_seg_mask"]
 
         gt_union = self.build_union_target_tensor(
             targets,
@@ -282,8 +391,34 @@ class Criterion(nn.Module):
         return {"loss_setpp_coverage": loss * self.closed_loop_warmup()}
 
     def loss_setpp_consistency(self, outputs, targets):
-        pred_set = outputs["pred_set_union_mask"]  # [B,1,H,W]
-        pred_seg = outputs["pred_seg_masks"]       # [B,Kmax,H,W]
+        if self._use_regrouped_set_loss(outputs):
+            pred_set = outputs.get("pred_set_union_mask", outputs["pred_masks"][:, 0:1])
+            pred_seg = outputs.get("pred_seg_masks", outputs["pred_masks"][:, 1:])
+            target_to_image = outputs["target_to_image"].to(pred_set.device)
+            batch_size = len(outputs["mask_num"])
+            set_union_b = self.regroup_per_target_union(pred_set, target_to_image, batch_size)
+            seg_union_b = self.regroup_per_target_union(pred_seg, target_to_image, batch_size)
+            weights = self.build_sample_weights_from_mask_num(
+                outputs["mask_num"],
+                self.lambda_consistency_single,
+                self.lambda_consistency_multi,
+                pred_set.device,
+            )
+            if self.consistency_mode == "seg_align_set":
+                loss = self.dice_prob_loss(seg_union_b, set_union_b.detach(), sample_weight=weights)
+            elif self.consistency_mode == "set_align_seg":
+                loss = self.dice_prob_loss(set_union_b, seg_union_b.detach(), sample_weight=weights)
+            elif self.consistency_mode == "bidirectional":
+                loss = (
+                    self.dice_prob_loss(seg_union_b, set_union_b.detach(), sample_weight=weights)
+                    + 0.5 * self.dice_prob_loss(set_union_b, seg_union_b.detach(), sample_weight=weights)
+                )
+            else:
+                raise ValueError(f"Unknown consistency_mode: {self.consistency_mode}")
+            return {"loss_setpp_consistency": loss * self.closed_loop_warmup()}
+
+        pred_set = outputs.get("pred_set_union_mask", outputs["pred_masks"][:, 0:1])
+        pred_seg = outputs.get("pred_seg_masks", outputs["pred_masks"][:, 1:])
         valid = outputs["valid_seg_mask"]
 
         set_prob = pred_set.sigmoid()
@@ -577,40 +712,50 @@ class Criterion(nn.Module):
             losses.update(l_dict)
 
         if 'union' in self.losses:
-            pred_set = outputs_without_aux.get("pred_set_union_mask", pred_masks_full[:, 0:1])
-            bce = F.binary_cross_entropy_with_logits(
-                pred_set, gt_union_rows, reduction="none",
-            ).flatten(1).mean(dim=1)
-            bce = (bce * row_weights).mean()
-            dice = self.dice_prob_loss(pred_set.sigmoid(), gt_union_rows, sample_weight=row_weights)
-            if self.setpp_closed_loop:
-                losses["loss_union_mask"] = bce * warmup
-                losses["loss_union_dice"] = dice * warmup
+            if self.setpp_closed_loop and self._use_regrouped_set_loss(outputs_without_aux):
+                l_dict = self.loss_set_union(outputs_without_aux, targets)
+                losses.update(l_dict)
             else:
-                warmup_factor = self._get_union_warmup_factor()
-                k1_scale = row_weights.mean()
-                losses["loss_union_mask"] = bce * self.union_weight * warmup_factor * k1_scale
-                losses["loss_union_dice"] = dice * self.union_weight * warmup_factor * k1_scale
+                pred_set = outputs_without_aux.get("pred_set_union_mask", pred_masks_full[:, 0:1])
+                bce = F.binary_cross_entropy_with_logits(
+                    pred_set, gt_union_rows, reduction="none",
+                ).flatten(1).mean(dim=1)
+                bce = (bce * row_weights).mean()
+                dice = self.dice_prob_loss(pred_set.sigmoid(), gt_union_rows, sample_weight=row_weights)
+                if self.setpp_closed_loop:
+                    losses["loss_union_mask"] = bce * warmup
+                    losses["loss_union_dice"] = dice * warmup
+                else:
+                    warmup_factor = self._get_union_warmup_factor()
+                    k1_scale = row_weights.mean()
+                    losses["loss_union_mask"] = bce * self.union_weight * warmup_factor * k1_scale
+                    losses["loss_union_dice"] = dice * self.union_weight * warmup_factor * k1_scale
 
-        if self.setpp_closed_loop and "valid_seg_mask" in outputs_without_aux:
-            pred_seg = outputs_without_aux["pred_seg_masks"]  # [T, 1, H, W]
-            seg_union = pred_seg.sigmoid()
-            coverage = self.dice_prob_loss(seg_union, gt_union_rows, sample_weight=row_weights)
-            losses["loss_setpp_coverage"] = coverage * warmup
-
-            set_prob = outputs_without_aux["pred_set_union_mask"].sigmoid()
-            if self.consistency_mode == "seg_align_set":
-                consistency = self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=row_weights)
-            elif self.consistency_mode == "set_align_seg":
-                consistency = self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=row_weights)
-            elif self.consistency_mode == "bidirectional":
-                consistency = (
-                    self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=row_weights)
-                    + 0.5 * self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=row_weights)
-                )
+        if self.setpp_closed_loop and self.setpp_enable and "valid_seg_mask" in outputs_without_aux:
+            if self._use_regrouped_set_loss(outputs_without_aux):
+                losses.update(self.loss_setpp_coverage(outputs_without_aux, targets))
+                losses.update(self.loss_setpp_consistency(outputs_without_aux, targets))
             else:
-                raise ValueError(f"Unknown consistency_mode: {self.consistency_mode}")
-            losses["loss_setpp_consistency"] = consistency * warmup
+                pred_seg = outputs_without_aux.get("pred_seg_masks", pred_masks_full[:, 1:2])
+                seg_union = pred_seg.sigmoid()
+                coverage = self.dice_prob_loss(seg_union, gt_union_rows, sample_weight=row_weights)
+                losses["loss_setpp_coverage"] = coverage * warmup
+
+                set_prob = outputs_without_aux.get(
+                    "pred_set_union_mask", pred_masks_full[:, 0:1]
+                ).sigmoid()
+                if self.consistency_mode == "seg_align_set":
+                    consistency = self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=row_weights)
+                elif self.consistency_mode == "set_align_seg":
+                    consistency = self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=row_weights)
+                elif self.consistency_mode == "bidirectional":
+                    consistency = (
+                        self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=row_weights)
+                        + 0.5 * self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=row_weights)
+                    )
+                else:
+                    raise ValueError(f"Unknown consistency_mode: {self.consistency_mode}")
+                losses["loss_setpp_consistency"] = consistency * warmup
 
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
@@ -618,6 +763,8 @@ class Criterion(nn.Module):
                 aux_full["target_to_image"] = target_to_image
                 aux_full["mask_num"] = mask_num
                 aux_full["per_target_mode"] = True
+                if "valid_seg_mask" in outputs_without_aux:
+                    aux_full["valid_seg_mask"] = outputs_without_aux["valid_seg_mask"]
                 aux_losses = self.forward_per_target({"aux_outputs": [], **aux_full}, targets)
                 losses.update({k + f"_{i}": v for k, v in aux_losses.items()})
 
@@ -689,16 +836,21 @@ class Criterion(nn.Module):
                 l_dict = self.get_loss(loss, instance_outputs, targets, indices, num_masks)
                 losses.update(l_dict)
 
-        if self.setpp_closed_loop and "valid_seg_mask" in outputs_without_aux:
+        if self.setpp_closed_loop and self.setpp_enable and "valid_seg_mask" in outputs_without_aux:
             losses.update(self.loss_setpp_coverage(outputs_without_aux, targets))
             losses.update(self.loss_setpp_consistency(outputs_without_aux, targets))
 
         # --- Auxiliary losses: strip query 0 from each aux output ---
         if "aux_outputs" in outputs:
             for i, aux_outputs in enumerate(outputs["aux_outputs"]):
-                aux_masks_full = aux_outputs["pred_masks"]
+                aux_full = dict(aux_outputs)
+                if outputs.get("per_target_mode", False):
+                    for key in ("per_target_mode", "target_to_image", "mask_num", "valid_seg_mask"):
+                        if key in outputs and key not in aux_full:
+                            aux_full[key] = outputs[key]
+                aux_masks_full = aux_full["pred_masks"]
                 aux_instance_masks = aux_masks_full[:, 1:, :, :]
-                aux_SEG_logits_full = aux_outputs.get("pred_SEG_logits", None)
+                aux_SEG_logits_full = aux_full.get("pred_SEG_logits", None)
                 if aux_SEG_logits_full is not None:
                     aux_instance_SEG_logits = aux_SEG_logits_full[:, 1:, :]
                 else:
@@ -711,7 +863,7 @@ class Criterion(nn.Module):
                 aux_indices = self.matcher(aux_instance, targets)
                 for loss in self.losses:
                     if loss == 'union':
-                        l_dict = self.get_loss(loss, aux_outputs, targets, None, num_masks, union_targets=union_targets)
+                        l_dict = self.get_loss(loss, aux_full, targets, None, num_masks, union_targets=union_targets)
                         for k, v in l_dict.items():
                             if v is not None:
                                 if self.setpp_closed_loop:

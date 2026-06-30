@@ -49,6 +49,8 @@ def parse_args(args):
     
     parser.add_argument("--save_path", default="./InstructSeg_model", type=str, required=True)
 
+    parser.add_argument("--setpp_enable", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
+    parser.add_argument("--setpp_regroup_set_loss", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
     parser.add_argument("--setpp_closed_loop", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
     parser.add_argument("--setpp_csqr_enable", default=True, type=lambda x: str(x).lower() in ('1', 'true', 'yes'))
     parser.add_argument("--setpp_csqr_fusion_alpha_init", default=0.99, type=float)

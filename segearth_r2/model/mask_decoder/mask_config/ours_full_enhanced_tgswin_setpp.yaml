@@ -1,0 +1,46 @@
+_BASE_: ./maskformer2_swin_base_384_bs16_50ep.yaml
+
+# Full: Enhanced TG-Swin encoder grounding + SET++ decoder set consistency.
+# Coarse evidence / DR-EWTI are explicitly disabled for this config.
+TG_SWIN:
+  ENABLED: True
+  TEXT_DIM: null
+  COND_DIM: 256
+
+  VERSION: "enhanced-wti-v2"
+  ENHANCED_WTI: True
+
+  WTI_RANK: 16
+  WTI_STAGES: [1, 2, 3]
+  WTI_START_LAYER: 0
+
+  BIAS_MAX: 4.0
+  ALPHA_INIT: 0.0
+  RELIABILITY_INIT: 0.0
+
+  USE_SEG_EMBEDDING: True
+  USE_PHRASE_POOL: True
+
+  PER_TARGET_SWING_REPEAT: True
+  USE_SET_TGSWIN_CONTROL: True
+
+  USE_COARSE_EVIDENCE: False
+  USE_DR_EWTI: False
+  USE_EVIDENCE_STATE: False
+
+  HEAD_AWARE: True
+  WTI_HEAD_MIXER: True
+  WTI_PROJECTOR_RATIO: 2.0
+  WTI_PROJECTOR_MAX_HIDDEN: 512
+  WTI_HEAD_MIXER_RATIO: 2.0
+  WTI_HEAD_MIXER_GAMMA_INIT: 0.0
+
+  STAGE_ROUTER: True
+  USE_RELATION_AWARE_POOL: True
+  USE_STAGE_PHRASE: False
+  USE_HYBRID_RELIABILITY: False
+
+  SET_CONTROL_INIT_BIAS: 4.0
+  GATE_MODE: "legacy"
+
+  LOG_STATS: False

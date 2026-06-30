@@ -1,0 +1,10 @@
+_BASE_: ./maskformer2_enhanced_wti_v2_setpp.yaml
+
+# TG-Swin only ablation: encoder grounding without SET++ SET-control bridge.
+TG_SWIN:
+  ENABLED: true
+  VERSION: "enhanced-wti-v2"
+  ENHANCED_WTI: true
+  USE_SET_TGSWIN_CONTROL: false
+  PER_TARGET_SWING_REPEAT: true
+  GATE_MODE: "legacy"

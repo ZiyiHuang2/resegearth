@@ -2,7 +2,10 @@
 set -euo pipefail
 
 ########################################
-# Enhanced WTI v2 + SET control + SET++：Train → Merge → Eval → W&B
+# Full ablation：TG-Swin (Enhanced WTI v2) + SET++ — Train → Merge → Eval → W&B
+#
+# 对应归因实验组：Full（encoder grounding + decoder set consistency）
+# 主入口即本脚本；scripts/train_full.sh 仅为最小 ablation 模板，日常跑 Full 用本脚本。
 #
 # 数据集：LaSeRS | 起点：base-8w merged_model
 #
@@ -11,7 +14,7 @@ set -euo pipefail
 #
 # Override:
 #   MAX_STEPS=50000 bash run_train_merge_test.sh
-#   RUN_TAG=ewti-v2-sc-30k MAX_STEPS=30000 bash run_train_merge_test.sh
+#   RUN_TAG=full-30k MAX_STEPS=30000 bash run_train_merge_test.sh
 ########################################
 
 ########################################
@@ -25,12 +28,14 @@ export NETRC="${NETRC:-/root/rivermind-data/.netrc}"
 export WANDB_DIR="${WANDB_DIR:-/root/rivermind-data/.wandb}"
 
 ########################################
-# SET++ decoder（固定全开）
+# Full = TG-Swin + SET++（归因开关，默认全开）
 ########################################
+SETPP_ENABLE=True
+SETPP_REGROUP_SET_LOSS=True
 SETPP_CLOSED_LOOP=True
 SETPP_CSQR_ENABLE=True
 
-RUN_TAG="${RUN_TAG:-ewti-v2-sc}"
+RUN_TAG="${RUN_TAG:-full}"
 export WANDB_NAME="${WANDB_NAME:-${RUN_TAG}}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
@@ -56,7 +61,7 @@ cd "${REPO_DIR}"
 WARM_START_MODEL="${WARM_START_MODEL:-${RESEG_ROOT}/output/base/standard-base-lasers-siglip1-8w-gd4/merged_model}"
 VISION_TOWER="${RESEG_ROOT}/pretrained_model/CLIP/siglip-so400m-patch14-384"
 VISION_TOWER_MASK="${RESEG_ROOT}/pretrained_model/mask2former/model_final_54b88a.pkl"
-MASK_CONFIG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/maskformer2_enhanced_wti_v2_setpp.yaml}"
+MASK_CONFIG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/ours_full_enhanced_tgswin_setpp.yaml}"
 
 ########################################
 # LaSeRS 数据集配置
@@ -87,8 +92,8 @@ EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-${RUN_TAG}}"
 ########################################
 # Train config（对齐 base-5w LaSeRS preset，SET++ 继续训 50k steps）
 ########################################
-# Enhanced WTI v2：关闭 LLM attention loss 后可开 gradient checkpointing + bs=2
-MAX_STEPS="${MAX_STEPS:-30000}"
+# Enhanced WTI v2：关闭 LLM attention loss 后可 bs=2（gradient checkpointing 默认关）
+MAX_STEPS="${MAX_STEPS:-20000}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 
@@ -104,7 +109,7 @@ LOGGING_STEPS="10"
 BF16="True"
 TF32="False"
 MODEL_MAX_LENGTH="2048"
-GRADIENT_CHECKPOINTING="True"
+GRADIENT_CHECKPOINTING="False"
 DATALOADER_NUM_WORKERS="8"
 
 LORA_R="8"
@@ -210,6 +215,8 @@ merge_ckpt () {
     --lora_r "${LORA_R}" \
     --lora_alpha "${LORA_ALPHA}" \
     --lora_dropout "${LORA_DROPOUT}" \
+    --setpp_enable "${SETPP_ENABLE}" \
+    --setpp_regroup_set_loss "${SETPP_REGROUP_SET_LOSS}" \
     --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
     --setpp_csqr_enable "${SETPP_CSQR_ENABLE}"
 }
@@ -389,7 +396,7 @@ echo "[INFO] RUN_TRAIN=${RUN_TRAIN} RUN_MERGE=${RUN_MERGE} RUN_EVAL=${RUN_EVAL}"
 echo "[INFO] MERGE_CHECKPOINT=${MERGE_CHECKPOINT:-<auto>}"
 echo "[INFO] EVAL_WANDB_PROJECT=${EVAL_WANDB_PROJECT}"
 echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
-echo "[INFO] SET++ closed_loop=True csqr=True"
+echo "[INFO] Full ablation: TG-Swin=ON (mask_config) + SET++ enable=${SETPP_ENABLE} regroup=${SETPP_REGROUP_SET_LOSS} closed_loop=${SETPP_CLOSED_LOOP} csqr=${SETPP_CSQR_ENABLE}"
 echo "[INFO] RUN_CROSS_DATASET_EVAL=${RUN_CROSS_DATASET_EVAL} (5 datasets test parallel)"
 
 if [[ ! -d "${WARM_START_MODEL}" ]]; then
@@ -476,7 +483,7 @@ if [[ "${RUN_TRAIN}" != "1" ]]; then
   echo "========================================"
 else
 echo "========================================"
-echo "[1/6] Training Enhanced WTI v2 + SET control + SET++ on LaSeRS (holdout eval)"
+echo "[1/6] Training Full (TG-Swin + SET++) on LaSeRS (holdout eval)"
 echo "========================================"
 
 assert_gpu_available
@@ -515,6 +522,8 @@ assert_gpu_available
   --data_seed "${DATA_SEED}" \
   --lasers_holdout_ratio "${LASERS_HOLDOUT_RATIO}" \
   --lasers_holdout_seed "${DATA_SEED}" \
+  --setpp_enable "${SETPP_ENABLE}" \
+  --setpp_regroup_set_loss "${SETPP_REGROUP_SET_LOSS}" \
   --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
   --setpp_csqr_enable "${SETPP_CSQR_ENABLE}" \
   --report_to wandb

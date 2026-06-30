@@ -9,6 +9,11 @@ import torch
 import torch.nn as nn
 
 
+def _scalar_param(value: float) -> nn.Parameter:
+    """1-element parameter for HF safetensors / meta-init compatibility."""
+    return nn.Parameter(torch.tensor([value], dtype=torch.float32))
+
+
 class StageWTIKeyBias(nn.Module):
     """v1: per-key token bias [BW, 1, 1, N]."""
 
@@ -34,7 +39,7 @@ class StageWTIKeyBias(nn.Module):
         self.visual_proj = nn.Linear(dim, rank, bias=False)
         self.score_proj = nn.Linear(rank, self.N, bias=False)
         nn.init.normal_(self.score_proj.weight, std=1e-3)
-        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        self.alpha = _scalar_param(alpha_init)
 
     def compute_raw_bias(self, x_windows, text_cond, reliability):
         bw, _, _ = x_windows.shape
@@ -97,7 +102,7 @@ class StageWTIHeadAware(nn.Module):
         for m in (self.visual_q, self.visual_k, self.text_q, self.text_k):
             nn.init.normal_(m.weight, std=1e-3)
 
-        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        self.alpha = _scalar_param(alpha_init)
         self.state_proj: Optional[nn.Linear] = None
 
     def set_state_proj(self, state_proj: nn.Linear):
@@ -186,6 +191,8 @@ class StageEnhancedWTIHeadAware(nn.Module):
         use_head_mixer: bool = True,
         head_mixer_ratio: float = 2.0,
         gamma_init: float = 0.0,
+        gate_mode: str = "legacy",
+        bias_scale_init: float = 0.1,
     ):
         super().__init__()
         self.dim = dim
@@ -196,6 +203,7 @@ class StageEnhancedWTIHeadAware(nn.Module):
         self.bias_max = bias_max
         self.stage_scale = stage_scale
         self.use_head_mixer = use_head_mixer
+        self.gate_mode = str(gate_mode).lower()
         H, r = num_heads, rank
         hr = H * r
 
@@ -227,13 +235,19 @@ class StageEnhancedWTIHeadAware(nn.Module):
                 nn.GELU(),
                 nn.Linear(mixer_hidden, num_heads),
             )
-            self.head_mixer_gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
+            self.head_mixer_gamma = _scalar_param(gamma_init)
         else:
             self.head_mixer_norm = None
             self.head_mixer = None
             self.head_mixer_gamma = None
 
-        self.alpha = nn.Parameter(torch.tensor(alpha_init, dtype=torch.float32))
+        self.alpha = _scalar_param(alpha_init)
+
+        if self.gate_mode == "set_lite":
+            init = torch.tensor(bias_scale_init, dtype=torch.float32).clamp(1e-4, 1 - 1e-4)
+            self.bias_scale_logit = nn.Parameter(torch.logit(init))
+        else:
+            self.bias_scale_logit = None
 
     @staticmethod
     def _broadcast_text_cond(text_cond: torch.Tensor, bw: int) -> torch.Tensor:
@@ -289,17 +303,29 @@ class StageEnhancedWTIHeadAware(nn.Module):
         reliability: torch.Tensor,
         set_control: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bw = x_windows.shape[0]
-        batch_size = text_cond.shape[0]
-        num_windows = bw // batch_size
-        rel = reliability.view(batch_size, -1)[:, :1]
-        rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
-
         raw_bias = self.compute_raw_bias(x_windows, text_cond, reliability)
-        gate = torch.tanh(self.alpha) * self.stage_scale * rel
-        if set_control is not None:
-            gate = gate * set_control
-        attn_bias = raw_bias * gate
+
+        if self.gate_mode == "set_lite":
+            global_scale = torch.sigmoid(self.bias_scale_logit)
+
+            if set_control is not None:
+                set_mod = 0.5 + set_control
+            else:
+                set_mod = 1.0
+
+            gate = global_scale * set_mod
+            attn_bias = raw_bias * gate
+        else:
+            bw = x_windows.shape[0]
+            batch_size = text_cond.shape[0]
+            num_windows = bw // batch_size
+            rel = reliability.view(batch_size, -1)[:, :1]
+            rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
+
+            gate = torch.tanh(self.alpha) * self.stage_scale * rel
+            if set_control is not None:
+                gate = gate * set_control
+            attn_bias = raw_bias * gate
         return attn_bias, raw_bias, gate
 
     def stats(self, attn_bias, raw_bias, gate, reliability, set_control=None):
@@ -312,6 +338,7 @@ class StageEnhancedWTIHeadAware(nn.Module):
         if self.head_mixer_gamma is not None:
             mixer_gamma = float(torch.tanh(self.head_mixer_gamma).item())
         st = {
+            "gate_mode": self.gate_mode,
             "alpha": float(torch.tanh(self.alpha).item()),
             "head_mixer_gamma": mixer_gamma,
             "bias_abs_mean": float(attn_bias.abs().mean().item()) if attn_bias is not None else 0.0,
@@ -320,6 +347,8 @@ class StageEnhancedWTIHeadAware(nn.Module):
             "reliability_mean": float(reliability.mean().item()) if reliability is not None else 0.0,
             "head_bias_entropy": ent,
         }
+        if self.gate_mode == "set_lite" and self.bias_scale_logit is not None:
+            st["bias_scale"] = float(torch.sigmoid(self.bias_scale_logit).item())
         if set_control is not None:
             st["set_control_mean"] = float(set_control.detach().mean().cpu())
         return st
@@ -358,6 +387,7 @@ class TGSwimController(nn.Module):
         wti_head_mixer: bool = True,
         wti_head_mixer_ratio: float = 2.0,
         wti_head_mixer_gamma_init: float = 0.0,
+        gate_mode: str = "legacy",
     ):
         super().__init__()
         self.cond_dim = cond_dim
@@ -368,6 +398,7 @@ class TGSwimController(nn.Module):
         self.log_stats = log_stats
         self.head_aware = head_aware
         self.enhanced_wti = enhanced_wti
+        self.gate_mode = str(gate_mode).lower()
         self.num_text_stages = num_text_stages
         self.use_evidence_state = use_evidence_state
         self.evidence_state_dim = evidence_state_dim
@@ -441,6 +472,7 @@ class TGSwimController(nn.Module):
                     use_head_mixer=wti_head_mixer,
                     head_mixer_ratio=wti_head_mixer_ratio,
                     gamma_init=wti_head_mixer_gamma_init,
+                    gate_mode=self.gate_mode,
                 )
             block = wti_cls(**block_kwargs)
             if use_evidence_state and self.state_proj is not None and hasattr(block, "set_state_proj"):

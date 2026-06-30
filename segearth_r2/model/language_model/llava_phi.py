@@ -1,6 +1,7 @@
 from typing import List, Optional, Tuple, Union
 from addict import Dict
 from dataclasses import dataclass
+import os
 import torch.nn.functional as F
 import fvcore.nn.weight_init as weight_init
 import numpy as np
@@ -28,6 +29,19 @@ from ..datasets_mapper.IVS_mapper import IVSDatasetMapper
 from segearth_r2.model.mask_decoder.mask_criterion.Mask_Criterion import Criterion, hungarian_matcher_InstructSeg
 from transformers import PhiModel, PhiForCausalLM, PhiConfig
 from fvcore.nn import FlopCountAnalysis
+
+@dataclass
+class FullTGSwinInputs:
+    """Prepared tensors for Full per-target TG-Swin encoder path."""
+    SEG_embedding: torch.Tensor
+    SET_embedding_t: torch.Tensor
+    SET_embedding_b: torch.Tensor
+    text_cond: torch.Tensor
+    reliability: torch.Tensor
+    set_control: Optional[torch.Tensor]
+    target_to_image: torch.Tensor
+    n_target: int
+
 
 @dataclass
 class CausalOutputWithMask(CausalLMOutputWithPast):
@@ -123,11 +137,100 @@ class SegEarthR2Model(MiphaPhiModel):
         vision_tower_mask.image_processor = IVSDatasetMapper(self.cfg)
 
 class SegEarthR2(MiphaPhiForCausalLM):
+    _SCALAR_PARAM_SUFFIXES = (
+        '.alpha',
+        '.head_mixer_gamma',
+        '.fusion_alpha_logit',
+        '.reliability_logit',
+        '.evidence_relation_gate',
+    )
+
+    @staticmethod
+    def _reshape_scalar_tensors(state_dict: dict) -> dict:
+        state_dict = dict(state_dict)
+        for key, tensor in list(state_dict.items()):
+            if not any(key.endswith(suffix) for suffix in SegEarthR2._SCALAR_PARAM_SUFFIXES):
+                continue
+            if getattr(tensor, 'ndim', None) == 0:
+                state_dict[key] = tensor.reshape(1)
+        return state_dict
+
+    @staticmethod
+    def _load_folder_checkpoint_state_dict(model_path: str) -> dict:
+        import json
+        import os
+
+        from safetensors.torch import load_file
+
+        index_path = os.path.join(model_path, 'model.safetensors.index.json')
+        if os.path.isfile(index_path):
+            with open(index_path, encoding='utf-8') as f:
+                index = json.load(f)
+            state_dict = {}
+            for shard in sorted(set(index['weight_map'].values())):
+                state_dict.update(load_file(os.path.join(model_path, shard)))
+            return state_dict
+
+        single_path = os.path.join(model_path, 'model.safetensors')
+        if os.path.isfile(single_path):
+            return load_file(single_path)
+        return {}
+
+    @classmethod
+    def _prepare_checkpoint_state_dict(cls, state_dict: dict) -> dict:
+        """Reshape 0-d scalar checkpoints to [1] for HF meta-init compatibility."""
+        return cls._reshape_scalar_tensors(state_dict)
+
+    @classmethod
+    def _repair_scalar_checkpoint_params(cls, model, model_path: str) -> None:
+        """HF renames head_mixer_gamma->head_mixer_weight on meta load; repair from disk."""
+        state_dict = cls._load_folder_checkpoint_state_dict(model_path)
+        if not state_dict:
+            return
+        scalar_sd = cls._reshape_scalar_tensors({
+            k: v for k, v in state_dict.items()
+            if any(k.endswith(suffix) for suffix in cls._SCALAR_PARAM_SUFFIXES)
+        })
+        if scalar_sd:
+            model.load_state_dict(scalar_sd, strict=False)
+
     @classmethod
     def from_pretrained(cls, *model_args, **kwargs):
         requested_loading_info = kwargs.pop('output_loading_info', False)
         kwargs['output_loading_info'] = True
-        model, loading_info = super().from_pretrained(*model_args, **kwargs)
+
+        if kwargs.get('state_dict') is None and model_args:
+            model_path = model_args[0]
+            if isinstance(model_path, str) and os.path.isdir(model_path):
+                raw_state_dict = cls._load_folder_checkpoint_state_dict(model_path)
+                if raw_state_dict:
+                    kwargs['state_dict'] = cls._prepare_checkpoint_state_dict(raw_state_dict)
+
+        import transformers.modeling_utils as modeling_utils
+        _orig_set_module = modeling_utils.set_module_tensor_to_device
+
+        def _set_module_with_scalar_fix(model, param_name, device, *args, **set_module_kwargs):
+            if args:
+                value = args[0]
+                rest = args[1:]
+                if value is not None and getattr(value, 'ndim', None) == 0 and value.numel() == 1:
+                    value = value.reshape(1)
+                return _orig_set_module(model, param_name, device, value, *rest, **set_module_kwargs)
+            value = set_module_kwargs.get('value')
+            if value is not None and getattr(value, 'ndim', None) == 0 and value.numel() == 1:
+                set_module_kwargs = dict(set_module_kwargs)
+                set_module_kwargs['value'] = value.reshape(1)
+            return _orig_set_module(model, param_name, device, **set_module_kwargs)
+
+        modeling_utils.set_module_tensor_to_device = _set_module_with_scalar_fix
+        try:
+            model, loading_info = super().from_pretrained(*model_args, **kwargs)
+        finally:
+            modeling_utils.set_module_tensor_to_device = _orig_set_module
+
+        if model_args and isinstance(model_args[0], str) and os.path.isdir(model_args[0]):
+            cls._repair_scalar_checkpoint_params(model, model_args[0])
+
         if any(k.startswith('SET_token_projector') for k in loading_info.get('missing_keys', [])):
             model._copy_set_projector_from_seg()
         if requested_loading_info:
@@ -230,17 +333,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             if seg.bias is not None and setp.bias is not None:
                 setp.bias.copy_(seg.bias)
 
-    def _normalize_csqr_state_dict(self, state_dict):
-        normalized = False
-        for key, alpha in list(state_dict.items()):
-            if not key.endswith('csqr_block.fusion_alpha_logit'):
-                continue
-            if getattr(alpha, 'ndim', None) == 0:
-                if not normalized:
-                    state_dict = dict(state_dict)
-                    normalized = True
-                state_dict[key] = alpha.reshape(1)
+    def _normalize_scalar_param_state_dict(self, state_dict):
+        """Reshape 0-d scalar checkpoints to [1] for HF meta-init compatibility."""
+        state_dict = self._prepare_checkpoint_state_dict(state_dict)
         return state_dict
+
+    def _normalize_csqr_state_dict(self, state_dict):
+        return self._normalize_scalar_param_state_dict(state_dict)
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         state_dict = self._normalize_csqr_state_dict(state_dict)
@@ -280,6 +379,141 @@ class SegEarthR2(MiphaPhiForCausalLM):
             return False
         version = str(getattr(cfg, "VERSION", "")).lower()
         return version == "enhanced-wti-v2" or bool(getattr(cfg, "ENHANCED_WTI", False))
+
+    def _assert_full_no_coarse_path(self):
+        """Full enhanced-wti-v2 must not enter coarse / DR-EWTI paths."""
+        if not (self._tg_swin_enabled() and self._is_enhanced_wti_v2()):
+            return
+        cfg = self._get_tg_swin_cfg()
+        if self._use_coarse_evidence():
+            raise RuntimeError("Full enhanced-wti-v2 should not use coarse evidence.")
+        if cfg and bool(getattr(cfg, "USE_DR_EWTI", False)):
+            raise RuntimeError("Full enhanced-wti-v2 should not use DR-EWTI.")
+        if cfg and bool(getattr(cfg, "USE_EVIDENCE_STATE", False)):
+            raise RuntimeError("Full enhanced-wti-v2 should not use evidence state.")
+
+    def _resolve_coarse_evidence(self, images, SEG_embedding, mask_num, set_embedding_b):
+        """Return coarse evidence only for legacy coarse routes; Full path always None."""
+        if self._tg_swin_enabled() and self._is_enhanced_wti_v2():
+            self._assert_full_no_coarse_path()
+            return None
+        if self._use_coarse_evidence():
+            return self.get_shared_coarse_evidence(
+                images, SEG_embedding, mask_num, set_embedding_b=set_embedding_b
+            )
+        return None
+
+    def _log_full_batch_semantics(
+        self,
+        global_step,
+        mask_num,
+        images,
+        images_expanded,
+        SEG_embedding,
+        SET_embedding_b,
+        SET_embedding,
+        text_cond,
+        reliability,
+        set_control,
+        target_to_image,
+    ):
+        if not getattr(self.config, "debug_batch_semantics", False):
+            return
+        if global_step is not None and int(global_step) % 100 != 0:
+            return
+        B = len(mask_num)
+        T = int(sum(mask_num))
+        img_shape = tuple(images.shape) if isinstance(images, torch.Tensor) else f"list[{len(images)}]"
+        exp_shape = tuple(images_expanded.shape) if isinstance(images_expanded, torch.Tensor) else str(images_expanded)
+        set_b_shape = tuple(SET_embedding_b.shape)
+        set_shape = tuple(SET_embedding.shape)
+        tc_shape = tuple(text_cond.shape)
+        sc_shape = tuple(set_control.shape) if set_control is not None else None
+        tti_shape = tuple(target_to_image.shape) if target_to_image is not None else None
+        print(
+            f"[Full batch semantics] step={global_step}\n"
+            f"  B={B} T={T}\n"
+            f"  images.shape={img_shape}\n"
+            f"  images_expanded.shape={exp_shape}\n"
+            f"  SEG_embedding.shape={tuple(SEG_embedding.shape)}\n"
+            f"  SET_embedding_b.shape={set_b_shape}\n"
+            f"  SET_embedding (repeated).shape={set_shape}\n"
+            f"  text_cond.shape={tc_shape}\n"
+            f"  reliability.shape={tuple(reliability.shape) if reliability is not None else None}\n"
+            f"  set_control.shape={sc_shape}\n"
+            f"  target_to_image.shape={tti_shape}\n"
+            f"  per_target_mode=True"
+        )
+
+    def _prepare_full_tg_swin_inputs(
+        self,
+        hidden_states,
+        SEG_token_embedding_indices,
+        SET_token_embedding_indices,
+        refer_span_mask,
+        mask_num,
+    ) -> FullTGSwinInputs:
+        """
+        Full TG-Swin encoder prep: SEG -> text_cond, SET -> set_control.
+        Does not run Swin or pixel decoder.
+        """
+        self._assert_full_no_coarse_path()
+
+        seg_hidden, text_cond, reliability = self.build_text_cond(
+            hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
+        )
+        assert text_cond is not None, "Full TG-Swin requires text_cond from [SEG]."
+        assert reliability is not None, "Full TG-Swin requires reliability from TCF."
+
+        SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
+        n_target = int(SEG_embedding.shape[0])
+        mask_num_sum = int(sum(int(n) for n in mask_num))
+        assert n_target == mask_num_sum, (
+            f"TG_SWIN alignment: SEG targets={n_target} != sum(mask_num)={mask_num_sum}"
+        )
+        assert text_cond.shape[0] == n_target, (
+            f"TG_SWIN alignment: text_cond batch={text_cond.shape[0]} != n_target={n_target}"
+        )
+        if text_cond.dim() == 3:
+            assert text_cond.shape[1] >= 1, "Full TG-Swin expects stage-wise text_cond [T,S,C]."
+        if reliability.dim() == 3:
+            assert reliability.shape[-1] == 1, "reliability should be [T,S,1] or [T,1]."
+
+        SET_embedding_b = self.SET_token_projector(
+            self.get_SET_embedding(hidden_states, SET_token_embedding_indices)
+        )
+        SET_embedding_t = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
+        assert SET_embedding_b.dim() == 3 and SET_embedding_b.shape[1] == 1, (
+            f"SET_embedding_b should be [B,1,C], got {tuple(SET_embedding_b.shape)}"
+        )
+        assert SET_embedding_t.shape[0] == n_target and SET_embedding_t.shape[1] == 1, (
+            f"SET_embedding_t should be [T,1,C], got {tuple(SET_embedding_t.shape)}"
+        )
+
+        set_control = self.build_set_control(SET_embedding_t)
+        if self.tg_swin_set_control is not None:
+            assert set_control is not None, (
+                "Full TG-Swin SET control is enabled but set_control is None."
+            )
+            assert set_control.shape[0] == n_target, (
+                f"TG_SWIN alignment: set_control batch={set_control.shape[0]} != n_target={n_target}"
+            )
+            if set_control.dim() == 3:
+                assert set_control.shape[-1] == 1, (
+                    f"set_control should be [T,S,1], got {tuple(set_control.shape)}"
+                )
+
+        target_to_image = self._build_target_to_image(mask_num, hidden_states.device)
+        return FullTGSwinInputs(
+            SEG_embedding=SEG_embedding,
+            SET_embedding_t=SET_embedding_t,
+            SET_embedding_b=SET_embedding_b,
+            text_cond=text_cond,
+            reliability=reliability,
+            set_control=set_control,
+            target_to_image=target_to_image,
+            n_target=n_target,
+        )
 
     def _init_tg_swin_modules(self):
         cfg = self._get_tg_swin_cfg()
@@ -346,6 +580,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             wti_head_mixer=bool(getattr(cfg, "WTI_HEAD_MIXER", True)),
             wti_head_mixer_ratio=float(getattr(cfg, "WTI_HEAD_MIXER_RATIO", 2.0)),
             wti_head_mixer_gamma_init=float(getattr(cfg, "WTI_HEAD_MIXER_GAMMA_INIT", 0.0)),
+            gate_mode=str(getattr(cfg, "GATE_MODE", "legacy")).lower(),
         )
         use_set_control = bool(getattr(cfg, "USE_SET_TGSWIN_CONTROL", False))
         if use_set_control and enhanced_wti:
@@ -481,6 +716,19 @@ class SegEarthR2(MiphaPhiForCausalLM):
         enable_tg_swin=True,
     ):
         swin = self.get_model().get_vision_tower_mask()
+        if (
+            enable_tg_swin
+            and self._tg_swin_enabled()
+            and self._is_enhanced_wti_v2()
+        ):
+            assert text_cond is not None, "Full TG-Swin requires text_cond from [SEG]."
+            assert reliability is not None, "Full TG-Swin requires reliability from TCF."
+            if self.tg_swin_set_control is not None:
+                assert set_control is not None, (
+                    "Full TG-Swin SET control is enabled but set_control is None."
+                )
+            assert coarse_evidence is None, "Full enhanced-wti-v2 must not pass coarse_evidence."
+
         tg_kwargs = {}
         if (
             self._tg_swin_enabled()
@@ -495,6 +743,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 "coarse_evidence": coarse_evidence,
                 "enable_tg_swin": True,
                 "set_control": set_control,
+            }
+        elif self._tg_swin_enabled() and enable_tg_swin:
+            if self._is_enhanced_wti_v2():
+                raise RuntimeError(
+                    "Full enhanced-wti-v2 requires text_cond; refusing silent fallback to plain Swin."
+                )
+            tg_kwargs = {
+                "text_cond": None,
+                "reliability": None,
+                "tg_swin_controller": self.tg_swin_controller,
+                "coarse_evidence": None,
+                "enable_tg_swin": False,
             }
         elif self._tg_swin_enabled():
             tg_kwargs = {
@@ -643,17 +903,35 @@ class SegEarthR2(MiphaPhiForCausalLM):
         mask_weight = cfg.MODEL.MASK_FORMER.MASK_WEIGHT
         # boundary_weight = cfg.MODEL.MASK_FORMER.BOUNDARY_WEIGHT
 
-        setpp_closed_loop = getattr(model_args, 'setpp_closed_loop', True) if model_args else True
+        setpp_enable = getattr(model_args, "setpp_enable", True) if model_args else True
+        setpp_closed_loop = (
+            getattr(model_args, "setpp_closed_loop", True) if model_args else True
+        ) and setpp_enable
         setpp_kwargs = {}
         if model_args is not None:
+            lambda_union_single = getattr(model_args, 'setpp_lambda_union_single', 0.01)
+            lambda_union_multi = getattr(model_args, 'setpp_lambda_union_multi', 0.05)
+            lambda_coverage_single = getattr(model_args, 'setpp_lambda_coverage_single', 0.005)
+            lambda_coverage_multi = getattr(model_args, 'setpp_lambda_coverage_multi', 0.02)
+            lambda_consistency_single = getattr(model_args, 'setpp_lambda_consistency_single', 0.005)
+            lambda_consistency_multi = getattr(model_args, 'setpp_lambda_consistency_multi', 0.02)
+            if not setpp_enable:
+                lambda_union_single = 0.0
+                lambda_union_multi = 0.0
+                lambda_coverage_single = 0.0
+                lambda_coverage_multi = 0.0
+                lambda_consistency_single = 0.0
+                lambda_consistency_multi = 0.0
             setpp_kwargs = dict(
+                setpp_enable=setpp_enable,
+                setpp_regroup_set_loss=getattr(model_args, "setpp_regroup_set_loss", True),
                 setpp_closed_loop=setpp_closed_loop,
-                lambda_union_single=getattr(model_args, 'setpp_lambda_union_single', 0.01),
-                lambda_union_multi=getattr(model_args, 'setpp_lambda_union_multi', 0.05),
-                lambda_coverage_single=getattr(model_args, 'setpp_lambda_coverage_single', 0.005),
-                lambda_coverage_multi=getattr(model_args, 'setpp_lambda_coverage_multi', 0.02),
-                lambda_consistency_single=getattr(model_args, 'setpp_lambda_consistency_single', 0.005),
-                lambda_consistency_multi=getattr(model_args, 'setpp_lambda_consistency_multi', 0.02),
+                lambda_union_single=lambda_union_single,
+                lambda_union_multi=lambda_union_multi,
+                lambda_coverage_single=lambda_coverage_single,
+                lambda_coverage_multi=lambda_coverage_multi,
+                lambda_consistency_single=lambda_consistency_single,
+                lambda_consistency_multi=lambda_consistency_multi,
                 closed_loop_warmup_steps=getattr(model_args, 'setpp_closed_loop_warmup_steps', 2000),
                 consistency_mode=getattr(model_args, 'setpp_consistency_mode', 'seg_align_set'),
             )
@@ -723,10 +1001,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         seg_proj = cfg.MODEL.MASK_FORMER.SEG_PROJ
         seg_fuse_score = cfg.MODEL.MASK_FORMER.FUSE_SCORE
         if model_args is not None:
-            use_csqr = getattr(model_args, 'setpp_csqr_enable', True)
+            setpp_enable = getattr(model_args, "setpp_enable", True)
+            use_csqr = setpp_enable and getattr(model_args, 'setpp_csqr_enable', True)
             csqr_fusion_alpha_init = getattr(model_args, 'setpp_csqr_fusion_alpha_init', 0.99)
         else:
-            use_csqr = getattr(self.config, 'setpp_csqr_enable', False)
+            setpp_enable = getattr(self.config, "setpp_enable", True)
+            use_csqr = setpp_enable and getattr(self.config, 'setpp_csqr_enable', False)
             csqr_fusion_alpha_init = getattr(self.config, 'setpp_csqr_fusion_alpha_init', 0.99)
 
         predictor = MultiScaleMaskedTransformerDecoderForOPTPreTrain(in_channels,
@@ -747,17 +1027,23 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
     def resolve_setpp_flags(self, model_args=None):
         if model_args is not None:
-            use_csqr = getattr(model_args, 'setpp_csqr_enable', True)
-            closed_loop = getattr(model_args, 'setpp_closed_loop', True)
+            setpp_enable = getattr(model_args, "setpp_enable", True)
+            use_csqr = setpp_enable and getattr(model_args, "setpp_csqr_enable", True)
+            closed_loop = setpp_enable and getattr(model_args, "setpp_closed_loop", True)
+            regroup_set_loss = getattr(model_args, "setpp_regroup_set_loss", True)
         else:
-            use_csqr = getattr(self.config, 'setpp_csqr_enable', True)
-            closed_loop = getattr(self.config, 'setpp_closed_loop', True)
-        return bool(use_csqr), bool(closed_loop)
+            setpp_enable = getattr(self.config, "setpp_enable", True)
+            use_csqr = setpp_enable and getattr(self.config, "setpp_csqr_enable", True)
+            closed_loop = setpp_enable and getattr(self.config, "setpp_closed_loop", True)
+            regroup_set_loss = getattr(self.config, "setpp_regroup_set_loss", True)
+        return bool(use_csqr), bool(closed_loop), bool(setpp_enable), bool(regroup_set_loss)
 
     def persist_setpp_config(self, model_args=None):
-        use_csqr, closed_loop = self.resolve_setpp_flags(model_args)
+        use_csqr, closed_loop, setpp_enable, regroup_set_loss = self.resolve_setpp_flags(model_args)
+        self.config.setpp_enable = setpp_enable
         self.config.setpp_csqr_enable = use_csqr
         self.config.setpp_closed_loop = closed_loop
+        self.config.setpp_regroup_set_loss = regroup_set_loss
         return use_csqr, closed_loop
 
     def ensure_setpp_predictor(self, model_args=None):
@@ -765,7 +1051,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if not hasattr(self, 'mask_decoder_cfg') or self.mask_decoder_cfg is None:
             return
 
-        target_use_csqr, _ = self.resolve_setpp_flags(model_args)
+        target_use_csqr, _, _, _ = self.resolve_setpp_flags(model_args)
 
         if not hasattr(self, 'predictor'):
             self.predictor = self.predictor_init(self.mask_decoder_cfg, model_args=model_args)
@@ -1281,37 +1567,33 @@ class SegEarthR2(MiphaPhiForCausalLM):
         else:
             attentions = None
 
-        SET_embedding_b = self.SET_token_projector(self.get_SET_embedding(hidden_states, SET_token_embedding_indices))
         per_target_mode = False
         target_to_image = None
+        SET_embedding_b = None
 
         if per_target_swin:
-            seg_hidden, text_cond, reliability = self.build_text_cond(
-                hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
+            tg_prep = self._prepare_full_tg_swin_inputs(
+                hidden_states,
+                SEG_token_embedding_indices,
+                SET_token_embedding_indices,
+                refer_span_mask,
+                mask_num,
             )
-            SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
-            n_target = SEG_embedding.shape[0]
-            mask_num_tensor = torch.tensor(mask_num, device=hidden_states.device)
-            assert n_target == int(mask_num_tensor.sum().item()), (
-                f"TG_SWIN alignment: SEG targets={n_target} != sum(mask_num)={int(mask_num_tensor.sum().item())}"
-            )
-            target_to_image = self._build_target_to_image(mask_num, hidden_states.device)
-            SET_embedding = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
-            set_control = self.build_set_control(SET_embedding)
-            assert text_cond.shape[0] == n_target, (
-                f"TG_SWIN alignment: text_cond batch={text_cond.shape[0]} != n_target={n_target}"
-            )
-            if set_control is not None:
-                assert set_control.shape[0] == n_target, (
-                    f"TG_SWIN alignment: set_control batch={set_control.shape[0]} != n_target={n_target}"
-                )
+            SEG_embedding = tg_prep.SEG_embedding
+            SET_embedding = tg_prep.SET_embedding_t
+            SET_embedding_b = tg_prep.SET_embedding_b
+            text_cond = tg_prep.text_cond
+            reliability = tg_prep.reliability
+            set_control = tg_prep.set_control
+            target_to_image = tg_prep.target_to_image
             per_target_mode = True
             coarse_evidence = None
-            if self._use_coarse_evidence():
-                coarse_evidence = self.get_shared_coarse_evidence(
-                    images, SEG_embedding, mask_num, set_embedding_b=SET_embedding_b
-                )
             images_expanded = self._repeat_images_per_target(images, mask_num)
+            self._log_full_batch_semantics(
+                global_step, mask_num, images, images_expanded,
+                SEG_embedding, SET_embedding_b, SET_embedding,
+                text_cond, reliability, set_control, target_to_image,
+            )
             image_features = self.get_vision_tower_feature(
                 images_expanded,
                 text_cond=text_cond,
@@ -1323,7 +1605,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
         else:
-            SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
+            SET_embedding_b = self.SET_token_projector(
+                self.get_SET_embedding(hidden_states, SET_token_embedding_indices)
+            )
+            SEG_embedding = self.SEG_token_projector(
+                self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices)
+            )
             SET_embedding = SET_embedding_b
             if image_features is None:
                 image_features = self.get_vision_tower_feature(images)
@@ -1345,6 +1632,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
             mask_outputs["per_target_mode"] = True
             mask_outputs["target_to_image"] = target_to_image
             mask_outputs["mask_num"] = list(mask_num)
+            if "aux_outputs" in mask_outputs:
+                for aux in mask_outputs["aux_outputs"]:
+                    aux["per_target_mode"] = True
+                    aux["target_to_image"] = target_to_image
+                    aux["mask_num"] = list(mask_num)
+                    if "valid_seg_mask" in mask_outputs:
+                        aux["valid_seg_mask"] = mask_outputs["valid_seg_mask"]
 
         # 开始计算loss
         loss = None
@@ -1540,43 +1834,36 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
 
         hidden_states = outputs.last_hidden_state
-        SET_embedding_b = self.SET_token_projector(self.get_SET_embedding(hidden_states, SET_token_embedding_indices))
         per_target_mode = False
 
         if per_target_swin:
-            seg_hidden, text_cond, reliability = self.build_text_cond(
-                hidden_states, SEG_token_embedding_indices, refer_span_mask=refer_span_mask
+            tg_prep = self._prepare_full_tg_swin_inputs(
+                hidden_states,
+                SEG_token_embedding_indices,
+                SET_token_embedding_indices,
+                refer_span_mask,
+                mask_num,
             )
-            SEG_embedding = self.SEG_token_projector(seg_hidden.unsqueeze(1))
-            n_target = SEG_embedding.shape[0]
-            SET_embedding = self._repeat_set_embedding_per_target(SET_embedding_b, mask_num)
-            set_control = self.build_set_control(SET_embedding)
-            assert text_cond.shape[0] == n_target, (
-                f"TG_SWIN alignment: text_cond batch={text_cond.shape[0]} != n_target={n_target}"
-            )
-            if set_control is not None:
-                assert set_control.shape[0] == n_target, (
-                    f"TG_SWIN alignment: set_control batch={set_control.shape[0]} != n_target={n_target}"
-                )
+            SEG_embedding = tg_prep.SEG_embedding
+            SET_embedding = tg_prep.SET_embedding_t
+            text_cond = tg_prep.text_cond
+            reliability = tg_prep.reliability
+            set_control = tg_prep.set_control
             per_target_mode = True
-            coarse_evidence = None
-            if self._use_coarse_evidence():
-                coarse_evidence = self.get_shared_coarse_evidence(
-                    images, SEG_embedding, mask_num, set_embedding_b=SET_embedding_b
-                )
             images_expanded = self._repeat_images_per_target(images, mask_num)
             image_features = self.get_vision_tower_feature(
                 images_expanded,
                 text_cond=text_cond,
                 reliability=reliability,
                 set_control=set_control,
-                coarse_evidence=coarse_evidence,
+                coarse_evidence=None,
                 enable_tg_swin=True,
             )
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
                 image_features)
             images = [s[0] for s in torch.split(images_expanded, 1, dim=0)]
         else:
+            SET_embedding_b = self.SET_token_projector(self.get_SET_embedding(hidden_states, SET_token_embedding_indices))
             SEG_embedding = self.SEG_token_projector(self.get_SEG_embedding(hidden_states, SEG_token_embedding_indices))
             SET_embedding = SET_embedding_b
             mask_features, transformer_encoder_features, multi_scale_features = self.pixel_decoder.forward_features(
