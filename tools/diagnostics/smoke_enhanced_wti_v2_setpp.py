@@ -99,22 +99,29 @@ def test_identity_init():
         window_size=12,
         rank=r,
         alpha_init=0.0,
+        gate_floor=0.05,
     )
     x_windows = torch.randn(BW, Nw, 256, requires_grad=True)
     text_cond = torch.randn(T, 64, requires_grad=True)
     reliability = torch.ones(T, 1)
 
     set_control = torch.ones(BW, 1, 1, 1)
-    attn_bias, _, _ = block(x_windows, text_cond, reliability, set_control=set_control)
-    assert attn_bias.abs().max().item() == 0.0, "alpha=0 should yield zero attn_bias"
+    attn_bias, raw_bias, gate = block(x_windows, text_cond, reliability, set_control=set_control)
+    assert attn_bias.abs().max().item() > 0, "gate_floor>0 should yield non-zero attn_bias at alpha=0"
+    assert gate.abs().mean().item() > 0, "gate should be non-zero at alpha=0"
 
-    block.alpha.data.fill_(0.05)
+    attn_bias.mean().backward()
+    assert text_cond.grad is not None
+    assert text_cond.grad.abs().sum().item() > 0
+
+    block.zero_grad(set_to_none=True)
+    text_cond.grad = None
     set_control_var = torch.ones(BW, 1, 1, 1, requires_grad=True)
     attn_bias2, _, _ = block(x_windows, text_cond, reliability, set_control=set_control_var)
     attn_bias2.mean().backward()
     assert set_control_var.grad is not None
     assert set_control_var.grad.abs().sum().item() > 0
-    print("[PASS] identity init: alpha=0 -> zero bias; set_control receives grad")
+    print("[PASS] gate_floor init: alpha=0 -> non-zero bias; text_cond/set_control receive grad")
 
 
 def test_enhanced_wti_module():

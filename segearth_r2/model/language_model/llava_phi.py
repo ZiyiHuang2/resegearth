@@ -39,6 +39,7 @@ class FullTGSwinInputs:
     text_cond: torch.Tensor
     reliability: torch.Tensor
     set_control: Optional[torch.Tensor]
+    set_gate_b: Optional[torch.Tensor]
     target_to_image: torch.Tensor
     n_target: int
 
@@ -55,6 +56,8 @@ class CausalOutputWithMask(CausalLMOutputWithPast):
     loss_llm: Optional[torch.FloatTensor] = None
     loss_attention: Optional[torch.FloatTensor] = None
     loss_union: Optional[torch.FloatTensor] = None
+    loss_union_mask: Optional[torch.FloatTensor] = None
+    loss_union_dice: Optional[torch.FloatTensor] = None
     loss_setpp_coverage: Optional[torch.FloatTensor] = None
     loss_setpp_consistency: Optional[torch.FloatTensor] = None
 
@@ -392,6 +395,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
         if cfg and bool(getattr(cfg, "USE_EVIDENCE_STATE", False)):
             raise RuntimeError("Full enhanced-wti-v2 should not use evidence state.")
 
+    def _grouped_setpp_decoder_enabled(self):
+        cfg = self._get_tg_swin_cfg()
+        if cfg is None:
+            return False
+        return bool(getattr(cfg, "GROUPED_SETPP_DECODER", True))
+
     def _resolve_coarse_evidence(self, images, SEG_embedding, mask_num, set_embedding_b):
         """Return coarse evidence only for legacy coarse routes; Full path always None."""
         if self._tg_swin_enabled() and self._is_enhanced_wti_v2():
@@ -416,6 +425,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         reliability,
         set_control,
         target_to_image,
+        grouped_setpp_mode=False,
     ):
         if not getattr(self.config, "debug_batch_semantics", False):
             return
@@ -430,6 +440,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
         tc_shape = tuple(text_cond.shape)
         sc_shape = tuple(set_control.shape) if set_control is not None else None
         tti_shape = tuple(target_to_image.shape) if target_to_image is not None else None
+        mode_str = "grouped_setpp_mode=True" if grouped_setpp_mode else "per_target_mode=True"
         print(
             f"[Full batch semantics] step={global_step}\n"
             f"  B={B} T={T}\n"
@@ -437,12 +448,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
             f"  images_expanded.shape={exp_shape}\n"
             f"  SEG_embedding.shape={tuple(SEG_embedding.shape)}\n"
             f"  SET_embedding_b.shape={set_b_shape}\n"
-            f"  SET_embedding (repeated).shape={set_shape}\n"
+            f"  SET_embedding (decoder input).shape={set_shape}\n"
             f"  text_cond.shape={tc_shape}\n"
             f"  reliability.shape={tuple(reliability.shape) if reliability is not None else None}\n"
-            f"  set_control.shape={sc_shape}\n"
+            f"  set_gate_t.shape={sc_shape}\n"
             f"  target_to_image.shape={tti_shape}\n"
-            f"  per_target_mode=True"
+            f"  {mode_str}"
         )
 
     def _prepare_full_tg_swin_inputs(
@@ -490,20 +501,30 @@ class SegEarthR2(MiphaPhiForCausalLM):
             f"SET_embedding_t should be [T,1,C], got {tuple(SET_embedding_t.shape)}"
         )
 
-        set_control = self.build_set_control(SET_embedding_t)
+        set_gate_b = self.build_set_gate(SET_embedding_b)
+        target_to_image = self._build_target_to_image(mask_num, hidden_states.device)
+        set_gate_t = None
+        if set_gate_b is not None:
+            set_gate_t = set_gate_b[target_to_image]
+        set_control = set_gate_t
         if self.tg_swin_set_control is not None:
-            assert set_control is not None, (
-                "Full TG-Swin SET control is enabled but set_control is None."
+            assert set_gate_b is not None, (
+                "Full TG-Swin SET control is enabled but set_gate_b is None."
             )
-            assert set_control.shape[0] == n_target, (
-                f"TG_SWIN alignment: set_control batch={set_control.shape[0]} != n_target={n_target}"
+            assert set_gate_t is not None, (
+                "Full TG-Swin SET control is enabled but set_gate_t is None."
             )
-            if set_control.dim() == 3:
-                assert set_control.shape[-1] == 1, (
-                    f"set_control should be [T,S,1], got {tuple(set_control.shape)}"
+            assert set_gate_b.shape[0] == len(mask_num), (
+                f"TG_SWIN alignment: set_gate_b batch={set_gate_b.shape[0]} != B={len(mask_num)}"
+            )
+            assert set_gate_t.shape[0] == n_target, (
+                f"TG_SWIN alignment: set_gate_t batch={set_gate_t.shape[0]} != n_target={n_target}"
+            )
+            if set_gate_t.dim() == 3:
+                assert set_gate_t.shape[-1] == 1, (
+                    f"set_gate_t should be [T,S,1], got {tuple(set_gate_t.shape)}"
                 )
 
-        target_to_image = self._build_target_to_image(mask_num, hidden_states.device)
         return FullTGSwinInputs(
             SEG_embedding=SEG_embedding,
             SET_embedding_t=SET_embedding_t,
@@ -511,6 +532,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             text_cond=text_cond,
             reliability=reliability,
             set_control=set_control,
+            set_gate_b=set_gate_b,
             target_to_image=target_to_image,
             n_target=n_target,
         )
@@ -581,6 +603,10 @@ class SegEarthR2(MiphaPhiForCausalLM):
             wti_head_mixer_ratio=float(getattr(cfg, "WTI_HEAD_MIXER_RATIO", 2.0)),
             wti_head_mixer_gamma_init=float(getattr(cfg, "WTI_HEAD_MIXER_GAMMA_INIT", 0.0)),
             gate_mode=str(getattr(cfg, "GATE_MODE", "legacy")).lower(),
+            gate_floor=float(getattr(cfg, "GATE_FLOOR", 0.05)),
+            fixed_stage_bias_scales=list(
+                getattr(cfg, "FIXED_STAGE_BIAS_SCALE", [0.05, 0.05, 0.05])
+            ),
         )
         use_set_control = bool(getattr(cfg, "USE_SET_TGSWIN_CONTROL", False))
         if use_set_control and enhanced_wti:
@@ -699,8 +725,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
         )
         return seg_hidden, text_cond, reliability
 
+    def build_set_gate(self, set_embedding_b):
+        """Image-level SET gate: set_embedding_b [B,1,C] or [B,C] -> set_gate_b [B,S,1]."""
+        if self.tg_swin_set_control is None:
+            return None
+        if set_embedding_b.dim() == 3:
+            set_hidden = set_embedding_b.squeeze(1)
+        else:
+            set_hidden = set_embedding_b
+        return self.tg_swin_set_control(set_hidden)
+
     def build_set_control(self, set_embedding_t):
-        """set_embedding_t: [T, 1, C] after repeat_interleave. Returns [T, S, 1] or None."""
+        """Legacy per-target SET control: set_embedding_t [T,1,C] -> [T,S,1]."""
         if self.tg_swin_set_control is None:
             return None
         set_hidden = set_embedding_t.squeeze(1)
@@ -1568,6 +1604,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
             attentions = None
 
         per_target_mode = False
+        grouped_setpp_mode = False
         target_to_image = None
         SET_embedding_b = None
 
@@ -1580,19 +1617,25 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 mask_num,
             )
             SEG_embedding = tg_prep.SEG_embedding
-            SET_embedding = tg_prep.SET_embedding_t
             SET_embedding_b = tg_prep.SET_embedding_b
             text_cond = tg_prep.text_cond
             reliability = tg_prep.reliability
             set_control = tg_prep.set_control
             target_to_image = tg_prep.target_to_image
-            per_target_mode = True
+            grouped_setpp_mode = self._grouped_setpp_decoder_enabled()
+            if grouped_setpp_mode:
+                per_target_mode = False
+                SET_embedding = SET_embedding_b
+            else:
+                per_target_mode = True
+                SET_embedding = tg_prep.SET_embedding_t
             coarse_evidence = None
             images_expanded = self._repeat_images_per_target(images, mask_num)
             self._log_full_batch_semantics(
                 global_step, mask_num, images, images_expanded,
                 SEG_embedding, SET_embedding_b, SET_embedding,
                 text_cond, reliability, set_control, target_to_image,
+                grouped_setpp_mode=grouped_setpp_mode,
             )
             image_features = self.get_vision_tower_feature(
                 images_expanded,
@@ -1623,12 +1666,53 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 for feat in multi_scale_features
             ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None,
-                                      SEG_embedding=SEG_embedding,
-                                      SET_embedding=SET_embedding,
-                                      mask_num=mask_num if not per_target_mode else None,
-                                      per_target_mode=per_target_mode)
-        if per_target_mode:
+        if grouped_setpp_mode:
+            grouped_memory_banks, grouped_pos_banks, mask_features_bank, slot_valid_mask = (
+                self.predictor.prepare_grouped_banks(
+                    multi_scale_features, mask_features, list(mask_num)
+                )
+            )
+            mask_outputs = self.predictor(
+                multi_scale_features,
+                mask_features,
+                None,
+                None,
+                SEG_embedding=SEG_embedding,
+                SET_embedding=SET_embedding,
+                mask_num=list(mask_num),
+                per_target_mode=False,
+                grouped_setpp_mode=True,
+                grouped_memory_banks=grouped_memory_banks,
+                grouped_pos_banks=grouped_pos_banks,
+                mask_features_bank=mask_features_bank,
+                slot_valid_mask=slot_valid_mask,
+                target_to_image=target_to_image,
+            )
+        else:
+            mask_outputs = self.predictor(
+                multi_scale_features,
+                mask_features,
+                None,
+                None,
+                SEG_embedding=SEG_embedding,
+                SET_embedding=SET_embedding,
+                mask_num=mask_num if not per_target_mode else None,
+                per_target_mode=per_target_mode,
+            )
+        if grouped_setpp_mode:
+            mask_outputs["grouped_setpp_mode"] = True
+            mask_outputs["per_target_mode"] = False
+            mask_outputs["target_to_image"] = target_to_image
+            mask_outputs["mask_num"] = list(mask_num)
+            if "aux_outputs" in mask_outputs:
+                for aux in mask_outputs["aux_outputs"]:
+                    aux["grouped_setpp_mode"] = True
+                    aux["per_target_mode"] = False
+                    aux["target_to_image"] = target_to_image
+                    aux["mask_num"] = list(mask_num)
+                    if "valid_seg_mask" in mask_outputs:
+                        aux["valid_seg_mask"] = mask_outputs["valid_seg_mask"]
+        elif per_target_mode:
             mask_outputs["per_target_mode"] = True
             mask_outputs["target_to_image"] = target_to_image
             mask_outputs["mask_num"] = list(mask_num)
@@ -1639,6 +1723,13 @@ class SegEarthR2(MiphaPhiForCausalLM):
                     aux["mask_num"] = list(mask_num)
                     if "valid_seg_mask" in mask_outputs:
                         aux["valid_seg_mask"] = mask_outputs["valid_seg_mask"]
+
+        if grouped_setpp_mode:
+            from segearth_r2.utils.nan_debug import audit_mask_outputs, enabled as nan_debug_enabled, set_step as set_nan_debug_step
+            if global_step is not None:
+                set_nan_debug_step(global_step)
+            if nan_debug_enabled():
+                audit_mask_outputs(mask_outputs, global_step or 0)
 
         # 开始计算loss
         loss = None
@@ -1662,6 +1753,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
         loss_mask = torch.tensor(0.0, device=hidden_states.device)
         loss_dice = torch.tensor(0.0, device=hidden_states.device)
         loss_union = torch.tensor(0.0, device=hidden_states.device)
+        loss_union_mask = torch.tensor(0.0, device=hidden_states.device)
+        loss_union_dice = torch.tensor(0.0, device=hidden_states.device)
         loss_setpp_coverage = torch.tensor(0.0, device=hidden_states.device)
         loss_setpp_consistency = torch.tensor(0.0, device=hidden_states.device)
         if seg_info is not None:
@@ -1673,7 +1766,7 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
                 targets = self.prepare_targets(gt_instances, images)
             elif 'mask' in seg_info[0]:
-                if per_target_mode:
+                if grouped_setpp_mode or per_target_mode:
                     targets = self._build_flat_seg_targets(
                         seg_info, mask_num, mask_outputs['pred_masks'].device, mask_outputs['pred_masks']
                     )
@@ -1719,6 +1812,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_mask = torch.tensor(0.0, device=hidden_states.device)
             loss_dice = torch.tensor(0.0, device=hidden_states.device)
             loss_union = torch.tensor(0.0, device=hidden_states.device)
+            loss_union_mask = torch.tensor(0.0, device=hidden_states.device)
+            loss_union_dice = torch.tensor(0.0, device=hidden_states.device)
             loss_setpp_coverage = torch.tensor(0.0, device=hidden_states.device)
             loss_setpp_consistency = torch.tensor(0.0, device=hidden_states.device)
         
@@ -1731,6 +1826,12 @@ class SegEarthR2(MiphaPhiForCausalLM):
                         loss_setpp_coverage += mask_losses[k]
                     elif 'consistency' in k:
                         loss_setpp_consistency += mask_losses[k]
+                    elif k == 'loss_union_mask':
+                        loss_union += mask_losses[k]
+                        loss_union_mask += mask_losses[k]
+                    elif k == 'loss_union_dice':
+                        loss_union += mask_losses[k]
+                        loss_union_dice += mask_losses[k]
                     elif 'union' in k:
                         loss_union += mask_losses[k]
                     elif '_mask' in k:
@@ -1780,6 +1881,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
             loss_llm=llm_loss.detach(),
             loss_attention=0.01 * loss_attention.detach(),
             loss_union=loss_union.detach(),
+            loss_union_mask=loss_union_mask.detach(),
+            loss_union_dice=loss_union_dice.detach(),
             loss_setpp_coverage=loss_setpp_coverage.detach(),
             loss_setpp_consistency=loss_setpp_consistency.detach(),
         )
@@ -1835,6 +1938,8 @@ class SegEarthR2(MiphaPhiForCausalLM):
 
         hidden_states = outputs.last_hidden_state
         per_target_mode = False
+        grouped_setpp_mode = False
+        target_to_image = None
 
         if per_target_swin:
             tg_prep = self._prepare_full_tg_swin_inputs(
@@ -1845,11 +1950,18 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 mask_num,
             )
             SEG_embedding = tg_prep.SEG_embedding
-            SET_embedding = tg_prep.SET_embedding_t
+            SET_embedding_b = tg_prep.SET_embedding_b
             text_cond = tg_prep.text_cond
             reliability = tg_prep.reliability
             set_control = tg_prep.set_control
-            per_target_mode = True
+            target_to_image = tg_prep.target_to_image
+            grouped_setpp_mode = self._grouped_setpp_decoder_enabled()
+            if grouped_setpp_mode:
+                per_target_mode = False
+                SET_embedding = SET_embedding_b
+            else:
+                per_target_mode = True
+                SET_embedding = tg_prep.SET_embedding_t
             images_expanded = self._repeat_images_per_target(images, mask_num)
             image_features = self.get_vision_tower_feature(
                 images_expanded,
@@ -1877,13 +1989,43 @@ class SegEarthR2(MiphaPhiForCausalLM):
                 for feat in multi_scale_features
             ]
 
-        mask_outputs = self.predictor(multi_scale_features, mask_features, None, None,
-                                      SEG_embedding=SEG_embedding,
-                                      SET_embedding=SET_embedding,
-                                      mask_num=mask_num if not per_target_mode else None,
-                                      per_target_mode=per_target_mode)
+        if grouped_setpp_mode:
+            grouped_memory_banks, grouped_pos_banks, mask_features_bank, slot_valid_mask = (
+                self.predictor.prepare_grouped_banks(
+                    multi_scale_features, mask_features, list(mask_num)
+                )
+            )
+            mask_outputs = self.predictor(
+                multi_scale_features,
+                mask_features,
+                None,
+                None,
+                SEG_embedding=SEG_embedding,
+                SET_embedding=SET_embedding,
+                mask_num=list(mask_num),
+                per_target_mode=False,
+                grouped_setpp_mode=True,
+                grouped_memory_banks=grouped_memory_banks,
+                grouped_pos_banks=grouped_pos_banks,
+                mask_features_bank=mask_features_bank,
+                slot_valid_mask=slot_valid_mask,
+                target_to_image=target_to_image,
+            )
+        else:
+            mask_outputs = self.predictor(
+                multi_scale_features,
+                mask_features,
+                None,
+                None,
+                SEG_embedding=SEG_embedding,
+                SET_embedding=SET_embedding,
+                mask_num=mask_num if not per_target_mode else None,
+                per_target_mode=per_target_mode,
+            )
 
         mask_pred_results = mask_outputs["pred_masks"]
+        if grouped_setpp_mode:
+            per_target_mode = False
         if per_target_mode:
             if isinstance(images, torch.Tensor):
                 images_list = [images[i] for i in range(images.shape[0])]

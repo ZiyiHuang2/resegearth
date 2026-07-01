@@ -178,9 +178,10 @@ class Criterion(nn.Module):
         valid_seg_mask: [B, Kmax], bool, True=valid
         return: [B, 1, H, W]
         """
-        seg_prob = seg_logits.sigmoid()
+        seg_prob = seg_logits.float().sigmoid()
         seg_prob = seg_prob * valid_seg_mask[:, :, None, None].float()
-        return 1.0 - torch.prod(1.0 - seg_prob, dim=1, keepdim=True)
+        one_minus = (1.0 - seg_prob).clamp(min=1e-6, max=1.0)
+        return 1.0 - torch.prod(one_minus, dim=1, keepdim=True)
 
     def dice_prob_loss(self, pred_prob, tgt_prob, sample_weight=None, eps=1.0):
         """
@@ -227,6 +228,8 @@ class Criterion(nn.Module):
         return torch.tensor(weights, dtype=torch.float32, device=device)
 
     def _use_regrouped_set_loss(self, outputs):
+        if outputs.get("grouped_setpp_mode", False):
+            return False
         return (
             self.setpp_enable
             and self.setpp_regroup_set_loss
@@ -235,15 +238,205 @@ class Criterion(nn.Module):
             and outputs.get("mask_num", None) is not None
         )
 
+    def build_flat_gt_masks_tensor(self, targets_flat, size, device):
+        """Flat per-target targets -> gt_masks_flat [T, 1, H, W]."""
+        if isinstance(size, torch.Size):
+            size = tuple(size[-2:])
+        elif len(size) > 2:
+            size = tuple(size[-2:])
+        rows = []
+        for t in targets_flat:
+            m = t["masks"].float().to(device)
+            if m.ndim == 3:
+                m = m.squeeze(0)
+            if m.shape[-2:] != size:
+                m = F.interpolate(
+                    m.unsqueeze(0).unsqueeze(0),
+                    size=size,
+                    mode="nearest",
+                ).squeeze(0).squeeze(0)
+            rows.append(m)
+        if not rows:
+            return torch.zeros(0, 1, size[0], size[1], device=device)
+        return torch.stack(rows, dim=0).unsqueeze(1)
+
+    def build_union_target_from_flat_targets(self, targets_flat, mask_num, size, device):
+        """Flat per-target targets -> GT union [B, 1, H, W]."""
+        if isinstance(size, torch.Size):
+            size = tuple(size[-2:])
+        elif len(size) > 2:
+            size = tuple(size[-2:])
+        unions = []
+        offset = 0
+        for k in mask_num:
+            k = int(k)
+            if k > 0:
+                mask_list = []
+                for j in range(k):
+                    m = targets_flat[offset + j]["masks"].float().to(device)
+                    if m.ndim == 3:
+                        m = m.squeeze(0)
+                    if m.shape[-2:] != size:
+                        m = F.interpolate(
+                            m.unsqueeze(0).unsqueeze(0),
+                            size=size,
+                            mode="nearest",
+                        ).squeeze(0).squeeze(0)
+                    mask_list.append(m)
+                stacked = torch.stack(mask_list, dim=0)
+                union = (stacked.sum(dim=0, keepdim=True) > 0).float()
+            else:
+                union = torch.zeros(1, size[0], size[1], device=device)
+            unions.append(union)
+            offset += k
+        return torch.stack(unions, dim=0)
+
+    def loss_target_aligned_masks(self, pred_seg_masks_flat, gt_masks_flat):
+        """Slot-aligned target mask loss without matcher. Shapes [T,1,H,W]."""
+        assert pred_seg_masks_flat.shape == gt_masks_flat.shape
+        num_masks = max(int(pred_seg_masks_flat.shape[0]), 1)
+        with torch.no_grad():
+            point_coords = get_uncertain_point_coords_with_randomness(
+                pred_seg_masks_flat.float(),
+                lambda logits: calculate_uncertainty(logits),
+                self.num_points,
+                self.oversample_ratio,
+                self.importance_sample_ratio,
+            )
+            point_labels = point_sample(
+                gt_masks_flat.float(),
+                point_coords,
+                align_corners=False,
+            ).squeeze(1)
+        point_logits = point_sample(
+            pred_seg_masks_flat.float(),
+            point_coords,
+            align_corners=False,
+        ).squeeze(1)
+        return {
+            "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
+            "loss_dice": dice_loss_jit(point_logits, point_labels, num_masks),
+        }
+
+    def loss_target_aligned_seg_logits(self, pred_seg_logits_flat, gt_labels_flat):
+        """Optional SEG label loss on flat aligned slots (binary match, no matcher)."""
+        if pred_seg_logits_flat is None:
+            return {}
+        src_logits = pred_seg_logits_flat.float().reshape(-1)
+        target = torch.ones_like(src_logits)
+        loss_func = nn.BCEWithLogitsLoss()
+        return {"loss_SEG_class": loss_func(src_logits, target)}
+
+    def forward_grouped_setpp(self, outputs, targets):
+        outputs_without_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
+        pred_seg_flat = outputs_without_aux["pred_seg_masks"]
+        size = pred_seg_flat.shape[-2:]
+        device = pred_seg_flat.device
+        gt_masks_flat = self.build_flat_gt_masks_tensor(targets, size, device)
+        assert pred_seg_flat.shape[0] == gt_masks_flat.shape[0], (
+            f"pred/gt target count mismatch: {pred_seg_flat.shape[0]} vs {gt_masks_flat.shape[0]}"
+        )
+
+        mask_num = outputs_without_aux["mask_num"]
+        warmup = self.closed_loop_warmup()
+        weights = self.build_sample_weights_from_mask_num(
+            mask_num,
+            self.lambda_union_single,
+            self.lambda_union_multi,
+            device,
+        )
+        gt_union_b = self.build_union_target_from_flat_targets(
+            targets, mask_num, size, device
+        )
+
+        losses = {}
+        if "masks" in self.losses:
+            losses.update(self.loss_target_aligned_masks(pred_seg_flat, gt_masks_flat))
+        if "SEG_labels" in self.losses:
+            gt_labels = torch.zeros(
+                gt_masks_flat.shape[0], 1, 1, device=device, dtype=pred_seg_flat.dtype
+            )
+            seg_logits = outputs_without_aux.get("pred_seg_logits")
+            if seg_logits is not None:
+                if seg_logits.shape[0] == gt_masks_flat.shape[0]:
+                    seg_logits_flat = seg_logits.reshape(gt_masks_flat.shape[0], 1, 1)
+                else:
+                    grouped = outputs_without_aux.get("pred_seg_logits_grouped", seg_logits)
+                    mask_num = outputs_without_aux["mask_num"]
+                    from segearth_r2.model.mask_decoder.Mask2Former_Simplify.modeling.transformer_decoder.mask2former_transformer_decoder import (
+                        flatten_grouped_seg_logits,
+                    )
+                    seg_logits_flat = flatten_grouped_seg_logits(grouped, mask_num)
+                losses.update(
+                    self.loss_target_aligned_seg_logits(seg_logits_flat, gt_labels)
+                )
+
+        if "union" in self.losses:
+            pred_set = outputs_without_aux["pred_set_union_mask"].float()
+            gt_union_fp32 = gt_union_b.float()
+            bce = F.binary_cross_entropy_with_logits(
+                pred_set, gt_union_fp32, reduction="none",
+            ).flatten(1).mean(dim=1)
+            bce = (bce * weights).mean()
+            dice = self.dice_prob_loss(pred_set.sigmoid(), gt_union_fp32, sample_weight=weights)
+            if self.setpp_closed_loop:
+                losses["loss_union_mask"] = bce * warmup
+                losses["loss_union_dice"] = dice * warmup
+            else:
+                warmup_factor = self._get_union_warmup_factor()
+                k1_scale = weights.mean()
+                losses["loss_union_mask"] = bce * self.union_weight * warmup_factor * k1_scale
+                losses["loss_union_dice"] = dice * self.union_weight * warmup_factor * k1_scale
+
+        if self.setpp_closed_loop and self.setpp_enable and "valid_seg_mask" in outputs_without_aux:
+            seg_grouped = outputs_without_aux["pred_seg_masks_grouped"]
+            valid = outputs_without_aux["valid_seg_mask"]
+            seg_union = self.soft_union(seg_grouped, valid)
+            coverage = self.dice_prob_loss(seg_union, gt_union_b, sample_weight=weights)
+            losses["loss_setpp_coverage"] = coverage * warmup
+
+            set_prob = outputs_without_aux["pred_set_union_mask"].float().sigmoid()
+            if self.consistency_mode == "seg_align_set":
+                consistency = self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=weights)
+            elif self.consistency_mode == "set_align_seg":
+                consistency = self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=weights)
+            elif self.consistency_mode == "bidirectional":
+                consistency = (
+                    self.dice_prob_loss(seg_union, set_prob.detach(), sample_weight=weights)
+                    + 0.5 * self.dice_prob_loss(set_prob, seg_union.detach(), sample_weight=weights)
+                )
+            else:
+                raise ValueError(f"Unknown consistency_mode: {self.consistency_mode}")
+            losses["loss_setpp_consistency"] = consistency * warmup
+
+        if "aux_outputs" in outputs:
+            for i, aux_outputs in enumerate(outputs["aux_outputs"]):
+                aux_full = dict(aux_outputs)
+                for key in ("grouped_setpp_mode", "per_target_mode", "target_to_image", "mask_num", "valid_seg_mask"):
+                    if key in outputs_without_aux and key not in aux_full:
+                        aux_full[key] = outputs_without_aux[key]
+                if "pred_seg_masks" in aux_full and "masks" in self.losses:
+                    aux_losses = self.loss_target_aligned_masks(
+                        aux_full["pred_seg_masks"], gt_masks_flat
+                    )
+                    losses.update({k + f"_{i}": v for k, v in aux_losses.items()})
+        from segearth_r2.utils.nan_debug import audit_criterion_grouped, current_step, enabled as nan_debug_enabled
+        if nan_debug_enabled():
+            audit_criterion_grouped(
+                outputs_without_aux, losses, gt_masks_flat, gt_union_b, current_step()
+            )
+        return losses
+
     def regroup_per_target_union(self, pred_logits_t, target_to_image, batch_size):
         """pred_logits_t: [T, 1, H, W] logits -> [B, 1, H, W] probability union."""
-        prob = pred_logits_t.sigmoid()
+        prob = pred_logits_t.float().sigmoid()
         unions = []
         for b in range(batch_size):
             idx = target_to_image == b
             if idx.any():
                 p = prob[idx]
-                union = 1.0 - torch.prod(1.0 - p, dim=0)
+                one_minus = (1.0 - p).clamp(min=1e-6, max=1.0)
+                union = 1.0 - torch.prod(one_minus, dim=0)
             else:
                 union = torch.zeros_like(prob[0])
             unions.append(union)
@@ -771,6 +964,8 @@ class Criterion(nn.Module):
         return losses
 
     def forward(self, outputs, targets):
+        if outputs.get("grouped_setpp_mode", False):
+            return self.forward_grouped_setpp(outputs, targets)
         if outputs.get("per_target_mode", False):
             return self.forward_per_target(outputs, targets)
 

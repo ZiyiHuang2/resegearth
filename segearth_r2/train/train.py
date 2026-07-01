@@ -302,9 +302,13 @@ def collect_experiment_flags(model_args, data_args, training_args, mask_cfg):
     enhanced_wti = bool(_tg_swin_cfg_get(mask_cfg, "ENHANCED_WTI", False))
     use_set_control = bool(_tg_swin_cfg_get(mask_cfg, "USE_SET_TGSWIN_CONTROL", False))
     per_target_repeat = bool(_tg_swin_cfg_get(mask_cfg, "PER_TARGET_SWING_REPEAT", True))
+    grouped_setpp_decoder = bool(_tg_swin_cfg_get(mask_cfg, "GROUPED_SETPP_DECODER", True))
     use_coarse = bool(_tg_swin_cfg_get(mask_cfg, "USE_COARSE_EVIDENCE", False))
     use_dr = bool(_tg_swin_cfg_get(mask_cfg, "USE_DR_EWTI", False))
     gate_mode = str(_tg_swin_cfg_get(mask_cfg, "GATE_MODE", "legacy")).lower()
+    fixed_stage_bias_scale = list(
+        _tg_swin_cfg_get(mask_cfg, "FIXED_STAGE_BIAS_SCALE", [0.05, 0.05, 0.05])
+    )
     setpp_enable = bool(getattr(model_args, "setpp_enable", True))
     setpp_csqr = bool(getattr(model_args, "setpp_csqr_enable", True))
     setpp_closed = bool(getattr(model_args, "setpp_closed_loop", True))
@@ -331,6 +335,7 @@ def collect_experiment_flags(model_args, data_args, training_args, mask_cfg):
         "use_coarse_evidence": use_coarse,
         "use_dr_ewti": use_dr,
         "gate_mode": gate_mode,
+        "fixed_stage_bias_scale": fixed_stage_bias_scale,
         "setpp_enable": setpp_enable,
         "setpp_csqr_enable": setpp_csqr,
         "setpp_closed_loop": setpp_closed,
@@ -340,11 +345,13 @@ def collect_experiment_flags(model_args, data_args, training_args, mask_cfg):
         "TG_SWIN.ENHANCED_WTI": enhanced_wti,
         "TG_SWIN.USE_SET_TGSWIN_CONTROL": use_set_control,
         "TG_SWIN.PER_TARGET_SWING_REPEAT": per_target_repeat,
+        "TG_SWIN.GROUPED_SETPP_DECODER": grouped_setpp_decoder,
         "TG_SWIN.USE_COARSE_EVIDENCE": use_coarse,
         "TG_SWIN.USE_DR_EWTI": use_dr,
         "TG_SWIN.WTI_STAGES": list(_tg_swin_cfg_get(mask_cfg, "WTI_STAGES", [])),
         "TG_SWIN.WTI_START_LAYER": int(_tg_swin_cfg_get(mask_cfg, "WTI_START_LAYER", 0)),
         "TG_SWIN.GATE_MODE": gate_mode,
+        "TG_SWIN.FIXED_STAGE_BIAS_SCALE": fixed_stage_bias_scale,
         "model_args.setpp_enable": setpp_enable,
         "model_args.setpp_csqr_enable": setpp_csqr,
         "model_args.setpp_closed_loop": setpp_closed,

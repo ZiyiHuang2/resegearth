@@ -14,6 +14,11 @@ def _scalar_param(value: float) -> nn.Parameter:
     return nn.Parameter(torch.tensor([value], dtype=torch.float32))
 
 
+def _alpha_gate_term(alpha: torch.Tensor, gate_floor: float) -> torch.Tensor:
+    """Non-zero gate floor so main loss can backprop through raw_bias at alpha=0."""
+    return gate_floor + torch.tanh(alpha)
+
+
 class StageWTIKeyBias(nn.Module):
     """v1: per-key token bias [BW, 1, 1, N]."""
 
@@ -27,6 +32,7 @@ class StageWTIKeyBias(nn.Module):
         bias_max: float = 4.0,
         alpha_init: float = 0.0,
         stage_scale: float = 1.0,
+        gate_floor: float = 0.05,
     ):
         super().__init__()
         self.dim = dim
@@ -35,6 +41,7 @@ class StageWTIKeyBias(nn.Module):
         self.N = window_size * window_size
         self.bias_max = bias_max
         self.stage_scale = stage_scale
+        self.gate_floor = gate_floor
         self.text_proj = nn.Linear(cond_dim, rank, bias=False)
         self.visual_proj = nn.Linear(dim, rank, bias=False)
         self.score_proj = nn.Linear(rank, self.N, bias=False)
@@ -58,12 +65,15 @@ class StageWTIKeyBias(nn.Module):
         rel = reliability.view(batch_size, -1)[:, :1]
         rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1)
         raw = self.compute_raw_bias(x_windows, text_cond, reliability)
-        gate = torch.tanh(self.alpha) * self.stage_scale * rel
+        gate = _alpha_gate_term(self.alpha, self.gate_floor) * self.stage_scale * rel
         return (raw * gate).unsqueeze(1).unsqueeze(1), raw, gate
 
     def stats(self, attn_bias, raw_bias, gate, reliability):
+        alpha_term = _alpha_gate_term(self.alpha, self.gate_floor)
         return {
             "alpha": float(torch.tanh(self.alpha).item()),
+            "alpha_term": float(alpha_term.item()),
+            "gate_abs_mean": float(gate.abs().mean().item()) if gate is not None else 0.0,
             "bias_abs_mean": float(attn_bias.abs().mean().item()) if attn_bias is not None else 0.0,
             "bias_abs_max": float(attn_bias.abs().max().item()) if attn_bias is not None else 0.0,
             "raw_bias_abs_mean": float(raw_bias.abs().mean().item()) if raw_bias is not None else 0.0,
@@ -84,6 +94,7 @@ class StageWTIHeadAware(nn.Module):
         bias_max: float = 4.0,
         alpha_init: float = 0.0,
         stage_scale: float = 1.0,
+        gate_floor: float = 0.05,
     ):
         super().__init__()
         self.dim = dim
@@ -93,6 +104,7 @@ class StageWTIHeadAware(nn.Module):
         self.rank = rank
         self.bias_max = bias_max
         self.stage_scale = stage_scale
+        self.gate_floor = gate_floor
         hr = num_heads * rank
 
         self.visual_q = nn.Linear(dim, hr, bias=False)
@@ -153,7 +165,7 @@ class StageWTIHeadAware(nn.Module):
         rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
 
         raw_bias = self.compute_raw_bias(x_windows, text_cond, reliability, evidence_state=evidence_state)
-        gate = torch.tanh(self.alpha) * self.stage_scale * rel
+        gate = _alpha_gate_term(self.alpha, self.gate_floor) * self.stage_scale * rel
         attn_bias = raw_bias * gate
         return attn_bias, raw_bias, gate
 
@@ -163,8 +175,11 @@ class StageWTIHeadAware(nn.Module):
         if head_mean is not None and head_mean.sum() > 0:
             p = head_mean / head_mean.sum().clamp_min(1e-8)
             ent = float(-(p * (p + 1e-8).log()).sum().item())
+        alpha_term = _alpha_gate_term(self.alpha, self.gate_floor)
         return {
             "alpha": float(torch.tanh(self.alpha).item()),
+            "alpha_term": float(alpha_term.item()),
+            "gate_abs_mean": float(gate.abs().mean().item()) if gate is not None else 0.0,
             "bias_abs_mean": float(attn_bias.abs().mean().item()) if attn_bias is not None else 0.0,
             "bias_abs_max": float(attn_bias.abs().max().item()) if attn_bias is not None else 0.0,
             "raw_bias_abs_mean": float(raw_bias.abs().mean().item()) if raw_bias is not None else 0.0,
@@ -193,6 +208,8 @@ class StageEnhancedWTIHeadAware(nn.Module):
         gamma_init: float = 0.0,
         gate_mode: str = "legacy",
         bias_scale_init: float = 0.1,
+        gate_floor: float = 0.05,
+        fixed_stage_bias_scale: float = 0.05,
     ):
         super().__init__()
         self.dim = dim
@@ -202,6 +219,8 @@ class StageEnhancedWTIHeadAware(nn.Module):
         self.rank = rank
         self.bias_max = bias_max
         self.stage_scale = stage_scale
+        self.gate_floor = gate_floor
+        self.fixed_stage_bias_scale = float(fixed_stage_bias_scale)
         self.use_head_mixer = use_head_mixer
         self.gate_mode = str(gate_mode).lower()
         H, r = num_heads, rank
@@ -315,6 +334,18 @@ class StageEnhancedWTIHeadAware(nn.Module):
 
             gate = global_scale * set_mod
             attn_bias = raw_bias * gate
+        elif self.gate_mode == "no_alpha_fixed":
+            bw = x_windows.shape[0]
+            batch_size = text_cond.shape[0]
+            num_windows = bw // batch_size
+            rel = reliability.view(batch_size, -1)[:, :1]
+            rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
+
+            beta_s = self.fixed_stage_bias_scale
+            gate = beta_s * rel
+            if set_control is not None:
+                gate = gate * set_control
+            attn_bias = raw_bias * gate
         else:
             bw = x_windows.shape[0]
             batch_size = text_cond.shape[0]
@@ -322,7 +353,8 @@ class StageEnhancedWTIHeadAware(nn.Module):
             rel = reliability.view(batch_size, -1)[:, :1]
             rel = rel.unsqueeze(1).expand(batch_size, num_windows, 1).reshape(bw, 1, 1, 1)
 
-            gate = torch.tanh(self.alpha) * self.stage_scale * rel
+            alpha_term = _alpha_gate_term(self.alpha, self.gate_floor)
+            gate = alpha_term * self.stage_scale * rel
             if set_control is not None:
                 gate = gate * set_control
             attn_bias = raw_bias * gate
@@ -339,18 +371,26 @@ class StageEnhancedWTIHeadAware(nn.Module):
             mixer_gamma = float(torch.tanh(self.head_mixer_gamma).item())
         st = {
             "gate_mode": self.gate_mode,
-            "alpha": float(torch.tanh(self.alpha).item()),
+            "gate_abs_mean": float(gate.abs().mean().item()) if gate is not None else 0.0,
             "head_mixer_gamma": mixer_gamma,
             "bias_abs_mean": float(attn_bias.abs().mean().item()) if attn_bias is not None else 0.0,
+            "attn_bias_abs_mean": float(attn_bias.abs().mean().item()) if attn_bias is not None else 0.0,
             "bias_abs_max": float(attn_bias.abs().max().item()) if attn_bias is not None else 0.0,
             "raw_bias_abs_mean": float(raw_bias.abs().mean().item()) if raw_bias is not None else 0.0,
             "reliability_mean": float(reliability.mean().item()) if reliability is not None else 0.0,
             "head_bias_entropy": ent,
         }
+        if self.gate_mode == "no_alpha_fixed":
+            st["beta_s"] = self.fixed_stage_bias_scale
+        else:
+            alpha_term = _alpha_gate_term(self.alpha, self.gate_floor)
+            st["alpha"] = float(torch.tanh(self.alpha).item())
+            st["alpha_term"] = float(alpha_term.item())
         if self.gate_mode == "set_lite" and self.bias_scale_logit is not None:
             st["bias_scale"] = float(torch.sigmoid(self.bias_scale_logit).item())
         if set_control is not None:
             st["set_control_mean"] = float(set_control.detach().mean().cpu())
+            st["set_gate_mean"] = float(set_control.detach().mean().cpu())
         return st
 
 
@@ -388,6 +428,8 @@ class TGSwimController(nn.Module):
         wti_head_mixer_ratio: float = 2.0,
         wti_head_mixer_gamma_init: float = 0.0,
         gate_mode: str = "legacy",
+        gate_floor: float = 0.05,
+        fixed_stage_bias_scales: Optional[List[float]] = None,
     ):
         super().__init__()
         self.cond_dim = cond_dim
@@ -399,6 +441,10 @@ class TGSwimController(nn.Module):
         self.head_aware = head_aware
         self.enhanced_wti = enhanced_wti
         self.gate_mode = str(gate_mode).lower()
+        self.gate_floor = gate_floor
+        if fixed_stage_bias_scales is None:
+            fixed_stage_bias_scales = [0.05] * len(self.wti_stage_list)
+        self.fixed_stage_bias_scales = list(fixed_stage_bias_scales)
         self.num_text_stages = num_text_stages
         self.use_evidence_state = use_evidence_state
         self.evidence_state_dim = evidence_state_dim
@@ -455,6 +501,7 @@ class TGSwimController(nn.Module):
             if stage_idx >= len(stage_dims):
                 continue
             self._stage_dims_map[stage_idx] = stage_dims[stage_idx]
+            stage_pos = self.wti_stage_list.index(stage_idx)
             block_kwargs = dict(
                 dim=stage_dims[stage_idx],
                 cond_dim=cond_dim,
@@ -464,8 +511,14 @@ class TGSwimController(nn.Module):
                 bias_max=bias_max,
                 alpha_init=alpha_init,
                 stage_scale=stage_scales[stage_idx] if stage_idx < len(stage_scales) else 1.0,
+                gate_floor=gate_floor,
             )
             if enhanced_wti:
+                fixed_scale = (
+                    self.fixed_stage_bias_scales[stage_pos]
+                    if stage_pos < len(self.fixed_stage_bias_scales)
+                    else self.fixed_stage_bias_scales[-1]
+                )
                 block_kwargs.update(
                     projector_hidden_ratio=wti_projector_ratio,
                     projector_max_hidden=wti_projector_max_hidden,
@@ -473,6 +526,7 @@ class TGSwimController(nn.Module):
                     head_mixer_ratio=wti_head_mixer_ratio,
                     gamma_init=wti_head_mixer_gamma_init,
                     gate_mode=self.gate_mode,
+                    fixed_stage_bias_scale=fixed_scale,
                 )
             block = wti_cls(**block_kwargs)
             if use_evidence_state and self.state_proj is not None and hasattr(block, "set_state_proj"):
@@ -601,6 +655,11 @@ class TGSwimController(nn.Module):
                 st["reliability_mean"] = float(rel.detach().mean().cpu())
             if sc is not None and "set_control_mean" not in st:
                 st["set_control_mean"] = float(sc.detach().mean().cpu())
+                st["set_gate_mean"] = float(sc.detach().mean().cpu())
+            if isinstance(module, StageEnhancedWTIHeadAware) and module.gate_mode == "no_alpha_fixed":
+                st["beta_s"] = module.fixed_stage_bias_scale
+            if "attn_bias_abs_mean" not in st and "bias_abs_mean" in st:
+                st["attn_bias_abs_mean"] = st["bias_abs_mean"]
             self._last_stats.update(st)
         return attn_bias
 

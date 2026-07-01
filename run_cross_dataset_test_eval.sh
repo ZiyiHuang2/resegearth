@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-dataset test eval + metrics for SET++ merged model (5 datasets in parallel).
+# Cross-dataset test eval + metrics for SET++ merged model (5 datasets serial).
 # Datasets: LaSeRS / RRSISD / RefSegRS / RISBench / EarthReason
 set -euo pipefail
 
@@ -81,31 +81,14 @@ run_one () {
 
 echo "[INFO] OUT=${OUT}"
 echo "[INFO] MODEL=${MODEL}"
-echo "[INFO] Parallel 5-dataset test eval on GPU ${CUDA_VISIBLE_DEVICES}"
-
-run_one lasers "${DATA_LASERS}" &
-PID_LASERS=$!
-
-run_one rrsisd "${DATA_RRSISD}" &
-PID_RRSISD=$!
-
-run_one refsegrs "${DATA_REFSEGRS}" &
-PID_REF=$!
-
-run_one risbench "${DATA_RISBENCH}" &
-PID_RIS=$!
-
-run_one earthreason "${DATA_EARTHREASON}" &
-PID_ER=$!
-
-echo "[INFO] parallel PIDs: lasers=${PID_LASERS} rrsisd=${PID_RRSISD} refsegrs=${PID_REF} risbench=${PID_RIS} earthreason=${PID_ER}"
+echo "[INFO] Serial 5-dataset test eval on GPU ${CUDA_VISIBLE_DEVICES}"
 
 FAIL=0
-wait "${PID_LASERS}" && echo "[OK] lasers finished" || { echo "[FAIL] lasers exit=$?"; FAIL=1; }
-wait "${PID_RRSISD}" && echo "[OK] rrsisd finished" || { echo "[FAIL] rrsisd exit=$?"; FAIL=1; }
-wait "${PID_REF}" && echo "[OK] refsegrs finished" || { echo "[FAIL] refsegrs exit=$?"; FAIL=1; }
-wait "${PID_RIS}" && echo "[OK] risbench finished" || { echo "[FAIL] risbench exit=$?"; FAIL=1; }
-wait "${PID_ER}" && echo "[OK] earthreason finished" || { echo "[FAIL] earthreason exit=$?"; FAIL=1; }
+run_one lasers "${DATA_LASERS}" && echo "[OK] lasers finished" || { echo "[FAIL] lasers exit=$?"; FAIL=1; }
+run_one rrsisd "${DATA_RRSISD}" && echo "[OK] rrsisd finished" || { echo "[FAIL] rrsisd exit=$?"; FAIL=1; }
+run_one refsegrs "${DATA_REFSEGRS}" && echo "[OK] refsegrs finished" || { echo "[FAIL] refsegrs exit=$?"; FAIL=1; }
+run_one risbench "${DATA_RISBENCH}" && echo "[OK] risbench finished" || { echo "[FAIL] risbench exit=$?"; FAIL=1; }
+run_one earthreason "${DATA_EARTHREASON}" && echo "[OK] earthreason finished" || { echo "[FAIL] earthreason exit=$?"; FAIL=1; }
 
 echo "========================================"
 if [[ "${FAIL}" -eq 0 ]]; then

@@ -2,19 +2,25 @@
 set -euo pipefail
 
 ########################################
-# Full ablation：TG-Swin (Enhanced WTI v2) + SET++ — Train → Merge → Eval → W&B
+# Full-candidate：no-alpha-fixed TG-Swin + grouped SET++ — Train → Merge → Eval → W&B
 #
-# 对应归因实验组：Full（encoder grounding + decoder set consistency）
-# 主入口即本脚本；scripts/train_full.sh 仅为最小 ablation 模板，日常跑 Full 用本脚本。
+# 主路（mask_config=ours_full_enhanced_tgswin_setpp.yaml）：
+#   attn_bias = raw_bias × beta_s × reliability × set_gate
+#   GATE_MODE=no_alpha_fixed, FIXED_STAGE_BIAS_SCALE=[0.05,0.05,0.05]
+#   grouped SET++ decoder / SetUnionMaskHead / direct grouped closure 不变
 #
-# 数据集：LaSeRS | 起点：base-8w merged_model
+# 主入口即本脚本；scripts/train_full.sh 仅为最小 ablation 模板。
+# 数据集：LaSeRS | 默认 warm-start：setpp-lasers-warmstart-8w-gd4/merged_model
 #
-# Quick start:
-#   GPU_ID=0 RUN_PREFLIGHT=0 bash run_train_merge_test.sh
+# Quick start (正式长训，preflight 含 smoke + gradient audit):
+#   GPU_ID=0 bash run_train_merge_test.sh
+#
+# 短程 sprint（跳过 preflight / merge / eval）:
+#   bash scripts/run_grouped_setpp_sprint_100.sh
 #
 # Override:
-#   MAX_STEPS=50000 bash run_train_merge_test.sh
-#   RUN_TAG=full-30k MAX_STEPS=30000 bash run_train_merge_test.sh
+#   MAX_STEPS=1000 RUN_TAG=full-noalpha-fixed-1k bash run_train_merge_test.sh
+#   RUN_PREFLIGHT=0 MAX_STEPS=20000 bash run_train_merge_test.sh
 ########################################
 
 ########################################
@@ -35,7 +41,7 @@ SETPP_REGROUP_SET_LOSS=True
 SETPP_CLOSED_LOOP=True
 SETPP_CSQR_ENABLE=True
 
-RUN_TAG="${RUN_TAG:-full}"
+RUN_TAG="${RUN_TAG:-full-noalpha-fixed}"
 export WANDB_NAME="${WANDB_NAME:-${RUN_TAG}}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 
@@ -58,7 +64,7 @@ cd "${REPO_DIR}"
 ########################################
 # Common paths
 ########################################
-WARM_START_MODEL="${WARM_START_MODEL:-${RESEG_ROOT}/output/base/standard-base-lasers-siglip1-8w-gd4/merged_model}"
+WARM_START_MODEL="${WARM_START_MODEL:-${RESEG_ROOT}/output/setpp/setpp-lasers-warmstart-8w-gd4/merged_model}"
 VISION_TOWER="${RESEG_ROOT}/pretrained_model/CLIP/siglip-so400m-patch14-384"
 VISION_TOWER_MASK="${RESEG_ROOT}/pretrained_model/mask2former/model_final_54b88a.pkl"
 MASK_CONFIG="${MASK_CONFIG:-segearth_r2/model/mask_decoder/mask_config/ours_full_enhanced_tgswin_setpp.yaml}"
@@ -90,9 +96,9 @@ EVAL_WANDB_PROJECT="${EVAL_WANDB_PROJECT:-segearth-eval-ewti-v2-sc}"
 EVAL_WANDB_RUN_NAME="${EVAL_WANDB_RUN_NAME:-${RUN_TAG}}"
 
 ########################################
-# Train config（对齐 base-5w LaSeRS preset，SET++ 继续训 50k steps）
+# Train config（Full-candidate no-alpha-fixed + grouped SET++，LaSeRS）
 ########################################
-# Enhanced WTI v2：关闭 LLM attention loss 后可 bs=2（gradient checkpointing 默认关）
+# Enhanced WTI v2 + grouped SET++：bs=2（gradient checkpointing 默认关）
 MAX_STEPS="${MAX_STEPS:-20000}"
 PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
@@ -105,7 +111,8 @@ WEIGHT_DECAY="0.0"
 WARMUP_RATIO="0.03"
 LR_SCHEDULER_TYPE="cosine"
 
-LOGGING_STEPS="10"
+LOGGING_STEPS="${LOGGING_STEPS:-10}"
+REPORT_TO="${REPORT_TO:-wandb}"
 BF16="True"
 TF32="False"
 MODEL_MAX_LENGTH="2048"
@@ -128,15 +135,51 @@ RUN_MERGE="${RUN_MERGE:-1}"
 RUN_EVAL="${RUN_EVAL:-1}"
 MERGE_CHECKPOINT="${MERGE_CHECKPOINT:-}"
 RUN_PREFLIGHT="${RUN_PREFLIGHT:-1}"
+# Preflight 子开关（RUN_PREFLIGHT=1 时生效）
+RUN_PREFLIGHT_E2E="${RUN_PREFLIGHT_E2E:-1}"
+RUN_PREFLIGHT_GRADIENT_AUDIT="${RUN_PREFLIGHT_GRADIENT_AUDIT:-1}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
 
 ########################################
 # Helpers
 ########################################
 run_preflight () {
-  echo "[INFO] Enhanced WTI v2 + SET control preflight"
+  echo "[INFO] Full-candidate preflight: no-alpha-fixed TG-Swin + grouped SET++"
+  "${PYTHON}" tools/diagnostics/smoke_grouped_setpp_full.py
   "${PYTHON}" tools/diagnostics/smoke_enhanced_wti_v2_setpp.py
-  "${PYTHON}" tools/diagnostics/probe_enhanced_wti_v2_seg_loss_gradient.py --phase alpha005
+  if [[ "${RUN_PREFLIGHT_E2E}" == "1" ]]; then
+    "${PYTHON}" tools/diagnostics/smoke_e2e_grouped_setpp_forward.py
+  fi
+  if [[ "${RUN_PREFLIGHT_GRADIENT_AUDIT}" == "1" ]]; then
+    "${PYTHON}" tools/diagnostics/audit_tgswin_main_loss_gradient.py
+  fi
+}
+
+print_mask_config_tgswin () {
+  MASK_CONFIG="${MASK_CONFIG}" "${PYTHON}" - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
+from segearth_r2.datasets.dataset import get_mask_config
+
+cfg_path = os.environ["MASK_CONFIG"]
+cfg = get_mask_config(cfg_path)
+tg = getattr(cfg, "TG_SWIN", None)
+if tg is None:
+    print("[WARN] TG_SWIN block missing in mask config")
+    raise SystemExit(0)
+
+def _get(name, default=""):
+    return getattr(tg, name, default)
+
+print(f"[INFO] TG_SWIN.GATE_MODE={_get('GATE_MODE', 'legacy')}")
+print(f"[INFO] TG_SWIN.FIXED_STAGE_BIAS_SCALE={list(_get('FIXED_STAGE_BIAS_SCALE', []))}")
+print(f"[INFO] TG_SWIN.GROUPED_SETPP_DECODER={_get('GROUPED_SETPP_DECODER', False)}")
+print(f"[INFO] TG_SWIN.USE_SET_TGSWIN_CONTROL={_get('USE_SET_TGSWIN_CONTROL', False)}")
+print(f"[INFO] TG_SWIN.USE_COARSE_EVIDENCE={_get('USE_COARSE_EVIDENCE', False)}")
+print(f"[INFO] TG_SWIN.USE_DR_EWTI={_get('USE_DR_EWTI', False)}")
+PY
 }
 
 assert_gpu_available () {
@@ -331,7 +374,7 @@ PY
 
 run_cross_dataset_eval_all () {
   local model_dir="$1"
-  echo "[INFO] 5-dataset parallel test eval: LaSeRS / RRSISD / RefSegRS / RISBench / EarthReason"
+  echo "[INFO] 5-dataset serial test eval: LaSeRS → RRSISD → RefSegRS → RISBench → EarthReason"
   MODEL_PATH="${model_dir}" \
   OUT_DIR="${OUTPUT_DIR}" \
   CUDA_VISIBLE_DEVICES="${GPU_ID}" \
@@ -396,11 +439,15 @@ echo "[INFO] RUN_TRAIN=${RUN_TRAIN} RUN_MERGE=${RUN_MERGE} RUN_EVAL=${RUN_EVAL}"
 echo "[INFO] MERGE_CHECKPOINT=${MERGE_CHECKPOINT:-<auto>}"
 echo "[INFO] EVAL_WANDB_PROJECT=${EVAL_WANDB_PROJECT}"
 echo "[INFO] EVAL_WANDB_RUN_NAME=${EVAL_WANDB_RUN_NAME}"
-echo "[INFO] Full ablation: TG-Swin=ON (mask_config) + SET++ enable=${SETPP_ENABLE} regroup=${SETPP_REGROUP_SET_LOSS} closed_loop=${SETPP_CLOSED_LOOP} csqr=${SETPP_CSQR_ENABLE}"
-echo "[INFO] RUN_CROSS_DATASET_EVAL=${RUN_CROSS_DATASET_EVAL} (5 datasets test parallel)"
+echo "[INFO] Full-candidate: TG-Swin=ON (mask_config) + grouped SET++ enable=${SETPP_ENABLE} regroup=${SETPP_REGROUP_SET_LOSS} closed_loop=${SETPP_CLOSED_LOOP} csqr=${SETPP_CSQR_ENABLE}"
+echo "[INFO] RUN_PREFLIGHT=${RUN_PREFLIGHT} e2e=${RUN_PREFLIGHT_E2E} gradient_audit=${RUN_PREFLIGHT_GRADIENT_AUDIT}"
+echo "[INFO] RUN_CROSS_DATASET_EVAL=${RUN_CROSS_DATASET_EVAL} (5 datasets test serial)"
+print_mask_config_tgswin
 
 if [[ ! -d "${WARM_START_MODEL}" ]]; then
   echo "[ERROR] warm-start model not found: ${WARM_START_MODEL}"
+  echo "[HINT] Full-candidate 默认从 SET++ warm-start 继续训；可设 WARM_START_MODEL= 覆盖"
+  echo "[HINT] 例如: WARM_START_MODEL=${RESEG_ROOT}/output/setpp/setpp-lasers-warmstart-8w-gd4/merged_model"
   exit 1
 fi
 
@@ -483,7 +530,7 @@ if [[ "${RUN_TRAIN}" != "1" ]]; then
   echo "========================================"
 else
 echo "========================================"
-echo "[1/6] Training Full (TG-Swin + SET++) on LaSeRS (holdout eval)"
+echo "[1/6] Training Full-candidate (no-alpha-fixed TG-Swin + grouped SET++) on LaSeRS (holdout eval)"
 echo "========================================"
 
 assert_gpu_available
@@ -526,7 +573,7 @@ assert_gpu_available
   --setpp_regroup_set_loss "${SETPP_REGROUP_SET_LOSS}" \
   --setpp_closed_loop "${SETPP_CLOSED_LOOP}" \
   --setpp_csqr_enable "${SETPP_CSQR_ENABLE}" \
-  --report_to wandb
+  --report_to "${REPORT_TO}"
 fi
 
 ########################################
@@ -591,7 +638,7 @@ check_merged_setpp_model "${MERGED_DIR}" "1"
 fi
 
 ########################################
-# 5) Eval on 5 datasets (test) in parallel + metrics
+# 5) Eval on 5 datasets (test) serial + metrics
 ########################################
 if [[ "${RUN_EVAL}" != "1" ]]; then
   echo "========================================"
@@ -599,7 +646,7 @@ if [[ "${RUN_EVAL}" != "1" ]]; then
   echo "========================================"
 else
 echo "========================================"
-echo "[5/6] Eval on 5 datasets (test, parallel) + upload metrics"
+echo "[5/6] Eval on 5 datasets (test, serial) + upload metrics"
 echo "========================================"
 
 if [[ "${RUN_CROSS_DATASET_EVAL}" == "1" ]]; then

@@ -189,9 +189,21 @@ class LLaVATrainer(Trainer):
         "loss_mask",
         "loss_dice",
         "loss_union",
+        "loss_union_mask",
+        "loss_union_dice",
         "loss_setpp_coverage",
         "loss_setpp_consistency",
         "loss_attention",
+    )
+
+    TGSWIN_GRAD_PREFIXES = (
+        "tg_swin_tcf",
+        "tg_swin_controller",
+        "tg_swin_set_control",
+        "pixel_decoder",
+        "predictor",
+        "SEG_token_projector",
+        "SET_token_projector",
     )
 
     def _iter_output_items(self, outputs):
@@ -238,6 +250,60 @@ class LLaVATrainer(Trainer):
             if key not in self.LOSS_LOG_KEYS:
                 ordered.append(f"{key}={loss_dict[key]:.6f}")
         logger.info("[step %d] losses: %s", self.state.global_step, " | ".join(ordered))
+
+    @staticmethod
+    def _prefix_grad_norm(model, prefix: str) -> Tuple[float, int]:
+        total_sq = 0.0
+        count = 0
+        for name, param in unwrap_model(model).named_parameters():
+            if prefix not in name or param.grad is None:
+                continue
+            grad = param.grad.detach()
+            if grad.is_sparse:
+                continue
+            total_sq += grad.float().pow(2).sum().item()
+            count += 1
+        return (total_sq ** 0.5, count) if count else (0.0, 0)
+
+    def _capture_tg_swin_fwd_stats(self, model):
+        controller = getattr(unwrap_model(model), "tg_swin_controller", None)
+        if controller is None or not hasattr(controller, "pop_stats"):
+            self._tg_swin_fwd_stats = {}
+            return
+        self._tg_swin_fwd_stats = controller.pop_stats()
+
+    def _log_tg_swin_diagnostics(self, model):
+        if self.args.local_rank not in (-1, 0):
+            return
+        next_step = self.state.global_step + 1
+        if next_step % max(1, self.args.logging_steps) != 0:
+            return
+
+        grad_parts = []
+        for prefix in self.TGSWIN_GRAD_PREFIXES:
+            norm, count = self._prefix_grad_norm(model, prefix)
+            grad_parts.append(f"{prefix}_grad={norm:.3e}(n={count})")
+
+        stat_parts = []
+        stats = getattr(self, "_tg_swin_fwd_stats", {}) or {}
+        for key in ("alpha_term", "gate_abs_mean", "set_control_mean", "bias_abs_mean"):
+            if key in stats:
+                stat_parts.append(f"{key}={stats[key]:.4f}")
+
+        msg = f"[step {next_step}] tg_swin: {' | '.join(grad_parts)}"
+        if stat_parts:
+            msg += f" | fwd: {' | '.join(stat_parts)}"
+        logger.info(msg)
+
+        log_metrics = {}
+        for prefix in self.TGSWIN_GRAD_PREFIXES:
+            norm, _ = self._prefix_grad_norm(model, prefix)
+            log_metrics[f"{prefix}_grad_norm"] = norm
+        for key in ("alpha_term", "gate_abs_mean", "set_control_mean", "bias_abs_mean"):
+            if key in stats:
+                log_metrics[f"tg_swin_{key}"] = stats[key]
+        if log_metrics:
+            self.log(log_metrics)
 
     def _save_checkpoint(self, model, trial, metrics=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
@@ -322,8 +388,14 @@ class LLaVATrainer(Trainer):
                 self.log(loss_dict)
                 if self.state.global_step > 0 and (self.state.global_step + 1) % max(1, self.args.logging_steps) == 0:
                     self._log_losses_to_output(loss_dict)
+            self._capture_tg_swin_fwd_stats(model)
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(self, model, inputs):
+        loss = super().training_step(model, inputs)
+        self._log_tg_swin_diagnostics(model)
+        return loss
 
     def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
         # Keep train drop_last behavior unchanged, but force eval to keep tail batches.
